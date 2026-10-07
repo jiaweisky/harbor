@@ -17,6 +17,7 @@ import (
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/integration"
 	"github.com/jiaweisky/harbor/internal/session"
+	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
 // DiscoveryPath is the aggregate discovery endpoint. It returns every agent
@@ -52,7 +53,8 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 			continue
 		}
 
-		exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions())
+		exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
+			workspace.NewResolver(cfg.Sandbox.WorkdirRoot, cfg.Sandbox.AllowOutside))
 		handler := a2asrv.NewHandler(exec,
 			a2asrv.WithLogger(slog.Default()),
 			a2asrv.WithAgentInactivityTimeout(10*time.Minute),

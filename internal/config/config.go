@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -37,12 +36,9 @@ type AuthConfig struct {
 
 // SandboxConfig configures workspace and env constraints.
 type SandboxConfig struct {
-	WorkdirRoot    string        `yaml:"workdir_root"`
-	AllowOutside   bool          `yaml:"allow_outside"`
-	Isolation      string        `yaml:"isolation"`
-	InheritEnv     *bool         `yaml:"inherit_env"` // default true; false restricts to an allowlisted env
-	DefaultTimeout time.Duration `yaml:"default_timeout"`
-	MaxConcurrent  int           `yaml:"max_concurrent"`
+	WorkdirRoot  string `yaml:"workdir_root"`
+	AllowOutside bool   `yaml:"allow_outside"`
+	InheritEnv   *bool  `yaml:"inherit_env"` // default true; false restricts to an allowlisted env
 }
 
 // InheritEnvEnabled reports whether child processes inherit the parent
@@ -106,7 +102,6 @@ type AgentConfig struct {
 	DisplayName    string            `yaml:"display_name"`
 	Binary         string            `yaml:"binary"`
 	Integration    Integration       `yaml:"integration"`
-	Parser         string            `yaml:"parser"` // exec: text | stream-json
 	Args           []string          `yaml:"args"`
 	Env            map[string]string `yaml:"env"`
 	AllowDangerous bool              `yaml:"allow_dangerous"`
@@ -169,11 +164,9 @@ type SessionConfig struct {
 	ContinueFlag string `yaml:"continue_flag"`
 }
 
-// LimitsConfig bounds per-agent execution.
+// LimitsConfig bounds concurrent execution for an agent.
 type LimitsConfig struct {
-	MaxConcurrent int           `yaml:"max_concurrent"`
-	Timeout       time.Duration `yaml:"timeout"`
-	MaxTurns      int           `yaml:"max_turns"`
+	MaxConcurrent int `yaml:"max_concurrent"`
 }
 
 // Load reads and validates a config file, applying defaults.
@@ -211,12 +204,6 @@ func (c *Config) applyDefaults() {
 	if c.Server.Auth.Mode == "" {
 		c.Server.Auth.Mode = "none"
 	}
-	if c.Sandbox.Isolation == "" {
-		c.Sandbox.Isolation = "shared"
-	}
-	if c.Sandbox.DefaultTimeout == 0 {
-		c.Sandbox.DefaultTimeout = 30 * time.Minute
-	}
 	for i := range c.Agents {
 		a := &c.Agents[i]
 		if a.Integration == "" {
@@ -235,6 +222,12 @@ func (c *Config) validate() error {
 	}
 	if len(c.Agents) == 0 {
 		return fmt.Errorf("at least one agent must be configured")
+	}
+	if c.Sandbox.WorkdirRoot != "" {
+		info, err := os.Stat(c.Sandbox.WorkdirRoot)
+		if err != nil || !info.IsDir() {
+			return fmt.Errorf("sandbox.workdir_root %q is not a directory", c.Sandbox.WorkdirRoot)
+		}
 	}
 	for i := range c.Agents {
 		a := &c.Agents[i]

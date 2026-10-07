@@ -8,12 +8,11 @@ server:
     tokens: []
 
 sandbox:
-  workdir_root: "/tmp/harbor-workspaces"
+  # workdir_root is required to confine tasks to a directory tree; the directory
+  # must already exist. Left unset, tasks run in Harbor's working directory.
+  # workdir_root: "/srv/workspaces"
   allow_outside: false
-  isolation: shared
   inherit_env: true
-  default_timeout: 30m
-  max_concurrent: 8
 
 agents:
   - id: codebuddy
@@ -22,13 +21,13 @@ agents:
     integration: stream-json
     args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages"]
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
-    limits: { max_concurrent: 3, timeout: 30m }
+    limits: { max_concurrent: 3 }
 
   - id: opencode
     display_name: "OpenCode"
     binary: opencode
     integration: exec
-    parser: text
     args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]
     session: { id_flag: "--session", continue_flag: "--continue" }
-    limits: { max_concurrent: 2, timeout: 30m }
+    limits: { max_concurrent: 2 }
+

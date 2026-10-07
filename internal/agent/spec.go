@@ -7,11 +7,12 @@ import (
 
 // Info describes a probed CLI binary.
 type Info struct {
-	Name    string
-	Version string
-	Path    string
-	Enabled bool
-	Err     error
+	Name        string
+	DisplayName string
+	Version     string
+	Path        string
+	Enabled     bool
+	Err         error
 }
 
 // Request is a normalized invocation request (A2A -> adapter).

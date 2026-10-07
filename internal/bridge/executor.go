@@ -10,6 +10,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
 // error codes written to TaskStatus.Message.Metadata["harbor.errorCode"].
@@ -17,6 +18,7 @@ const (
 	codeInternal           = "internal"
 	codeCLINotFound        = "cli_not_found"
 	codeUnsupportedContent = "unsupported_content"
+	codeWorkdirDenied      = "workdir_denied"
 )
 
 // errNoText is returned when an incoming message has no textual part.
@@ -30,14 +32,17 @@ type SessionStore interface {
 
 // CLIExecutor turns a coding-agent CLI session into A2A task events.
 type CLIExecutor struct {
-	launcher agent.Launcher
-	sessions SessionStore
-	live     *agent.LiveSessions
+	launcher  agent.Launcher
+	sessions  SessionStore
+	live      *agent.LiveSessions
+	workspace *workspace.Resolver
 }
 
 // NewCLIExecutor creates an executor over the given launcher.
-func NewCLIExecutor(ln agent.Launcher, sessions SessionStore, live *agent.LiveSessions) *CLIExecutor {
-	return &CLIExecutor{launcher: ln, sessions: sessions, live: live}
+func NewCLIExecutor(
+	ln agent.Launcher, sessions SessionStore, live *agent.LiveSessions, ws *workspace.Resolver,
+) *CLIExecutor {
+	return &CLIExecutor{launcher: ln, sessions: sessions, live: live, workspace: ws}
 }
 
 // Execute implements a2asrv.AgentExecutor. A task paused on input-required is
@@ -210,12 +215,17 @@ func (e *CLIExecutor) toRequest(ec *a2asrv.ExecutorContext) (*agent.Request, err
 		return nil, errNoText
 	}
 	meta := mergeMetadata(ec)
+	dir, err := e.workspace.Resolve(ec.ContextID, metaString(meta, "harbor.workDir"))
+	if err != nil {
+		return nil, err
+	}
 	sid, _ := e.sessions.Get(ec.ContextID)
 	return &agent.Request{
 		Prompt:      prompt,
 		SystemExtra: metaString(meta, "harbor.systemPrompt"),
 		Model:       metaString(meta, "harbor.model"),
 		Agent:       metaString(meta, "harbor.agent"),
+		WorkDir:     dir,
 		SessionID:   sid,
 		Continue:    sid == "" && metaBool(meta, "harbor.continue"),
 		MaxTurns:    metaInt(meta, "harbor.maxTurns"),
@@ -228,10 +238,14 @@ func isWaitingForInput(ec *a2asrv.ExecutorContext) bool {
 }
 
 func codeForRequestError(err error) string {
-	if errors.Is(err, errNoText) {
+	switch {
+	case errors.Is(err, errNoText):
 		return codeUnsupportedContent
+	case errors.Is(err, workspace.ErrDenied):
+		return codeWorkdirDenied
+	default:
+		return codeInternal
 	}
-	return codeInternal
 }
 
 func codeForStartError(err error) string {

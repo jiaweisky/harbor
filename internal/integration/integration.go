@@ -20,7 +20,7 @@ import (
 func Build(ctx context.Context, ac config.AgentConfig, inheritEnv bool) (agent.Launcher, agent.Info, error) {
 	path, err := exec.LookPath(ac.Binary)
 	if err != nil {
-		return nil, agent.Info{Name: ac.ID, Enabled: false, Err: err}, nil
+		return nil, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Enabled: false, Err: err}, nil
 	}
 
 	profile, known := config.LookupProfile(ac.Binary)
@@ -45,7 +45,7 @@ func Build(ctx context.Context, ac config.AgentConfig, inheritEnv bool) (agent.L
 	if err != nil {
 		return nil, agent.Info{}, err
 	}
-	return ln, agent.Info{Name: ac.ID, Path: path, Enabled: true, Version: ver}, nil
+	return ln, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Path: path, Enabled: true, Version: ver}, nil
 }
 
 // New constructs a Launcher for the given agent config. inheritEnv controls

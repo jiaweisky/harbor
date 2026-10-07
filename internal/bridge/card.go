@@ -10,6 +10,11 @@ import (
 func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool) *a2a.AgentCard {
 	caps := ln.Capabilities()
 
+	displayName := info.DisplayName
+	if displayName == "" {
+		displayName = ln.Name()
+	}
+
 	version := info.Version
 	if version == "" {
 		version = "0.1.0"
@@ -24,8 +29,8 @@ func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool)
 	}
 
 	card := &a2a.AgentCard{
-		Name:        "Harbor/" + ln.Name(),
-		Description: "Remote A2A wrapper for the " + ln.Name() + " coding agent CLI",
+		Name:        "Harbor/" + displayName,
+		Description: "Remote A2A wrapper for the " + displayName + " coding agent CLI",
 		Version:     version,
 		SupportedInterfaces: []*a2a.AgentInterface{{
 			URL:             endpoint,
@@ -40,8 +45,8 @@ func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool)
 		DefaultOutputModes: out,
 		Skills: []a2a.AgentSkill{{
 			ID:          ln.Name(),
-			Name:        ln.Name(),
-			Description: "Run a coding task with " + ln.Name(),
+			Name:        displayName,
+			Description: "Run a coding task with " + displayName,
 			Tags:        []string{"coding", "cli", ln.Name()},
 			Examples:    []string{"fix the failing test in ./pkg", "review this diff"},
 		}},

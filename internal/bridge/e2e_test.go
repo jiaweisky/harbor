@@ -19,6 +19,7 @@ import (
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/integration"
 	"github.com/jiaweisky/harbor/internal/session"
+	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
 func scriptPath(t *testing.T, name string) string {
@@ -51,8 +52,17 @@ func newLauncher(
 
 func newHandler(t *testing.T, ln agent.Launcher) a2asrv.RequestHandler {
 	t.Helper()
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions())
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil)
 	return a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+}
+
+// newPwdHandler returns a handler whose CLI reports its working directory,
+// confined to root.
+func newPwdHandler(t *testing.T, root string) a2asrv.RequestHandler {
+	t.Helper()
+	ln := newLauncher(t, scriptPath(t, "fake-pwd.sh"), "exec", nil, nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), workspace.NewResolver(root, false))
+	return a2asrv.NewHandler(exec)
 }
 
 func message(text string) *a2a.Message {
@@ -272,6 +282,68 @@ func TestErrorCode(t *testing.T) {
 	}
 }
 
+func TestWorkdirApplied(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m := message("hi")
+	m.Metadata = map[string]any{"harbor.workDir": "repo"}
+	resp, err := newPwdHandler(t, root).SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+	want, _ := filepath.EvalSymlinks(repo)
+	if got := artifactText(task); !strings.Contains(got, want) {
+		t.Fatalf("artifact %q does not contain workdir %q", got, want)
+	}
+}
+
+func TestWorkdirDenied(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m := message("hi")
+	m.Metadata = map[string]any{"harbor.workDir": "../outside"}
+	resp, err := newPwdHandler(t, root).SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateFailed {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+	if task.Status.Message == nil || task.Status.Message.Metadata["harbor.errorCode"] != "workdir_denied" {
+		t.Fatalf("missing workdir_denied error code: %+v", task.Status.Message)
+	}
+}
+
+func TestCardUsesDisplayName(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
+	info := ln.Probe(context.Background())
+	info.DisplayName = "CodeBuddy Pro"
+	card := bridge.BuildCard(ln, info, "http://example/agents/cb/", false)
+	if card.Name != "Harbor/CodeBuddy Pro" {
+		t.Fatalf("card name = %q", card.Name)
+	}
+	if len(card.Skills) != 1 || card.Skills[0].ID != ln.Name() {
+		t.Fatalf("skill id should stay the agent id: %+v", card.Skills)
+	}
+}
+
 func TestRequireAuthOnExposedBind(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -325,7 +397,7 @@ func TestAuthScope(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
 	card := bridge.BuildCard(ln, ln.Probe(context.Background()), "http://example/agents/x/", true)
 
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions())
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil)
 	h := a2asrv.NewHandler(exec)
 
 	mux := http.NewServeMux()
