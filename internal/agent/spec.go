@@ -25,6 +25,7 @@ type Request struct {
 	SessionID   string
 	Continue    bool
 	MaxTurns    int
+	Login       bool // run the CLI's login command instead of a prompt
 	Meta        map[string]any
 }
 
@@ -98,6 +99,9 @@ func (c Capabilities) InputModes() []string {
 		modes = append(modes, "text/plain")
 	}
 	modes = append(modes, c.InputImage...)
+	if c.InputFile {
+		modes = append(modes, "application/octet-stream")
+	}
 	if c.InputData {
 		modes = append(modes, "application/json")
 	}
@@ -124,6 +128,16 @@ type Launcher interface {
 	Name() string
 	Capabilities() Capabilities
 	Probe(ctx context.Context) Info
+	// Auth describes how the CLI authenticates (may be nil for CLIs Harbor
+	// cannot verify).
+	Auth() Authenticator
+	// AuthReady reports whether the CLI is authenticated for service-level
+	// (shared) use. It is always true when credentials are per caller.
+	AuthReady(ctx context.Context) bool
+	// EnsureLogin verifies the CLI holds a ticket, attempting its login command
+	// once when none is present. It is used at startup: a failure disables the
+	// agent.
+	EnsureLogin(ctx context.Context) error
 	Start(ctx context.Context, req *Request) (Session, error)
 }
 

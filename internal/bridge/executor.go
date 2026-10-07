@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -28,6 +29,7 @@ const (
 	codeWorkdirDenied      = "workdir_denied"
 	codeTimeout            = "timeout"
 	codeAgentUnavailable   = "agent_unavailable"
+	codeAuthRequired       = "auth_required"
 )
 
 // Metadata keys carried on task status messages. The interaction id is both
@@ -59,6 +61,7 @@ type CLIExecutor struct {
 	locks        sync.Map      // taskID -> func() (workdir lock release)
 	runs         sync.Map      // taskID -> *taskRun (process lifetime, decoupled from the request)
 	interactions sync.Map      // taskID -> *agent.Interaction awaiting an answer
+	metrics      *agentMetrics
 }
 
 // taskRun is the lifetime of one CLI process. Its context is detached from the
@@ -82,6 +85,31 @@ func NewCLIExecutor(
 		workspace: ws,
 		timeout:   limits.Timeout,
 		breaker:   newBreaker(limits.Breaker),
+		metrics:   &agentMetrics{},
+	}
+}
+
+// Name reports the agent id this executor serves.
+func (e *CLIExecutor) Name() string { return e.launcher.Name() }
+
+// Ready reports whether the agent can accept tasks: false while its circuit
+// breaker is open or probing after failures.
+func (e *CLIExecutor) Ready() bool { return e.breaker.State() == stateNameClosed }
+
+// BreakerState reports the current circuit-breaker state name.
+func (e *CLIExecutor) BreakerState() string { return e.breaker.State() }
+
+// Snapshot returns a point-in-time copy of the agent's counters and health.
+func (e *CLIExecutor) Snapshot() MetricsSnapshot {
+	return MetricsSnapshot{
+		Name:         e.Name(),
+		Submitted:    e.metrics.submitted.Load(),
+		Active:       e.metrics.active.Load(),
+		Completed:    e.metrics.completed.Load(),
+		Failed:       e.metrics.failed.Load(),
+		Canceled:     e.metrics.canceled.Load(),
+		Rejected:     e.metrics.rejected.Load(),
+		BreakerState: e.breaker.State(),
 	}
 }
 
@@ -89,19 +117,52 @@ func NewCLIExecutor(
 // resumed; any other task starts a new CLI session.
 func (e *CLIExecutor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
+		taskID := string(ec.TaskID)
+		emit := e.instrument(taskID, ec.User, yield)
 		if !e.breaker.Allow() {
-			if ec.StoredTask == nil && !yield(a2a.NewSubmittedTask(ec, ec.Message), nil) {
+			if ec.StoredTask == nil && !emit(a2a.NewSubmittedTask(ec, ec.Message), nil) {
 				return
 			}
-			yield(rejectedStatus(ec, "agent is temporarily unavailable after repeated failures"), nil)
+			emit(rejectedStatus(ec, "agent is temporarily unavailable after repeated failures"), nil)
 			return
 		}
-		taskID := string(ec.TaskID)
 		if isWaitingForInput(ec) {
-			e.resume(ec, taskID, yield)
+			e.resume(ec, taskID, emit)
 			return
 		}
-		e.start(ctx, ec, taskID, yield)
+		e.start(ctx, ec, taskID, emit)
+	}
+}
+
+// instrument wraps yield to record per-task metrics and audit log entries as
+// events flow to the client. It records a submission and a terminal outcome at
+// most once per invocation, so a resumed task counts its outcome when it truly
+// finishes rather than when it pauses.
+func (e *CLIExecutor) instrument(
+	taskID string, user *a2asrv.User, yield func(a2a.Event, error) bool,
+) func(a2a.Event, error) bool {
+	username := ""
+	if user != nil {
+		username = user.Name
+	}
+	name := e.Name()
+	submitted, finished := false, false
+	return func(ev a2a.Event, err error) bool {
+		if !submitted {
+			if tk, ok := ev.(*a2a.Task); ok && tk.Status.State == a2a.TaskStateSubmitted {
+				submitted = true
+				e.metrics.submitted.Add(1)
+				slog.Info("task submitted", "agent", name, "task", taskID, "user", username)
+			}
+		}
+		if !finished {
+			if outcome, ok := terminalOutcome(ev); ok {
+				finished = true
+				e.metrics.record(outcome)
+				slog.Info("task finished", "agent", name, "task", taskID, "outcome", outcome, "user", username)
+			}
+		}
+		return yield(ev, err)
 	}
 }
 
@@ -150,13 +211,16 @@ func (e *CLIExecutor) beginRun(parent context.Context, taskID string) context.Co
 		runCtx, cancel = context.WithTimeout(base, e.timeout)
 	}
 	e.runs.Store(taskID, &taskRun{ctx: runCtx, cancel: cancel})
+	e.metrics.active.Add(1)
 	return runCtx
 }
 
-// endRun cancels and forgets a task's process lifetime. It is idempotent.
+// endRun cancels and forgets a task's process lifetime. It is idempotent, so
+// the active gauge is decremented exactly once per run.
 func (e *CLIExecutor) endRun(taskID string) {
 	if v, ok := e.runs.LoadAndDelete(taskID); ok {
 		v.(*taskRun).cancel()
+		e.metrics.active.Add(-1)
 	}
 }
 
@@ -211,14 +275,21 @@ func (e *CLIExecutor) teardown(taskID string, sess agent.Session) {
 	e.cleanup(taskID, false)
 }
 
-// cleanup releases a task's per-task state. When fail is true the failure
-// breaker is penalized; otherwise it is resolved.
-func (e *CLIExecutor) cleanup(taskID string, fail bool) {
+// forget releases a task's transient state: its process lifetime, live session,
+// change baseline, pending interaction, and workdir lock. It is idempotent and
+// does not touch the failure breaker.
+func (e *CLIExecutor) forget(taskID string) {
 	e.endRun(taskID)
 	e.live.Del(taskID)
 	e.baselines.Delete(taskID)
 	e.interactions.Delete(taskID)
 	e.releaseLock(taskID)
+}
+
+// cleanup releases a task's state. When fail is true the failure breaker is
+// penalized; otherwise it is resolved.
+func (e *CLIExecutor) cleanup(taskID string, fail bool) {
+	e.forget(taskID)
 	if fail {
 		e.breaker.Failure()
 	} else {
@@ -280,7 +351,7 @@ func (e *CLIExecutor) handleEvent(
 ) bool {
 	switch ev.Kind {
 	case agent.EventSession:
-		e.sessions.Bind(ec.ContextID, ev.SessionID)
+		e.sessions.Bind(contextKey(ec), ev.SessionID)
 		return true
 	case agent.EventTextDelta:
 		return sink.Write(ev.Text)
@@ -295,14 +366,12 @@ func (e *CLIExecutor) handleEvent(
 		return false
 	case agent.EventError:
 		sink.Flush()
-		e.endRun(taskID)
-		e.live.Del(taskID)
-		e.interactions.Delete(taskID)
 		if sess.Canceled() {
+			e.forget(taskID)
 			return false
 		}
 		e.emitChanges(ec, taskID, emit)
-		e.releaseLock(taskID)
+		e.forget(taskID)
 		e.breaker.Failure()
 		emit(failedStatus(ec, codeInternal, eventErrorText(ev)))
 		return false
@@ -361,13 +430,10 @@ func (e *CLIExecutor) finish(
 	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
 	sink *textSink, emit func(a2a.Event) bool,
 ) {
-	defer e.releaseLock(taskID)
-	defer e.endRun(taskID)
-	defer e.interactions.Delete(taskID)
+	defer e.forget(taskID)
 	if !sink.Flush() {
 		return
 	}
-	e.live.Del(taskID)
 	if sess.Canceled() {
 		return // Cancel already emitted the canceled state.
 	}
@@ -395,7 +461,7 @@ func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emi
 	if !ok {
 		return
 	}
-	dir, err := e.workspace.Resolve(ec.ContextID, metaString(mergeMetadata(ec), "harbor.workDir"))
+	dir, err := e.workspace.Resolve(contextKey(ec), metaString(mergeMetadata(ec), "harbor.workDir"))
 	if err != nil || dir == "" {
 		return
 	}
@@ -423,32 +489,33 @@ func toAnySlice(values []string) []any {
 func (e *CLIExecutor) Cancel(_ context.Context, ec *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
 		taskID := string(ec.TaskID)
+		emit := e.instrument(taskID, ec.User, yield)
 		if sess, ok := e.live.Get(taskID); ok {
 			_ = sess.Cancel()
-			e.live.Del(taskID)
 		}
-		e.endRun(taskID)
-		e.baselines.Delete(taskID)
-		e.interactions.Delete(taskID)
-		e.releaseLock(taskID)
+		e.forget(taskID)
 		e.breaker.Resolve()
-		yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCanceled, nil), nil)
+		emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCanceled, nil), nil)
 	}
 }
 
 // toRequest maps the A2A request onto an agent.Request, merging message-level
 // and request-level metadata (request-level wins).
 func (e *CLIExecutor) toRequest(ec *a2asrv.ExecutorContext) (*agent.Request, error) {
-	prompt := firstTextPart(ec.Message)
-	if prompt == "" {
-		return nil, errNoText
-	}
 	meta := mergeMetadata(ec)
-	dir, err := e.workspace.Resolve(ec.ContextID, metaString(meta, "harbor.workDir"))
+	login := metaBool(meta, "harbor.login")
+	dir, err := e.workspace.Resolve(contextKey(ec), metaString(meta, "harbor.workDir"))
 	if err != nil {
 		return nil, err
 	}
-	sid, _ := e.sessions.Get(ec.ContextID)
+	prompt, err := e.promptFromParts(ec.Message, dir)
+	if err != nil {
+		return nil, err
+	}
+	if prompt == "" && !login {
+		return nil, errNoText
+	}
+	sid, _ := e.sessions.Get(contextKey(ec))
 	return &agent.Request{
 		Prompt:      prompt,
 		SystemExtra: metaString(meta, "harbor.systemPrompt"),
@@ -458,8 +525,19 @@ func (e *CLIExecutor) toRequest(ec *a2asrv.ExecutorContext) (*agent.Request, err
 		SessionID:   sid,
 		Continue:    sid == "" && metaBool(meta, "harbor.continue"),
 		MaxTurns:    metaInt(meta, "harbor.maxTurns"),
+		Login:       login,
 		Meta:        meta,
 	}, nil
+}
+
+// contextKey scopes a context id to its owner, so one caller cannot resume
+// another caller's CLI session or working tree by reusing a contextId. A NUL
+// separator keeps the user and context parts unambiguous.
+func contextKey(ec *a2asrv.ExecutorContext) string {
+	if ec.User == nil || ec.User.Name == "" {
+		return ec.ContextID
+	}
+	return ec.User.Name + "\x00" + ec.ContextID
 }
 
 func isWaitingForInput(ec *a2asrv.ExecutorContext) bool {
@@ -468,7 +546,7 @@ func isWaitingForInput(ec *a2asrv.ExecutorContext) bool {
 
 func codeForRequestError(err error) string {
 	switch {
-	case errors.Is(err, errNoText):
+	case errors.Is(err, errNoText), errors.Is(err, errUnsupportedContent):
 		return codeUnsupportedContent
 	case errors.Is(err, workspace.ErrDenied):
 		return codeWorkdirDenied
@@ -478,10 +556,16 @@ func codeForRequestError(err error) string {
 }
 
 func codeForStartError(err error) string {
-	if errors.Is(err, agent.ErrCLINotFound) {
+	switch {
+	case errors.Is(err, agent.ErrCLINotFound):
 		return codeCLINotFound
+	case errors.Is(err, agent.ErrAuthRequired):
+		return codeAuthRequired
+	case errors.Is(err, agent.ErrNoLogin):
+		return codeUnsupportedContent
+	default:
+		return codeInternal
 	}
-	return codeInternal
 }
 
 func mergeMetadata(ec *a2asrv.ExecutorContext) map[string]any {

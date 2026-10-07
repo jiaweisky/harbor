@@ -283,6 +283,50 @@ func TestSessionResume_codebuddy(t *testing.T) {
 	}
 }
 
+// userCtx returns a request context carrying an authenticated caller identity.
+func userCtx(name string) context.Context {
+	ctx, cc := a2asrv.NewCallContext(context.Background(), nil)
+	cc.User = a2asrv.NewAuthenticatedUser(name, nil)
+	return ctx
+}
+
+// TestSessionScopedByUser verifies that a CLI session bound to one caller's
+// context cannot be resumed by another caller reusing the same contextId.
+func TestSessionScopedByUser(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "args.log")
+	env := map[string]string{"HARBOR_ARG_LOG": logPath}
+	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, env))
+
+	send := func(ctx context.Context, ctxID string) {
+		t.Helper()
+		m := message("hi")
+		m.ContextID = ctxID
+		if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m}); err != nil {
+			t.Fatalf("SendMessage: %v", err)
+		}
+	}
+	readLog := func() string {
+		t.Helper()
+		b, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatalf("read arg log: %v", err)
+		}
+		return string(b)
+	}
+
+	alice, bob := userCtx("alice"), userCtx("bob")
+	send(alice, "shared-ctx") // alice's first turn: no session yet
+	send(bob, "shared-ctx")   // bob reuses the id: must not resume alice's session
+	if got := readLog(); strings.Contains(got, "--resume") {
+		t.Fatalf("a different caller resumed the session:\n%s", got)
+	}
+	send(alice, "shared-ctx") // alice resumes her own session
+	if got := readLog(); !strings.Contains(got, "--resume sess-123") {
+		t.Fatalf("alice's second turn did not resume her session:\n%s", got)
+	}
+}
+
 func TestSendMessage_opencode(t *testing.T) {
 	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-opencode.sh"), "exec", []string{"run", "{{.Prompt}}"}, nil))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -302,7 +346,10 @@ func TestSendMessage_opencode(t *testing.T) {
 }
 
 func TestCancel(t *testing.T) {
-	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-slow.sh"), "stream-json", nil, nil))
+	exec := bridge.NewCLIExecutor(
+		newLauncher(t, scriptPath(t, "fake-slow.sh"), "stream-json", nil, nil),
+		session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -356,6 +403,173 @@ func TestCancel(t *testing.T) {
 	}
 	if got.Status.State != a2a.TaskStateCanceled {
 		t.Fatalf("state = %s", got.Status.State)
+	}
+	if snap := exec.Snapshot(); snap.Canceled != 1 || snap.Active != 0 {
+		t.Fatalf("snapshot = %+v, want 1 canceled and 0 active", snap)
+	}
+}
+
+func TestExecutorMetricsCompleted(t *testing.T) {
+	exec := bridge.NewCLIExecutor(
+		newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil),
+		session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+
+	snap := exec.Snapshot()
+	if snap.Submitted != 1 || snap.Completed != 1 || snap.Active != 0 {
+		t.Fatalf("snapshot = %+v, want 1 submitted, 1 completed, 0 active", snap)
+	}
+	if !exec.Ready() || snap.BreakerState != "closed" {
+		t.Fatalf("ready=%v breaker=%q, want ready and closed", exec.Ready(), snap.BreakerState)
+	}
+}
+
+func TestPromptFromParts(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "args.log")
+	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "exec",
+		[]string{"-p", "{{.Prompt}}"}, map[string]string{"HARBOR_ARG_LOG": logPath})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
+		workspace.NewResolver(root, false), config.LimitsConfig{})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	file := a2a.NewRawPart([]byte("file body"))
+	file.Filename = "notes.txt"
+	file.MediaType = "text/plain"
+	link := a2a.NewFileURLPart("https://example.test/spec.pdf", "application/pdf")
+	link.Filename = "spec.pdf"
+
+	m := a2a.NewMessage(a2a.MessageRoleUser,
+		a2a.NewTextPart("first part"),
+		a2a.NewTextPart("second part"),
+		file,
+		link,
+	)
+	m.Metadata = map[string]any{"harbor.workDir": "."}
+	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read arg log: %v", err)
+	}
+	got := string(log)
+	for _, want := range []string{"first part", "second part", "notes.txt", "https://example.test/spec.pdf"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, got)
+		}
+	}
+
+	uploaded := filepath.Join(root, ".harbor", "uploads", "1-notes.txt")
+	if b, err := os.ReadFile(uploaded); err != nil || string(b) != "file body" {
+		t.Fatalf("uploaded file: err=%v body=%q", err, b)
+	}
+}
+
+func TestRejectsUnsupportedImage(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "args.log")
+	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "exec",
+		[]string{"-p", "{{.Prompt}}"}, map[string]string{"HARBOR_ARG_LOG": logPath})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
+		workspace.NewResolver(root, false), config.LimitsConfig{})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	img := a2a.NewRawPart([]byte("png"))
+	img.Filename = "x.png"
+	img.MediaType = "image/png"
+	m := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("describe this"), img)
+	m.Metadata = map[string]any{"harbor.workDir": "."}
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateFailed {
+		t.Fatalf("state = %s, want failed", task.Status.State)
+	}
+	if code := task.Status.Message.Metadata["harbor.errorCode"]; code != "unsupported_content" {
+		t.Fatalf("errorCode = %v, want unsupported_content", code)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("CLI should not have started; arg log present (err=%v)", err)
+	}
+}
+
+// fakeBin writes an executable named name and returns its path.
+func fakeBin(t *testing.T, name, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// newExecLauncher builds an exec launcher over an arbitrary binary.
+func newExecLauncher(t *testing.T, ac config.AgentConfig, opts integration.Options) agent.Launcher {
+	t.Helper()
+	ac.Integration = "exec"
+	ac.Parser = "text"
+	ac.Args = []string{"-p", "{{.Prompt}}"}
+	ln, err := integration.New(ac, opts)
+	if err != nil {
+		t.Fatalf("integration.New: %v", err)
+	}
+	return ln
+}
+
+func TestLoginTask(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "args.log")
+	bin := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\necho \"$@\" >> \"$HARBOR_ARG_LOG\" 2>/dev/null\n" +
+		"echo 'Open https://example.test/device?code=abc to sign in'\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ln := newExecLauncher(t, config.AgentConfig{
+		ID: "codex", Binary: bin, Env: map[string]string{"HARBOR_ARG_LOG": logPath},
+	}, integration.Options{InheritEnv: true})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
+	h := a2asrv.NewHandler(exec)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("please sign me in"))
+	m.Metadata = map[string]any{"harbor.login": true}
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", task.Status.State)
+	}
+	if got := artifactText(task); !strings.Contains(got, "https://example.test/device") {
+		t.Fatalf("artifact = %q, want the login URL", got)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read arg log: %v", err)
+	}
+	if !strings.Contains(string(log), "login") {
+		t.Fatalf("login args not used, log = %q", string(log))
 	}
 }
 
@@ -706,7 +920,7 @@ func TestCLIHomeIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
-	want := "HOME=" + filepath.Join(home, "default")
+	want := "HOME=" + home
 	if got := artifactText(resp.(*a2a.Task)); !strings.Contains(got, want) {
 		t.Fatalf("artifact %q does not contain %q", got, want)
 	}

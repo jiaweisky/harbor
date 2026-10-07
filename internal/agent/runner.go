@@ -227,20 +227,42 @@ func (r *Runner) release() {
 
 // baseEnvKeys are the parent variables kept when environment inheritance is
 // disabled (sandbox.inherit_env: false); every other parent variable is dropped.
-// Adapter-provided variables are always added on top of this set.
+// Adapter-provided variables are always added on top of this set. The Windows
+// roots are included so a CLI there can still find its profile.
 var baseEnvKeys = map[string]bool{
-	"PATH": true, "HOME": true, "LANG": true, "LC_ALL": true, "TERM": true, "TMPDIR": true,
+	"PATH": true, "HOME": true, "USERPROFILE": true, "APPDATA": true, "LOCALAPPDATA": true,
+	"LANG": true, "LC_ALL": true, "TERM": true, "TMPDIR": true,
 }
 
 // buildEnv returns the child environment. When inherit is false only an
 // allowlisted base plus the adapter extras is passed (no credential leakage).
-// When cliHome is set, HOME and the XDG/CLI config roots are redirected under it.
+// When cliHome is set, HOME and the CLI config roots are redirected under it;
+// those redirects win over any adapter-provided values so isolation cannot be
+// overridden.
 func buildEnv(inherit bool, cliHome string, extra []string) []string {
 	base := os.Environ()
 	if !inherit {
 		base = allowlistedEnv()
 	}
-	return append(base, append(cliHomeEnv(cliHome), extra...)...)
+	return append(base, append(extra, cliHomeEnv(cliHome)...)...)
+}
+
+// Env returns the full environment a child invocation would receive, so callers
+// can inspect it (for example to check credentials) before starting.
+func (r *Runner) Env(inv *Invocation) []string {
+	return buildEnv(r.inheritEnv, r.cliHome, inv.Env)
+}
+
+// AuthBase returns the base home directory for credential checks: the
+// configured CLI home, otherwise the process user's real home.
+func (r *Runner) AuthBase() string {
+	if r.cliHome != "" {
+		return r.cliHome
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return home
+	}
+	return ""
 }
 
 func allowlistedEnv() []string {
@@ -253,19 +275,30 @@ func allowlistedEnv() []string {
 	return env
 }
 
-// cliHomeEnv redirects a CLI's config/home to an isolated directory.
+// cliHomeEnv redirects a CLI's config/home to the configured directory. It sets
+// the roots each supported CLI resolves its config under, so the CLI derives the
+// platform-correct subpaths itself.
 func cliHomeEnv(cliHome string) []string {
 	if cliHome == "" {
 		return nil
 	}
-	home := filepath.Join(cliHome, "default")
+	home := cliHome
 	return []string{
+		// Unix roots.
 		"HOME=" + home,
 		"XDG_CONFIG_HOME=" + filepath.Join(home, ".config"),
 		"XDG_DATA_HOME=" + filepath.Join(home, ".local", "share"),
 		"XDG_CACHE_HOME=" + filepath.Join(home, ".cache"),
+		// Windows roots: a CLI on Windows resolves its config from these
+		// instead of HOME, so setting only HOME would leak the real profile.
+		"USERPROFILE=" + home,
+		"APPDATA=" + filepath.Join(home, "AppData", "Roaming"),
+		"LOCALAPPDATA=" + filepath.Join(home, "AppData", "Local"),
+		// CLI-specific config roots.
 		"CLAUDE_CONFIG_DIR=" + filepath.Join(home, ".claude"),
 		"CODEX_HOME=" + filepath.Join(home, ".codex"),
+		"CODEBUDDY_CONFIG_DIR=" + filepath.Join(home, ".codebuddy"),
+		"OPENCODE_CONFIG_DIR=" + filepath.Join(home, ".config", "opencode"),
 	}
 }
 

@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -63,6 +64,8 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 	}
 
 	cards := make([]*a2a.AgentCard, 0, len(cfg.Agents))
+	execs := make([]*bridge.CLIExecutor, 0, len(cfg.Agents))
+	authReady := make(map[string]bool, len(cfg.Agents))
 	for i := range cfg.Agents {
 		ac := cfg.Agents[i]
 		ln, info, err := integration.Build(ctx, ac, integration.Options{
@@ -81,6 +84,8 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 		resolver := workspace.NewResolverWithIsolation(cfg.Sandbox.WorkdirRoot,
 			cfg.Sandbox.AllowOutside, cfg.Sandbox.Isolation, cfg.Sandbox.IsolationRoot)
 		exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), resolver, ac.Limits)
+		execs = append(execs, exec)
+		authReady[ac.ID] = ln.AuthReady(ctx)
 		handler := a2asrv.NewHandler(exec, handlerOptions...)
 
 		path := AgentPath(ac.ID)
@@ -98,9 +103,54 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 	mux.Handle("/.well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(cards[0]))
 	mux.Handle(DiscoveryPath, bridge.NewCardsHandler(cards))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/readyz", readinessHandler(execs, authReady))
+	mux.HandleFunc("/metrics", metricsHandler(execs))
 
 	return bridge.CORSMiddleware(cfg.Server.CORSAllowedOrigins, mux), nil
+}
+
+// agentReadiness is one agent's readiness, reported on /readyz.
+type agentReadiness struct {
+	Breaker string `json:"breaker"`
+	Auth    bool   `json:"auth"`
+	Ready   bool   `json:"ready"`
+}
+
+// readinessHandler reports service readiness as JSON. An agent is ready when
+// its circuit breaker is closed and its CLI is authenticated; the service is
+// ready when at least one agent is ready.
+func readinessHandler(execs []*bridge.CLIExecutor, authReady map[string]bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		agents := make(map[string]agentReadiness, len(execs))
+		ready := false
+		for _, e := range execs {
+			name := e.Name()
+			auth := authReady[name]
+			rdy := e.Ready() && auth
+			agents[name] = agentReadiness{Breaker: e.BreakerState(), Auth: auth, Ready: rdy}
+			if rdy {
+				ready = true
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if !ready {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ready": ready, "agents": agents})
+	}
+}
+
+// metricsHandler exposes per-agent task counters and breaker state in the
+// Prometheus text exposition format.
+func metricsHandler(execs []*bridge.CLIExecutor) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		snaps := make([]bridge.MetricsSnapshot, 0, len(execs))
+		for _, e := range execs {
+			snaps = append(snaps, e.Snapshot())
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		bridge.WritePrometheus(w, snaps)
+	}
 }
 
 // authMiddleware returns the JSON-RPC authentication middleware for the

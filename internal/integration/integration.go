@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/jiaweisky/harbor/internal/acp"
+	"github.com/jiaweisky/harbor/internal/adapters"
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/parser"
@@ -19,7 +20,7 @@ import (
 type Options struct {
 	// InheritEnv passes the parent environment to the CLI when true.
 	InheritEnv bool
-	// CLIHome, when set, isolates the CLI's HOME and config roots under it.
+	// CLIHome, when set, redirects the CLI's HOME and config roots under it.
 	CLIHome string
 }
 
@@ -54,6 +55,11 @@ func Build(ctx context.Context, ac config.AgentConfig, opts Options) (agent.Laun
 	if err != nil {
 		return nil, agent.Info{}, err
 	}
+	// Login is a startup prerequisite: probe for a ticket and, if absent, run
+	// the CLI's login once. A failure disables the agent.
+	if err := ln.EnsureLogin(ctx); err != nil {
+		return nil, agent.Info{}, fmt.Errorf("login: %w", err)
+	}
 	return ln, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Path: path, Enabled: true, Version: ver}, nil
 }
 
@@ -78,12 +84,16 @@ func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 		versionArgs = profile.VersionArgs
 	}
 
+	auth := authenticator(ac)
+	login := loginInvoke(ac, auth)
+
 	switch integ {
 	case config.IntegrationStreamJSON:
 		return agent.NewHeadlessLauncher(agent.LauncherConfig{
 			Name: ac.ID, Binary: ac.Binary, Capabilities: streamJSONCaps(),
-			Parser: parser.NewStreamJSON(), Invoke: streamJSONInvoke(ac),
-			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
+			Parser: parser.NewStreamJSON(), Invoke: streamJSONInvoke(ac), LoginInvoke: login,
+			Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
+			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
 		}), nil
 	case config.IntegrationExec:
@@ -93,13 +103,15 @@ func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 		}
 		return agent.NewHeadlessLauncher(agent.LauncherConfig{
 			Name: ac.ID, Binary: ac.Binary, Capabilities: textCaps(),
-			Parser: p, Invoke: textInvoke(ac),
-			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
+			Parser: p, Invoke: textInvoke(ac), LoginInvoke: login,
+			Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
+			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
 		}), nil
 	case config.IntegrationACP:
 		return acp.NewLauncher(acp.Config{
 			Name: ac.ID, Binary: ac.Binary, Args: ac.Args, Env: envSlice(ac.Env),
+			Auth:          auth,
 			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
 		}), nil
@@ -117,10 +129,38 @@ func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 	}
 }
 
+// authenticator returns the CLI's authenticator: a built-in adapter for a known
+// CLI, or an unverifiable one for a generic CLI. The probed version lets the
+// adapter branch on version-specific behavior.
+func authenticator(ac config.AgentConfig) agent.Authenticator {
+	if a, ok := adapters.AuthFor(ac.Binary, ac.Version); ok {
+		return a
+	}
+	return adapters.Unverified()
+}
+
+// loginInvoke builds the invocation that runs the CLI's login command, or nil
+// when the CLI has no headless login.
+func loginInvoke(ac config.AgentConfig, auth agent.Authenticator) agent.InvokeFunc {
+	args := auth.LoginArgs()
+	if len(args) == 0 {
+		return nil
+	}
+	return func(req *agent.Request) (*agent.Invocation, error) {
+		return &agent.Invocation{
+			Bin:  ac.Binary,
+			Args: append([]string(nil), args...),
+			Dir:  req.WorkDir,
+			Env:  envSlice(ac.Env),
+		}, nil
+	}
+}
+
 // streamJSONCaps describes a CLI driven over its structured, duplex stream mode.
 func streamJSONCaps() agent.Capabilities {
 	return agent.Capabilities{
 		InputText:           true,
+		InputFile:           true,
 		InputPrompt:         true,
 		OutputText:          true,
 		Permission:          agent.PermInteractive,
@@ -134,6 +174,7 @@ func streamJSONCaps() agent.Capabilities {
 func textCaps() agent.Capabilities {
 	return agent.Capabilities{
 		InputText:     true,
+		InputFile:     true,
 		InputPrompt:   true,
 		OutputText:    true,
 		Permission:    agent.PermFlagOnly,

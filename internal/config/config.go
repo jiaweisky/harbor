@@ -44,7 +44,7 @@ type SandboxConfig struct {
 	Isolation     string `yaml:"isolation"`      // shared | worktree | copy
 	IsolationRoot string `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
 	InheritEnv    *bool  `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
-	CLIHome       string `yaml:"cli_home"`       // base dir for isolated CLI config/home
+	CLIHome       string `yaml:"cli_home"`       // optional root for the CLI's config/home
 }
 
 // InheritEnvEnabled reports whether child processes inherit the parent
@@ -125,7 +125,7 @@ type RegexConfig struct {
 
 // Profile describes a known coding-agent CLI: which integrations it supports,
 // the default integration, the minimum supported version, and how to read the
-// version.
+// version. The CLI's authentication surface lives with the CLI's adapter.
 type Profile struct {
 	Binary      string        // matched against the binary's base name
 	Integration Integration   // default integration

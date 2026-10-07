@@ -14,6 +14,13 @@ const (
 	stateHalfOpen
 )
 
+// Breaker state names reported by State.
+const (
+	stateNameClosed   = "closed"
+	stateNameOpen     = "open"
+	stateNameHalfOpen = "half-open"
+)
+
 // breaker is a per-agent failure circuit breaker. It opens after a number of
 // consecutive failures, rejects calls while open, and probes once after a
 // cooldown. A nil or zero-threshold breaker is disabled.
@@ -69,6 +76,24 @@ func (b *breaker) Allow() bool {
 		return true
 	default:
 		return true
+	}
+}
+
+// State reports the breaker's current state without side effects. A nil breaker
+// (disabled) reports closed.
+func (b *breaker) State() string {
+	if b == nil {
+		return stateNameClosed
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch b.state {
+	case stateOpen:
+		return stateNameOpen
+	case stateHalfOpen:
+		return stateNameHalfOpen
+	default:
+		return stateNameClosed
 	}
 }
 

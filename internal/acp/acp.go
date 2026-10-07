@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 )
@@ -33,6 +34,7 @@ type Config struct {
 	Binary          string
 	Args            []string
 	Env             []string // extra environment entries ("K=V"), on top of the inherited/allowlisted base
+	Auth            agent.Authenticator
 	MaxConcurrent   int
 	InheritEnv      bool
 	CLIHome         string
@@ -57,11 +59,28 @@ func NewLauncher(cfg Config) *Launcher {
 
 func (l *Launcher) Name() string { return l.cfg.Name }
 
+func (l *Launcher) Auth() agent.Authenticator { return l.cfg.Auth }
+
+// authEnv is the environment a CLI's auth commands run with.
+func (l *Launcher) authEnv() []string { return l.runner.Env(&agent.Invocation{Env: l.cfg.Env}) }
+
+// AuthReady reports whether the CLI currently holds a usable ticket.
+func (l *Launcher) AuthReady(ctx context.Context) bool {
+	return agent.Authenticated(ctx, l.cfg.Binary, l.runner.AuthBase(), l.authEnv(), l.cfg.Auth)
+}
+
+// EnsureLogin verifies the CLI holds a ticket, attempting its login once when
+// none is present.
+func (l *Launcher) EnsureLogin(ctx context.Context) error {
+	return agent.EnsureLogin(ctx, l.cfg.Name, l.cfg.Binary, l.runner.AuthBase(), l.authEnv(), l.cfg.Auth)
+}
+
 // Capabilities describes an ACP agent: token streaming, tool traces, and native
 // interaction through permission requests, which resume within the turn.
 func (l *Launcher) Capabilities() agent.Capabilities {
 	return agent.Capabilities{
 		InputText:           true,
+		InputFile:           true,
 		InputPrompt:         true,
 		OutputText:          true,
 		ToolTrace:           true,
@@ -92,6 +111,9 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	if err != nil {
 		return nil, err
 	}
+	if req.Login {
+		return l.startLogin(ctx, cwd)
+	}
 
 	taskID := agent.TaskIDFrom(ctx)
 	inv := &agent.Invocation{
@@ -120,6 +142,49 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	s.startPrompt(ctx, sessionID, req.Prompt)
 	return s, nil
 }
+
+// startLogin runs the CLI's login command and streams its output so a client
+// can read a device-code URL and complete the login out of band. It does not
+// speak ACP: the login command is a plain subprocess.
+func (l *Launcher) startLogin(ctx context.Context, cwd string) (agent.Session, error) {
+	if l.cfg.Auth == nil || len(l.cfg.Auth.LoginArgs()) == 0 {
+		return nil, agent.ErrNoLogin
+	}
+	inv := &agent.Invocation{
+		Bin:  l.cfg.Binary,
+		Args: append([]string(nil), l.cfg.Auth.LoginArgs()...),
+		Dir:  cwd,
+		Env:  append([]string(nil), l.cfg.Env...),
+	}
+	taskID := agent.TaskIDFrom(ctx)
+	events, err := l.runner.Start(ctx, taskID, inv, agent.NewLineParser())
+	if err != nil {
+		return nil, err
+	}
+	return &loginSession{events: events, kill: func() { l.runner.Kill(taskID) }}, nil
+}
+
+// loginSession streams a login command's output; it accepts no out-of-band
+// input.
+type loginSession struct {
+	events   <-chan agent.Event
+	kill     func()
+	canceled atomic.Bool
+}
+
+func (s *loginSession) Events() <-chan agent.Event { return s.events }
+
+func (s *loginSession) Send(context.Context, agent.Input) error { return agent.ErrUnsupported }
+
+func (s *loginSession) Cancel() error {
+	s.canceled.Store(true)
+	if s.kill != nil {
+		s.kill()
+	}
+	return nil
+}
+
+func (s *loginSession) Canceled() bool { return s.canceled.Load() }
 
 // absWorkDir returns an absolute working directory, falling back to the process
 // working directory when the request carries none.

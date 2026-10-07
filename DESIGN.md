@@ -560,6 +560,7 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 - A2A `contextId` = 一条对话线程；`taskId` = 一次请求。
 - 首个任务从 CLI 输出解析出原生 `sessionId`，写入 `SessionStore：contextId → sessionId`。
 - 后续同 `contextId` 的请求，Adapter 自动附加 `--resume <sessionId>`（claude/codebuddy）或 `--session <id>` / `--continue`（opencode）。
+- **按调用方作用域**：`contextId` 由客户端提供，故 `contextId → CLI session` 与 `contextId → 工作树` 的绑定都加上**已鉴权用户**（key = `user + "\x00" + contextId`）；否则 A 复用 B 的 `contextId` 就能续到 B 的会话/工作树。未鉴权（无 user）时退化为仅按 `contextId`。
 - `--fork` / `--fork-session` 语义可用 A2A 元数据（`SendMessageConfig` / `Message.Metadata`）选择“续写或分叉”。
 
 ### 6.5 权限/澄清交互（input-required）
@@ -634,6 +635,7 @@ coding agent 的核心产出是**代码改动**，必须作为 artifact 交付�
 | `harbor.maxTurns` | int | 最大轮次 |
 | `harbor.continue` | bool | 无 sessionId 时续用最近会话（`--continue`） |
 | `harbor.interactionId` | string | 回答 `input-required` 时回带的交互 id（§7.4） |
+| `harbor.login` | bool | 运行 CLI 登录命令而非 prompt（重新获取票据，见 §10.4） |
 
 **错误码**（失败时置于 `TaskStatus.Message.Metadata["harbor.errorCode"]`，值域固定）：
 
@@ -756,6 +758,8 @@ type Capabilities struct {
 
 要点：**能力校验前置**——请求中的媒体类型/交互若不在生效能力内，立即以 `ErrUnsupportedContentType` / 拒绝态返回，**不要**启动 CLI 后再失败。
 
+**已落地**：Executor 按 part 类型拼装 prompt——多个 `TextPart` 拼接；`DataPart` 序列化为 JSON 进入 prompt；`FilePart(raw)` 落到 `<workDir>/.harbor/uploads/` 并在 prompt 中给出路径，`FilePart(URL)` 直接引用 URL。**能力校验前置**：图片 MIME 不在 `InputImage` 内、或文件而无 `InputFile` 时，返回 `unsupported_content` 且不启动 CLI；`InputModes()` 在 `InputFile` 时投影 `application/octet-stream`。未接入：CLI 专用附件参数（`--file`/`@path`/`--add-dir`）、`DataPart` 经 `--input-format stream-json` 直传、结构化输出（`--json-schema`/`--output-schema`）。
+
 ### 7.6 功能支持矩阵（依据本机 `-h` 实测）
 
 依据：用户提供并本机实测的 `opencode -h` / `codebuddy -h` / `claude -h` / `codex -h` 及 `codex exec -h`。
@@ -851,7 +855,7 @@ func init() { agent.RegisterAdapter("weird-cli", newWeirdAdapter) }
    - AgentCard 声明 `securitySchemes`（HTTP bearer）+ `securityRequirements`（见 §6.1）；
    - **安全联锁**：`listen` 非 loopback 且**没有鉴权**（`auth.mode == none`）时**拒绝启动**，除非显式 `allow_insecure: true`（用于反代/网格已鉴权的场景）；任何非 `none` 的鉴权方式都放行。loopback 默认无需鉴权。
    - **作用域**：Bearer 中间件**只包 JSON-RPC 端点**；卡片与发现端点（`/.well-known/agent-card.json`、`/.well-known/agents.json`、`/agents/{id}/.well-known/agent-card.json`）**公开**——客户端需先取卡才知道鉴权 scheme，且 codebuddy 拉卡时不带 token。
-   **不计划支持** OAuth2 / mTLS / 令牌内省 / 细粒度授权（YAGNI）。若需“按调用方凭据”，见 §10 的 BYO key 模型，而非引入这些方案。
+   **不计划支持** OAuth2 / mTLS / 令牌内省 / 细粒度授权（YAGNI）。按调用方凭据（§10.2 模型 B）不实现；如需按用户额度/计费，起多个 Harbor 实例各用不同 OS 用户。
 2. **上游凭据与登录**：见 **§10**（CLI 自身的 provider 登录/凭据隔离，与本条的服务鉴权是两件事）。
 3. **工作目录沙箱**：所有任务限定在 `sandbox.workdir_root` 内；`allow_outside` 默认 `false`；realpath/前缀校验拒绝 `..` 与 symlink 逃逸（详见 §6.7）。
 4. **环境变量**：**默认继承启动用户环境**（不少 CLI 依赖它）；`sandbox.inherit_env: false` 时仅注入白名单（`PATH`/`HOME`/`LANG`/`LC_ALL`/`TERM`/`TMPDIR`）+ `agents[].env`，以减少凭据暴露。
@@ -878,12 +882,12 @@ func init() { agent.RegisterAdapter("weird-cli", newWeirdAdapter) }
 
 | 模型 | 说明 | 适用 |
 |---|---|---|
-| **A. 服务级凭据** | Harbor 主机预置一套已登录 CLI 的 config/家目录或 API key，所有 A2A 调用共享。 | 团队/组织共享一个编程 Agent；**M1 默认** |
-| **B. 按调用方凭据** | 每个 A2A 用户用自己的 provider key / 登录态；Harbor 按用户隔离存储或按请求注入。 | 多租户、BYO 额度、成本归属 |
+| **A. 服务级凭据** | Harbor 以某个 OS 用户运行，**每个 CLI 一份**登录票据；所有通过 A2A 鉴权的调用方共享。调用方之间的区分靠鉴权 + 会话（`contextId`）。 | **本项目采用**；多份凭据 → 多个 Harbor 实例（各用不同 OS 用户） |
+| **B. 按调用方凭据** | 每个 A2A 用户用自己的 provider key / 登录态；Harbor 按用户隔离存储或按请求注入。 | **不实现**（见下）；如需按用户额度/计费，用多实例而非进程内多凭据 |
 
 ### 10.3 关键机制：隔离 CLI 的 config/home
 
-无论哪种模型，**绝不能让子进程直接读写服务器的真实 `~` / Keychain**（污染、串号、泄漏）。主机制是**每个 tenant 一个独立 `HOME`**（默认即可覆盖所有 CLI 的 `~/.xxx`），再按 CLI 叠加专用变量做精细覆盖；默认继承启动用户环境（`inherit_env: true`），设为 `false` 时只显式注入该 tenant 的凭据。
+建议让子进程的 CLI config/home 落在 Harbor 管理的目录而非直接读写服务器的真实 `~`（可重定向时；其中 `~` 用 `HOME`/`XDG_*` 等覆盖，Keychain 不可重定向）。主机制是把 CLI 的 config/home 根重定向到 `sandbox.cli_home`（本项目单凭据，一份即可），再按 CLI 叠加专用变量做精确覆盖；默认继承启动用户环境（`inherit_env: true`），设为 `false` 时只注入白名单 + `agents[].env`。
 
 | CLI | 默认配置根 | 覆盖变量 | 依据 |
 |---|---|---|---|
@@ -893,10 +897,12 @@ func init() { agent.RegisterAdapter("weird-cli", newWeirdAdapter) }
 | codex | `$CODEX_HOME`（默认 `~/.codex`） | `CODEX_HOME` | ✅ 由 `codex -h` 确认 |
 
 ```
-HOME=<harbor_home>/<tenant>
-CLAUDE_CONFIG_DIR=<...>/claude
-CODEX_HOME=<...>/codex
-XDG_CONFIG_HOME=<...>/config       # opencode 等遵循 XDG
+HOME=<cli_home>
+CLAUDE_CONFIG_DIR=<cli_home>/.claude
+CODEX_HOME=<cli_home>/.codex
+XDG_CONFIG_HOME=<cli_home>/.config   # opencode 等遵循 XDG
+USERPROFILE=<cli_home>               # Windows 根
+APPDATA=<cli_home>/AppData/Roaming
 ```
 
 > 优先用 `HOME`（对所有 CLI 生效），专用变量仅作精确覆盖；各 CLI 的配置根以其实测 `-h`/文档为准（M1 接 codebuddy + opencode：codebuddy 同 claude 用 `CLAUDE_CONFIG_DIR`/`ANTHROPIC_API_KEY` 一类的变量待实测，opencode 记 `XDG_CONFIG_HOME`）。
@@ -912,7 +918,7 @@ XDG_CONFIG_HOME=<...>/config       # opencode 等遵循 XDG
 ### 10.4 Headless 登录的可行路径
 
 1. **预置（推荐）**：在带浏览器的机器上完成登录 / 生成 API key / `claude setup-token` / `codex login`，把结果以 **secret** 挂载进 Harbor；Harbor 不负责交互登录。
-2. **API key 注入（BYO）**：调用方按请求携带 provider key，Harbor 仅注入子进程 env，**不落盘**；需防日志泄漏。
+2. **API key 注入（BYO，不实现）**：调用方按请求携带 provider key、只注入当次子进程 env。本项目不采用（模型 A 单凭据），留作记录。
 3. **设备码 / 登录任务（进阶）**：Harbor 发起登录，把 URL/码作为 A2A 消息/artifact 返回（可 `input-required`），客户端/管理员完成后 Harbor 收口 token——把“登录”建模成一个 A2A 任务。
 4. 明确**不追求**在 headless 上跑浏览器 OAuth 回调。
 
@@ -927,7 +933,7 @@ XDG_CONFIG_HOME=<...>/config       # opencode 等遵循 XDG
 - 存储：优先**外部 secret（挂载 / KMS / Vault）**；自管理时用主密钥加密落盘；**不依赖服务器 Keychain**。
 - 轮换/删除：支持更新与吊销；登录态目录可整目录清除。
 - 最小暴露：凭据不进日志 / artifact / push；错误信息脱敏。
-- 审计：记录“哪个 tenant 用哪个 credential 执行了哪个任务”。
+- 审计：记录“哪个 user 用哪个 agent 执行了哪个任务”（单凭据模型）。
 
 ### 10.7 辨析：两个“OAuth2”别混为一谈
 
@@ -941,6 +947,18 @@ XDG_CONFIG_HOME=<...>/config       # opencode 等遵循 XDG
 - 即“OAuth2 与 /login 强相关”**在语义层成立、在实现层可解耦**。
 
 > M1 范围：**服务级凭据（模型 A）+ CLI home 隔离 + `Probe` 认证探测 + 鉴权失效类型化错误**。按调用方凭据（模型 B）与“登录任务”留后续。
+
+**已落地（模型 A，单凭据）**：Harbor 以某个操作系统用户运行，**每个 CLI 只在该系统用户下维护一份登录票据**，所有通过 A2A 鉴权的调用方共用它；调用方之间的区分靠**鉴权（谁能调）+ 会话（`contextId`）**，不做按调用方的凭据隔离。（如需多份凭据，直接起多个 Harbor 实例、各自用不同系统用户。）
+
+认证逻辑抽象为 `agent.Authenticator` 接口（`CredentialEnv` / `LoggedIn(home, env)` / `StatusArgs` / `LoggedInStatus` / `LoginArgs`），每个 CLI 在 `internal/adapters/` 用自己的文件实现，按二进制名注册（`adapters.AuthFor(binary, version)`）。工厂接收**探得的版本号**，因此当某版本改了状态/输出格式时，只需在**那一个 adapter 文件**里按版本号加兼容分支（`Factory(version)`），不预先构建变体框架、不动其它包。机制：
+
+- **登录是启动前置**：`integration.Build` 调用 `Launcher.EnsureLogin`——探测票据（有状态命令则运行，如 claude `auth status` / codex `login status`；否则看凭据文件/env）；**有** → agent 就绪；**没有** → 运行 CLI 登录命令（`Authenticator.LoginArgs`，输出逐行打进日志，便于运维看设备码/URL），成功后**再次校验**；仍拿不到票据 → 该 agent 不可用（`ErrAuthRequired`），全部不可用则拒绝启动。
+- **票据定位**：`sandbox.cli_home` 可选——设置时把 **Unix 根** `HOME`/`XDG_*`、**Windows 根** `USERPROFILE`/`APPDATA`/`LOCALAPPDATA` 及 CLI 专用 `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`CODEBUDDY_CONFIG_DIR`/`OPENCODE_CONFIG_DIR` 重定向到该目录；未设置则用系统用户的真实 home/keychain。`LoggedIn` 从**生效 env 的取值**解析配置位置（如 `CLAUDE_CONFIG_DIR`/`XDG_DATA_HOME`/`CODEX_HOME`），因此同一 CLI 在不同 OS/自定义路径下都能定位票据。
+- **`harbor.login` 任务**：请求元数据 `harbor.login: true` 时运行登录命令并按文本流式返回输出，进程退出即完成——用于**运行期重新获取票据**（无需重启 Harbor）。
+- **`/readyz`**：就绪 = 熔断关闭 **且** `AuthReady`（按 CLI 状态命令/凭据对系统用户探测）。
+- **检测不绕过钥匙串**：优先用 CLI 自身状态命令（会正确读取 Keychain/OAuth），无状态命令才退到 env/文件；两者都不行的 CLI（codebuddy）标记“不可验证”（`LoggedIn` 恒真，不做否定判定）。
+
+**刻意不做**：登录过程的 `input-required` 双向 stdin——a2a-go 对**运行中**任务的后续消息返回 `ErrExecutionInProgress`，只有 `input-required` 才能回传，而登录进程自行退出时无法在暂停态完成任务，会卡死；设备码登录（codex/claude）无需 stdin，opencode 交互式登录可用 `OPENCODE_AUTH_CONTENT` 预置。
 
 ---
 
@@ -1026,7 +1044,7 @@ limits:
 - **追踪**：OpenTelemetry，A2A 请求 → CLI 子进程 span。
 - **健康检查**：`/healthz`（服务）、`/readyz`（各 CLI `Probe` + **认证状态**，见 §10.5）。
 
----
+**已落地**：`/metrics` 以 Prometheus 文本格式暴露每 agent 的 `harbor_tasks_submitted_total`、`harbor_tasks_total{outcome}`、`harbor_tasks_active`、`harbor_breaker_state`；`/readyz` 返回 JSON（`{ready, agents{id:{breaker,auth,ready}}}`），agent 就绪 = 熔断关闭 **且** CLI 已认证（§10.5），全部不可用则 503；任务提交/终态经 `log/slog` 审计（`agent`/`task`/`user`/`outcome`）。未实现：任务时长直方图、token/费用指标、OpenTelemetry 追踪。
 
 ## 14. 目录结构
 
@@ -1092,6 +1110,7 @@ sandbox:
   allow_outside: false
   isolation: shared          # shared | worktree | copy（见 §6.7）
   inherit_env: true
+  cli_home: "/srv/harbor-cli-home"   # 可选：把 CLI config/home 重定向到此（见 §10.3）
   default_timeout: 30m
   max_concurrent: 8
   # container: { image: "harbor/claude:latest", network: none }  # 可选强隔离（§9）
@@ -1213,8 +1232,8 @@ codebuddy
 | **M2 可靠性与测试** | 假 CLI 夹具 + golden 测试；并发配额 / 超时 / 取消；SSE 节流；崩溃恢复、孤儿清理、**熔断/健康**（§11.1/§11.2）。 |
 | **M3 多 Agent 宽度** | codex（独立 JSONL Parser）、generic 配置 Adapter、claude 顺带；多 agent 路由与多卡片。 |
 | **M4 产出与交互完善** | ~~代码变更 artifact（diff / 文件，见 §6.8）~~（已落地）、~~push notifications~~（已落地）、~~交互规范化（Canonical interaction + `input-required` DataPart + Card 扩展，见 §7.4）~~（已落地，ACP 路径）、完整交互降级矩阵（question / plan_approval / `--resume` 有损注入）、durable interaction。 |
-| **M5 安全与运维** | 容器 / worktree 沙箱、指标、审计日志、持久化 TaskStore。 |
-| **M6 进阶** | ~~ACP 集成模式~~（已落地，stdio）、按调用方凭据 / 登录任务（§10）、Go plugin 扩展。 |
+| **M5 安全与运维** | 容器 / worktree 沙箱、~~指标~~（已落地，Prometheus 文本）、~~审计日志~~（已落地，slog）、~~持久化 TaskStore~~（已落地，JSON 文件）。 |
+| **M6 进阶** | ~~ACP 集成模式~~（已落地，stdio）、~~启动前置登录 + `harbor.login` 任务（§10，模型 A）~~（已落地）、Go plugin 扩展。 |
 
 ---
 
@@ -1765,4 +1784,4 @@ a2a send http://localhost:8080/agents/opencode  "list files"
 6. **模块路径/命名（已定）**：`github.com/jiaweisky/harbor`（对应 repo `https://github.com/jiaweisky/harbor.git`）。
 7. **codex 适配（已定，M3）**：已确认非交互入口 `codex exec`、事件流 `--json`（JSONL）、结构化输出 `--output-schema`、常驻 `app-server`、续跑 `codex exec resume`。**为何需独立 Parser**：JSONL 只是分帧，codex 的 item/turn 事件 schema 与 claude 的 message/`content_block`  schema 不同，Parser 必须先归一化，配置/正则无法可靠映射嵌套事件（仅多注册一个 Parser，其余全部复用）。**为何不在 M1**：M1 追求“用最少的 adapter 打通链路”，codebuddy 的 stream-json 覆盖构造最全且与 claude 共用 Parser，投入即覆盖 2 个 agent；codex 只增宽度、不验证新架构点，故归 M3「多 Agent」。可按需提前到 M2。
 8. **能力模型落地范围（已定，M1）**：M1 即引入 `Capabilities` 类型与 `Adapter.Capabilities()`，由 AgentCard 投影读取；**只填 M1 用到的字段**（文本 in/out、逐 token 流式、会话续跑、权限模型），其余留默认零值。理由：能力从第一天就是单一事实来源（§7.2），避免 M2 返工；成本仅多一个结构体，非过度设计。
-9. **CLI 凭据模型（已定，M1）**：采用**服务级凭据（模型 A）+ 每 tenant `HOME` 隔离**（§10.3）。M1 接 codebuddy + opencode；codebuddy 的 provider 凭据变量（同 claude 系）与 opencode 的配置根（`XDG_CONFIG_HOME` 等）在落地时实测；`CODEX_HOME` 已由 `codex -h` 确认。按请求 BYO key 与“登录任务”留 M6。
+9. **CLI 凭据模型（已定）**：采用**服务级凭据（模型 A）**——Harbor 以某个 OS 用户运行，每个 CLI 一份登录票据，所有鉴权通过的调用方共享；调用方隔离靠鉴权 + 会话（`contextId`）。登录是**启动前置**（`EnsureLogin`：探测→必要时跑 CLI 登录命令→复检，失败则 agent 不可用），`harbor.login` 任务用于运行期重新取票。**不实现**按调用方凭据（模型 B）与按请求 BYO 注入；如需多份凭据，起多个 Harbor 实例各用不同 OS 用户。票据定位优先 CLI 状态命令（会读 Keychain/OAuth），无状态命令才退到 env/文件。
