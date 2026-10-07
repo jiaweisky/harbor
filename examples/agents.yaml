@@ -1,0 +1,34 @@
+version: 1
+
+server:
+  listen: "127.0.0.1:8080"
+  base_url: "http://127.0.0.1:8080"
+  auth:
+    mode: none
+    tokens: []
+
+sandbox:
+  workdir_root: "/tmp/harbor-workspaces"
+  allow_outside: false
+  isolation: shared
+  inherit_env: true
+  default_timeout: 30m
+  max_concurrent: 8
+
+agents:
+  - id: codebuddy
+    display_name: "CodeBuddy"
+    binary: codebuddy
+    integration: stream-json
+    args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages"]
+    session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
+    limits: { max_concurrent: 3, timeout: 30m }
+
+  - id: opencode
+    display_name: "OpenCode"
+    binary: opencode
+    integration: exec
+    parser: text
+    args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]
+    session: { id_flag: "--session", continue_flag: "--continue" }
+    limits: { max_concurrent: 2, timeout: 30m }

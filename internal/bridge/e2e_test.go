@@ -1,0 +1,357 @@
+package bridge_test
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
+
+	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/bridge"
+	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/integration"
+	"github.com/jiaweisky/harbor/internal/session"
+)
+
+func scriptPath(t *testing.T, name string) string {
+	t.Helper()
+	p, err := filepath.Abs(filepath.Join("..", "..", "testdata", "fake-cli", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func newLauncher(
+	t *testing.T, script string, integ config.Integration, args []string, env map[string]string,
+) agent.Launcher {
+	t.Helper()
+	ac := config.AgentConfig{
+		ID:          string(integ),
+		Binary:      script,
+		Integration: integ,
+		Args:        args,
+		Env:         env,
+		Session:     config.SessionConfig{IDFlag: "--session-id", ResumeFlag: "--resume", ContinueFlag: "--continue"},
+	}
+	ln, err := integration.New(ac, true)
+	if err != nil {
+		t.Fatalf("integration.New: %v", err)
+	}
+	return ln
+}
+
+func newHandler(t *testing.T, ln agent.Launcher) a2asrv.RequestHandler {
+	t.Helper()
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions())
+	return a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+}
+
+func message(text string) *a2a.Message {
+	return a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart(text))
+}
+
+func artifactText(task *a2a.Task) string {
+	var b strings.Builder
+	for _, a := range task.Artifacts {
+		for _, p := range a.Parts {
+			b.WriteString(p.Text())
+		}
+	}
+	return b.String()
+}
+
+func TestSendMessage_codebuddy(t *testing.T) {
+	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task, ok := resp.(*a2a.Task)
+	if !ok {
+		t.Fatalf("result type %T", resp)
+	}
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+	if got := artifactText(task); !strings.Contains(got, "Hello world") {
+		t.Fatalf("artifact text = %q", got)
+	}
+}
+
+func TestStreaming_codebuddy(t *testing.T) {
+	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	updates := 0
+	for ev, err := range h.SendStreamingMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")}) {
+		if err != nil {
+			t.Fatalf("stream error: %v", err)
+		}
+		if _, ok := ev.(*a2a.TaskArtifactUpdateEvent); ok {
+			updates++
+		}
+	}
+	if updates < 1 {
+		t.Fatalf("expected >=1 artifact update, got %d", updates)
+	}
+}
+
+func TestSessionResume_codebuddy(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "args.log")
+	env := map[string]string{"HARBOR_ARG_LOG": logPath}
+
+	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, env))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const ctxID = "ctx-resume-1"
+	m1 := message("first")
+	m1.ContextID = ctxID
+	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m1}); err != nil {
+		t.Fatalf("first SendMessage: %v", err)
+	}
+
+	m2 := message("second")
+	m2.ContextID = ctxID
+	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m2}); err != nil {
+		t.Fatalf("second SendMessage: %v", err)
+	}
+
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read arg log: %v", err)
+	}
+	if !strings.Contains(string(b), "--resume sess-123") {
+		t.Fatalf("expected --resume sess-123 in args, got:\n%s", string(b))
+	}
+}
+
+func TestSendMessage_opencode(t *testing.T) {
+	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-opencode.sh"), "exec", []string{"run", "{{.Prompt}}"}, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("list files")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+	if got := artifactText(task); !strings.Contains(got, "listing files") {
+		t.Fatalf("artifact text = %q", got)
+	}
+}
+
+func TestCancel(t *testing.T) {
+	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-slow.sh"), "stream-json", nil, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	seq := h.SendStreamingMessage(ctx, &a2a.SendMessageRequest{Message: message("go")})
+	taskCh := make(chan a2a.TaskID, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ev, err := range seq {
+			if err != nil {
+				return
+			}
+			if tk, ok := ev.(*a2a.Task); ok {
+				select {
+				case taskCh <- tk.ID:
+				default:
+				}
+			}
+		}
+	}()
+
+	var taskID a2a.TaskID
+	select {
+	case taskID = <-taskCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no task id received")
+	}
+
+	// Wait until the task is working (subprocess started) before canceling.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := h.GetTask(ctx, &a2a.GetTaskRequest{ID: taskID})
+		if err == nil && got.Status.State == a2a.TaskStateWorking {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := h.CancelTask(ctx, &a2a.CancelTaskRequest{ID: taskID}); err != nil {
+		t.Fatalf("CancelTask: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatal("stream did not finish after cancel")
+	}
+
+	got, err := h.GetTask(ctx, &a2a.GetTaskRequest{ID: taskID})
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.Status.State != a2a.TaskStateCanceled {
+		t.Fatalf("state = %s", got.Status.State)
+	}
+}
+
+func TestCardVersion(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
+	info := ln.Probe(context.Background())
+	card := bridge.BuildCard(ln, info, "http://example/agents/x/", false)
+	if len(card.SupportedInterfaces) != 1 {
+		t.Fatalf("interfaces = %d", len(card.SupportedInterfaces))
+	}
+	if card.SupportedInterfaces[0].ProtocolVersion != a2a.Version {
+		t.Fatalf("protocol version = %s", card.SupportedInterfaces[0].ProtocolVersion)
+	}
+}
+
+func TestModelPassthrough(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "args.log")
+	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil,
+		map[string]string{"HARBOR_ARG_LOG": logPath}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m := message("hi")
+	m.Metadata = map[string]any{"harbor.model": "gpt-x"}
+	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read arg log: %v", err)
+	}
+	if !strings.Contains(string(b), "--model gpt-x") {
+		t.Fatalf("expected --model gpt-x in args, got:\n%s", string(b))
+	}
+}
+
+func TestErrorCode(t *testing.T) {
+	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-fail.sh"), "stream-json", nil, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateFailed {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+	if task.Status.Message == nil {
+		t.Fatal("no status message")
+	}
+	code, _ := task.Status.Message.Metadata["harbor.errorCode"].(string)
+	if code != "internal" {
+		t.Fatalf("errorCode = %q", code)
+	}
+}
+
+func TestRequireAuthOnExposedBind(t *testing.T) {
+	cases := []struct {
+		name          string
+		listen, mode  string
+		allowInsecure bool
+		wantErr       bool
+	}{
+		{"loopback no auth", "127.0.0.1:8080", "none", false, false},
+		{"localhost no auth", "localhost:8080", "none", false, false},
+		{"exposed no auth", "0.0.0.0:8080", "none", false, true},
+		{"empty host no auth", ":8080", "none", false, true}, // empty host binds all interfaces
+		{"exposed with bearer", "0.0.0.0:8080", "bearer", false, false},
+		{"exposed but allow_insecure", "0.0.0.0:8080", "none", true, false},
+	}
+	for _, c := range cases {
+		err := bridge.RequireAuthOnExposedBind(c.listen, c.mode, c.allowInsecure)
+		if (err != nil) != c.wantErr {
+			t.Errorf("%s: RequireAuthOnExposedBind(%q,%q,%v) err=%v, wantErr=%v",
+				c.name, c.listen, c.mode, c.allowInsecure, err, c.wantErr)
+		}
+	}
+}
+
+func TestDiscoveryAggregate(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
+	card := bridge.BuildCard(ln, ln.Probe(context.Background()), "http://example/agents/x/", false)
+
+	mux := http.NewServeMux()
+	mux.Handle("/.well-known/agents.json", bridge.NewCardsHandler([]*a2a.AgentCard{card}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/.well-known/agents.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var cards []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&cards); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(cards) != 1 {
+		t.Fatalf("cards = %d", len(cards))
+	}
+}
+
+func TestAuthScope(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
+	card := bridge.BuildCard(ln, ln.Probe(context.Background()), "http://example/agents/x/", true)
+
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions())
+	h := a2asrv.NewHandler(exec)
+
+	mux := http.NewServeMux()
+	mux.Handle("/agents/x/", bridge.BearerMiddleware([]string{"secret"}, a2asrv.NewJSONRPCHandler(h)))
+	mux.Handle("/agents/x/.well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(card))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Card is public (no token) -> 200.
+	cardResp, err := http.Get(srv.URL + "/agents/x/.well-known/agent-card.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cardResp.Body.Close()
+	if cardResp.StatusCode != http.StatusOK {
+		t.Fatalf("card status = %d", cardResp.StatusCode)
+	}
+
+	// RPC without token -> 401.
+	body := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{}}`)
+	rpcResp, err := http.Post(srv.URL+"/agents/x/", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rpcResp.Body.Close()
+	if rpcResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("rpc status = %d", rpcResp.StatusCode)
+	}
+}

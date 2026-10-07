@@ -1,0 +1,22 @@
+# Build output
+/bin/
+*.exe
+*.test
+*.out
+
+# Coverage
+/coverage.out
+/coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local opencode session state
+.opencode/
