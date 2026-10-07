@@ -8,16 +8,25 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jiaweisky/harbor/internal/acp"
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/parser"
 	versionutil "github.com/jiaweisky/harbor/internal/version"
 )
 
+// Options controls how a launcher's processes are run.
+type Options struct {
+	// InheritEnv passes the parent environment to the CLI when true.
+	InheritEnv bool
+	// CLIHome, when set, isolates the CLI's HOME and config roots under it.
+	CLIHome string
+}
+
 // Build probes the CLI and constructs a launcher. A missing binary yields a
 // disabled Info with no error; an unsupported version yields an error so the
 // agent is refused rather than run against an unknown binary.
-func Build(ctx context.Context, ac config.AgentConfig, inheritEnv bool) (agent.Launcher, agent.Info, error) {
+func Build(ctx context.Context, ac config.AgentConfig, opts Options) (agent.Launcher, agent.Info, error) {
 	path, err := exec.LookPath(ac.Binary)
 	if err != nil {
 		return nil, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Enabled: false, Err: err}, nil
@@ -41,17 +50,16 @@ func Build(ctx context.Context, ac config.AgentConfig, inheritEnv bool) (agent.L
 	}
 
 	ac.Version = ver // reuse the probed version; avoids re-probing in the launcher
-	ln, err := New(ac, inheritEnv)
+	ln, err := New(ac, opts)
 	if err != nil {
 		return nil, agent.Info{}, err
 	}
 	return ln, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Path: path, Enabled: true, Version: ver}, nil
 }
 
-// New constructs a Launcher for the given agent config. inheritEnv controls
-// whether the CLI inherits the parent process environment. When the integration
+// New constructs a Launcher for the given agent config. When the integration
 // is empty it is resolved from the CLI's known profile.
-func New(ac config.AgentConfig, inheritEnv bool) (agent.Launcher, error) {
+func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 	profile, known := config.LookupProfile(ac.Binary)
 
 	integ := ac.Integration
@@ -75,7 +83,7 @@ func New(ac config.AgentConfig, inheritEnv bool) (agent.Launcher, error) {
 		return agent.NewHeadlessLauncher(agent.LauncherConfig{
 			Name: ac.ID, Binary: ac.Binary, Capabilities: streamJSONCaps(),
 			Parser: parser.NewStreamJSON(), Invoke: streamJSONInvoke(ac),
-			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: inheritEnv,
+			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
 		}), nil
 	case config.IntegrationExec:
@@ -86,10 +94,16 @@ func New(ac config.AgentConfig, inheritEnv bool) (agent.Launcher, error) {
 		return agent.NewHeadlessLauncher(agent.LauncherConfig{
 			Name: ac.ID, Binary: ac.Binary, Capabilities: textCaps(),
 			Parser: p, Invoke: textInvoke(ac),
-			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: inheritEnv,
+			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
 		}), nil
-	case config.IntegrationServer, config.IntegrationACP:
+	case config.IntegrationACP:
+		return acp.NewLauncher(acp.Config{
+			Name: ac.ID, Binary: ac.Binary, Args: ac.Args, Env: envSlice(ac.Env),
+			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
+			VersionArgs: versionArgs, VersionOverride: ac.Version,
+		}), nil
+	case config.IntegrationServer:
 		return nil, fmt.Errorf(
 			"integration %q is recognized but not implemented yet; use %q for a CLI with "+
 				"a structured stream, or %q for one-shot text output",
@@ -181,7 +195,7 @@ func textInvoke(ac config.AgentConfig) agent.InvokeFunc {
 // sessionArgs returns the flags that continue or resume a CLI session.
 func sessionArgs(ac config.AgentConfig, req *agent.Request) []string {
 	if req.SessionID != "" {
-		if flag := firstNonEmpty(ac.Session.ResumeFlag, ac.Session.IDFlag); flag != "" {
+		if flag := agent.FirstNonEmpty(ac.Session.ResumeFlag, ac.Session.IDFlag); flag != "" {
 			return []string{flag, req.SessionID}
 		}
 		return nil
@@ -220,13 +234,4 @@ func envSlice(env map[string]string) []string {
 		out = append(out, k+"="+v)
 	}
 	return out
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }

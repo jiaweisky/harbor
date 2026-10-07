@@ -73,7 +73,10 @@ func (p *StreamJSON) parseAssistant(rec []byte, out func(agent.Event)) {
 				out(agent.Event{Kind: agent.EventTextDelta, Text: b.text, Raw: rec})
 			}
 		case "thinking":
-			out(agent.Event{Kind: agent.EventThinking, Text: b.text, Raw: rec})
+			// Claude puts reasoning under "thinking"; fall back to "text".
+			if text := firstNonEmpty(b.thinking, b.text); text != "" {
+				out(agent.Event{Kind: agent.EventThinking, Text: text, Raw: rec})
+			}
 		case "tool_use":
 			out(agent.Event{Kind: agent.EventToolCall, Tool: b.name, ToolInput: b.input, Raw: rec})
 		}
@@ -92,9 +95,14 @@ func (p *StreamJSON) parseUser(rec []byte, out func(agent.Event)) {
 // parseResult handles the terminal result record.
 func (p *StreamJSON) parseResult(rec []byte, out func(agent.Event)) {
 	var r struct {
-		Result    string `json:"result"`
-		IsError   bool   `json:"is_error"`
-		SessionID string `json:"session_id"`
+		Result    string  `json:"result"`
+		IsError   bool    `json:"is_error"`
+		SessionID string  `json:"session_id"`
+		CostUSD   float64 `json:"total_cost_usd"`
+		Usage     *struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
 	}
 	_ = json.Unmarshal(rec, &r)
 	if r.IsError {
@@ -104,14 +112,23 @@ func (p *StreamJSON) parseResult(rec []byte, out func(agent.Event)) {
 	if !p.sawDelta {
 		out(agent.Event{Kind: agent.EventTextFinal, Text: r.Result, SessionID: r.SessionID, Raw: rec})
 	}
+	if r.Usage != nil || r.CostUSD > 0 {
+		u := &agent.Usage{CostUSD: r.CostUSD}
+		if r.Usage != nil {
+			u.InputTokens = r.Usage.InputTokens
+			u.OutputTokens = r.Usage.OutputTokens
+		}
+		out(agent.Event{Kind: agent.EventUsage, Usage: u, Raw: rec})
+	}
 	out(agent.Event{Kind: agent.EventDone, Raw: rec})
 }
 
 type contentBlock struct {
-	typ   string
-	text  string
-	name  string
-	input map[string]any
+	typ      string
+	text     string
+	thinking string
+	name     string
+	input    map[string]any
 }
 
 // contentBlocks extracts message content blocks from a record.
@@ -119,10 +136,11 @@ func contentBlocks(rec []byte) []contentBlock {
 	var msg struct {
 		Message struct {
 			Content []struct {
-				Type  string         `json:"type"`
-				Text  string         `json:"text"`
-				Name  string         `json:"name"`
-				Input map[string]any `json:"input"`
+				Type     string         `json:"type"`
+				Text     string         `json:"text"`
+				Thinking string         `json:"thinking"`
+				Name     string         `json:"name"`
+				Input    map[string]any `json:"input"`
 			} `json:"content"`
 		} `json:"message"`
 	}
@@ -131,7 +149,9 @@ func contentBlocks(rec []byte) []contentBlock {
 	}
 	blocks := make([]contentBlock, 0, len(msg.Message.Content))
 	for _, c := range msg.Message.Content {
-		blocks = append(blocks, contentBlock{typ: c.Type, text: c.Text, name: c.Name, input: c.Input})
+		blocks = append(blocks, contentBlock{
+			typ: c.Type, text: c.Text, thinking: c.Thinking, name: c.Name, input: c.Input,
+		})
 	}
 	return blocks
 }

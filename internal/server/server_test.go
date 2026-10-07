@@ -53,6 +53,8 @@ func TestRoutes(t *testing.T) {
 		{"per-agent card", "/agents/cb/.well-known/agent-card.json"},
 		{"standard header card", "/.well-known/agent-card.json"},
 		{"aggregate discovery", "/.well-known/agents.json"},
+		{"health", "/healthz"},
+		{"ready", "/readyz"},
 	}
 	for _, c := range cases {
 		resp, err := http.Get(srv.URL + c.path)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/bridge"
@@ -52,7 +53,7 @@ func newLauncherParser(
 		Env:         env,
 		Session:     config.SessionConfig{IDFlag: "--session-id", ResumeFlag: "--resume", ContinueFlag: "--continue"},
 	}
-	ln, err := integration.New(ac, true)
+	ln, err := integration.New(ac, integration.Options{InheritEnv: true})
 	if err != nil {
 		t.Fatalf("integration.New: %v", err)
 	}
@@ -87,6 +88,31 @@ func artifactText(task *a2a.Task) string {
 		}
 	}
 	return b.String()
+}
+
+// interactionFromMessage extracts the structured interaction from the DataPart
+// of an input-required message.
+func interactionFromMessage(t *testing.T, m *a2a.Message) agent.Interaction {
+	t.Helper()
+	if m == nil {
+		t.Fatal("input-required message is nil")
+	}
+	for _, p := range m.Parts {
+		if p.Data() == nil {
+			continue
+		}
+		b, err := json.Marshal(p.Data())
+		if err != nil {
+			t.Fatalf("marshal interaction: %v", err)
+		}
+		var itx agent.Interaction
+		if err := json.Unmarshal(b, &itx); err != nil {
+			t.Fatalf("unmarshal interaction: %v", err)
+		}
+		return itx
+	}
+	t.Fatal("no DataPart interaction in message")
+	return agent.Interaction{}
 }
 
 func TestSendMessage_codebuddy(t *testing.T) {
@@ -126,6 +152,103 @@ func TestStreaming_codebuddy(t *testing.T) {
 	}
 	if updates < 1 {
 		t.Fatalf("expected >=1 artifact update, got %d", updates)
+	}
+}
+
+// newPausedACPTask starts an ACP task whose fake CLI requests permission, so the
+// task pauses in input-required. It returns the handler, the request context,
+// its cancel, and the paused task.
+func newPausedACPTask(t *testing.T) (a2asrv.RequestHandler, context.Context, context.CancelFunc, *a2a.Task) {
+	t.Helper()
+	ln := newLauncher(t, scriptPath(t, "fake-acp.sh"), "acp", nil, nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{Timeout: 10 * time.Second})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("go")})
+	if err != nil {
+		cancel()
+		t.Fatalf("first SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateInputRequired {
+		cancel()
+		t.Fatalf("state = %s, want input-required", task.Status.State)
+	}
+	return h, ctx, cancel, task
+}
+
+// resumeTask answers a paused task and returns the resulting task.
+func resumeTask(
+	t *testing.T, h a2asrv.RequestHandler, ctx context.Context,
+	paused *a2a.Task, answer *a2a.Message,
+) *a2a.Task {
+	t.Helper()
+	answer.TaskID = paused.ID
+	answer.ContextID = paused.ContextID
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: answer})
+	if err != nil {
+		t.Fatalf("resume SendMessage: %v", err)
+	}
+	return resp.(*a2a.Task)
+}
+
+// TestInputRequiredResume verifies that a task paused on input-required keeps
+// its CLI process alive across the completing RPC and resumes to completion.
+func TestInputRequiredResume(t *testing.T) {
+	h, ctx, cancel, task := newPausedACPTask(t)
+	defer cancel()
+
+	itx := interactionFromMessage(t, task.Status.Message)
+	if itx.Kind != agent.InteractionPermission {
+		t.Fatalf("interaction kind = %q, want permission", itx.Kind)
+	}
+	if itx.ID == "" || !itx.Resume {
+		t.Fatalf("interaction = %+v, want an id and resume=true", itx)
+	}
+	if len(itx.Options) == 0 {
+		t.Fatalf("interaction has no options: %+v", itx)
+	}
+
+	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{
+		"kind": string(itx.Kind), "id": itx.ID, "answer": "allow_once",
+	}))
+	done := resumeTask(t, h, ctx, task, answer)
+	if done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", done.Status.State)
+	}
+	if got := artifactText(done); !strings.Contains(got, "Hello world") {
+		t.Fatalf("artifact text = %q, want it to contain %q", got, "Hello world")
+	}
+}
+
+func TestInputRequiredAcceptsTextWithMetadataID(t *testing.T) {
+	h, ctx, cancel, task := newPausedACPTask(t)
+	defer cancel()
+
+	itx := interactionFromMessage(t, task.Status.Message)
+	answer := message("allow_once")
+	answer.Metadata = map[string]any{"harbor.interactionId": itx.ID}
+
+	if done := resumeTask(t, h, ctx, task, answer); done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", done.Status.State)
+	}
+}
+
+func TestInputRequiredRejectsMismatchedID(t *testing.T) {
+	h, ctx, cancel, task := newPausedACPTask(t)
+	defer cancel()
+
+	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{
+		"id": "itx_stale", "answer": "allow_once",
+	}))
+	done := resumeTask(t, h, ctx, task, answer)
+	if done.Status.State != a2a.TaskStateFailed {
+		t.Fatalf("state = %s, want failed", done.Status.State)
+	}
+	if code := done.Status.Message.Metadata["harbor.errorCode"]; code != "internal" {
+		t.Fatalf("errorCode = %v, want internal", code)
 	}
 }
 
@@ -248,6 +371,29 @@ func TestCardVersion(t *testing.T) {
 	}
 }
 
+func TestCardDeclaresInteractionExtension(t *testing.T) {
+	acpLn := newLauncher(t, scriptPath(t, "fake-acp.sh"), "acp", nil, nil)
+	acpCard := bridge.BuildCard(acpLn, acpLn.Probe(context.Background()), "http://example/agents/a/", false)
+	if !hasExtension(acpCard, bridge.InteractionExtensionURI) {
+		t.Fatalf("interactive card missing interaction extension: %+v", acpCard.Capabilities.Extensions)
+	}
+
+	execLn := newLauncher(t, scriptPath(t, "fake-pwd.sh"), "exec", nil, nil)
+	execCard := bridge.BuildCard(execLn, execLn.Probe(context.Background()), "http://example/agents/e/", false)
+	if hasExtension(execCard, bridge.InteractionExtensionURI) {
+		t.Fatalf("non-interactive card should not declare the interaction extension")
+	}
+}
+
+func hasExtension(card *a2a.AgentCard, uri string) bool {
+	for _, e := range card.Capabilities.Extensions {
+		if e.URI == uri {
+			return true
+		}
+	}
+	return false
+}
+
 func TestModelPassthrough(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "args.log")
@@ -320,7 +466,7 @@ func TestSendMessage_genericRegex(t *testing.T) {
 		Regex:       &config.RegexConfig{Text: `^OUT:\s*(.+)$`},
 		Args:        []string{"{{.Prompt}}"},
 	}
-	ln, err := integration.New(ac, true)
+	ln, err := integration.New(ac, integration.Options{InheritEnv: true})
 	if err != nil {
 		t.Fatalf("integration.New: %v", err)
 	}
@@ -453,6 +599,116 @@ func TestChangesArtifact(t *testing.T) {
 	}
 	if !strings.Contains(diff, "tracked.txt") || !strings.Contains(diff, "+appended line") {
 		t.Fatalf("changes artifact missing diff:\n%s", diff)
+	}
+}
+
+func TestTraceEvents(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-trace.sh"), "stream-json", nil, nil)
+	h := newHandler(t, ln)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	kinds := map[string]bool{}
+	for ev, err := range h.SendStreamingMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")}) {
+		if err != nil {
+			t.Fatalf("stream error: %v", err)
+		}
+		su, ok := ev.(*a2a.TaskStatusUpdateEvent)
+		if !ok || su.Status.Message == nil {
+			continue
+		}
+		if k, ok := su.Status.Message.Metadata["harbor.kind"].(string); ok {
+			kinds[k] = true
+		}
+	}
+	for _, want := range []string{"thinking", "tool_call", "tool_result", "usage"} {
+		if !kinds[want] {
+			t.Fatalf("missing trace kind %q; got %v", want, kinds)
+		}
+	}
+}
+
+func TestPushNotification(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-slow.sh"), "stream-json", nil, nil)
+	limits := config.LimitsConfig{Timeout: 800 * time.Millisecond}
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, limits)
+	h := a2asrv.NewHandler(exec,
+		a2asrv.WithPushNotifications(push.NewInMemoryStore(),
+			push.NewHTTPPushSender(&push.HTTPSenderConfig{AllowPrivateNetworks: true, Timeout: 5 * time.Second})))
+
+	hit := make(chan struct{}, 1)
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case hit <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer hook.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	seq := h.SendStreamingMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")})
+	taskCh := make(chan a2a.TaskID, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ev, err := range seq {
+			if err != nil {
+				return
+			}
+			if tk, ok := ev.(*a2a.Task); ok {
+				select {
+				case taskCh <- tk.ID:
+				default:
+				}
+			}
+		}
+	}()
+
+	var taskID a2a.TaskID
+	select {
+	case taskID = <-taskCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no task id received")
+	}
+	cfg := &a2a.PushConfig{TaskID: taskID, URL: hook.URL}
+	if _, err := h.CreateTaskPushConfig(ctx, cfg); err != nil {
+		t.Fatalf("CreateTaskPushConfig: %v", err)
+	}
+
+	select {
+	case <-hit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no push notification delivered")
+	}
+	<-done
+}
+
+func TestCLIHomeIsolation(t *testing.T) {
+	home := t.TempDir()
+	ac := config.AgentConfig{
+		ID:          "h",
+		Binary:      scriptPath(t, "fake-home.sh"),
+		Integration: "exec",
+		Args:        []string{"{{.Prompt}}"},
+	}
+	ln, err := integration.New(ac, integration.Options{InheritEnv: true, CLIHome: home})
+	if err != nil {
+		t.Fatalf("integration.New: %v", err)
+	}
+	h := newHandler(t, ln)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	want := "HOME=" + filepath.Join(home, "default")
+	if got := artifactText(resp.(*a2a.Task)); !strings.Contains(got, want) {
+		t.Fatalf("artifact %q does not contain %q", got, want)
 	}
 }
 

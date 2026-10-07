@@ -154,3 +154,13 @@ func TaskIDFrom(ctx context.Context) string {
 	id, _ := ctx.Value(taskIDKey{}).(string)
 	return id
 }
+
+// FirstNonEmpty returns the first non-empty string, or "" if none is set.
+func FirstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}

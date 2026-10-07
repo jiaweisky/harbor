@@ -308,13 +308,13 @@ Adapter 针对不同 CLI 选择“集成模式”。以下基于各 CLI `-h` 实
 
 **B. 服务端（server）**：CLI 常驻 HTTP/app-server（`opencode serve`、`codebuddy --serve`、`codex app-server`）；Harbor 作**客户端代理其 API** → A2A。只是“怎么调”的一种实现。
 
-**C. ACP**：CLI 常驻 ACP（`opencode acp` 经 stdio；`codebuddy --acp --acp-transport streamable-http` 可 HTTP）；Harbor 作 ACP 客户端，双向。
+**C. ACP**：CLI 常驻 ACP（`opencode acp`、`codebuddy --acp`）经 stdio；Harbor 作 ACP 客户端，双向。**已实现**（stdio；`--acp-transport streamable-http` 未实现）。
 
 > 交互式 TUI 不使用。`-p/--print` 是**无头标志**（claude/codebuddy 都有），**不是 serve**——它是 `stream-json` / `text` 模式的载体。
 >
 > 配置 `integration` 取值映射：`exec`（无头/text）、`stream-json`（无头/结构化）、`server`、`acp`。
 
-> 落地顺序：**M1 = 无头 `stream-json`（codebuddy；claude 同源顺带）+ 无头 `text`（opencode `run`）** → 后续 `exec`（codex/custom）→ `server` → `acp`。**顺序只反映落地成本，不代表模式优劣。**
+> 落地顺序：**M1 = 无头 `stream-json`（codebuddy；claude 同源顺带）+ 无头 `text`（opencode `run`）** → 后续 `exec`（codex/custom）→ `server` → `acp`。**顺序只反映落地成本，不代表模式优劣。** 现状：`stream-json` / `exec` / `acp` 已落地；`server` 未实现。
 
 ### 5.2 集成模式取舍（为什么不优先 ACP）
 
@@ -335,6 +335,7 @@ ACP（Agent Client Protocol）很诱人，但属于**条件性最优**，并非�
 - 真正的硬约束是**覆盖**（claude/codex 无 ACP）与**Harbor 作为 client 的实现成本**，而非“ACP 只能 stdio/编辑器”。
 - **实现顺序按“覆盖 + 成本”**：v1 用 stream-json/exec 先覆盖 4 家 → v2 用 ACP 收敛统一（仅对支持的 CLI）。codebuddy 可对比 `--acp --acp-transport streamable-http` 与 `--serve` 两条服务化路径。
 - ACP 是唯一**跨 CLI 标准化**的集成协议，长期确实是最优收敛点；但“长期统一”不等于“短期优先”。（各家 HTTP `app-server`/`serve` 也各不同、不标准化，故仍以 ACP 为长期目标。）
+- **ACP 已按此路径落地（stdio）**，`opencode acp` 实测端到端通过。覆盖：`initialize` → `session/new` → `session/prompt` 的一轮生命周期、`session/update` 流式映射（`agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update`）、以及 `session/request_permission` → A2A `input-required` 的桥接（应答为被选 `optionId`）。`fs/*` 与 `terminal/*` **不声明也不实现**：实测 opencode 自带工具、不回调这些方法，故仅对未声明能力返回 method-not-found。跨任务会话续接（`session/load`）暂缓：一轮 prompt 结束即停止进程，一个 A2A 任务对应一次 ACP 会话生命周期。
 
 ### 5.3 stream-json → 统一事件映射（示意）
 
@@ -546,6 +547,7 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 要点：
 
 - **duplex 恢复**：任务在 `input-required` 时 a2a-go 会以**同一 `taskId`** 再次调用 `Execute`（`StoredTask != nil`）；此时**不重启进程**，而是 `sess.Send(answer)` 写回 stdin 继续。
+- **进程生命周期与 RPC 解耦**：进程的运行 ctx 由 Executor 以 `context.WithoutCancel` 派生、按 `taskID` 保存（叠加 `limits.timeout`），**不随 `Execute`/RPC 返回而取消**——否则 `input-required` 暂停时进程会被连带回收，`Send` 写到已关闭的 stdin（`file already closed`）。仅在**终态 / `CancelTask` / 超时**时取消。取舍：暂停计时（含等待答复）计入超时；未配置超时的暂停任务会一直存活，故交互任务应配置超时。
 - **live 会话表**：`taskID → Session`，供恢复与取消定位活进程；仅在终态删除。
 - **taskID 贯通**：Executor 把 `taskID` 经 ctx 交给 Launcher/Session（`agent.WithTaskID`）；line-based Launcher 用它对齐 `Runner.Start/Kill` 的 key，避免“cancel 找不到进程”。
 - **合并节流**：`coalescer` 按时间 / 字节 flush，避免逐 token 刷爆 SSE。
@@ -740,6 +742,8 @@ type Capabilities struct {
 | 支持交互但不支持挂起续答 | 登记 CLI 会话 ID，**重新以 `--resume` 启动**并注入答复（有损，可能重放/丢上下文）。 |
 | 不支持交互 | 由配置策略决定（预授权 / 自动拒绝 / bypass），**永不发** `input-required`；Card 声明不支持。 |
 | 客户端只会发文本 | 问题以文本 + 选项列表呈现；结构化答复仅对支持扩展的客户端可用。 |
+
+**已落地**：Capability 对齐中的交互规范化在 ACP 路径实现——`input-required` 消息同时携带人可读 `TextPart` 与结构化 `DataPart`（`{kind,id,action,target,risk,options,resume}`）；答复可用同构 `DataPart`（Harbor 校验 `id`，不匹配则拒绝）或纯文本兜底；Card 在存在交互能力时声明扩展 `https://github.com/jiaweisky/harbor/extensions/interaction/v1`（schema 见 `extensions/interaction.md`）。尚未接入：stream-json 的 `control_request`、`question` / `plan_approval` 两类（Canonical 已定义，无 CLI 来源）、以及“不支持挂起续答”时的 `--resume` 有损注入。
 
 ### 7.5 媒体类型对齐
 
@@ -1127,18 +1131,17 @@ agents:
     parser: text
     args: ["exec", "-"]        # prompt 经 stdin 传入（避免 argv 限制）
 
-  # ACP 模式：内建 Launcher，配置选择模式与传输（不做运行时协商）
+  # ACP 模式：内建 Launcher，经 stdio 驱动 CLI 的 ACP 模式（不做运行时协商）
   # 同一 CLI 支持多模式时：静态二选一，或注册为两个 agent（两张卡，客户端自选）
   - id: opencode-acp
     binary: opencode
     integration: acp
+    # opencode 的 ACP 子命令由内建 profile 默认提供 args: ["acp"]，可省略
     args: ["acp"]
-    acp: { transport: stdio }
   - id: codebuddy-acp
     binary: codebuddy
     integration: acp
     args: ["--acp"]
-    acp: { transport: streamable-http, endpoint: "http://127.0.0.1:0" }
   # …同时可保留上面的 codebuddy(stream-json)，两者互不影响
 
   # 零代码扩展：任意 CLI
@@ -1209,9 +1212,9 @@ codebuddy
 | **M1 骨架** | Go module、Adapter/Parser/Runner、Registry、A2A server 装配；**codebuddy（`stream-json`，证明完整架构）+ opencode（`exec`，能力受限）**；**Bearer 鉴权 + 安全联锁**；**CLI home 隔离 + `Probe` 认证探测**（§10）；逐 token 流式；工作目录校验绑定 context（§6.7）。 |
 | **M2 可靠性与测试** | 假 CLI 夹具 + golden 测试；并发配额 / 超时 / 取消；SSE 节流；崩溃恢复、孤儿清理、**熔断/健康**（§11.1/§11.2）。 |
 | **M3 多 Agent 宽度** | codex（独立 JSONL Parser）、generic 配置 Adapter、claude 顺带；多 agent 路由与多卡片。 |
-| **M4 产出与交互完善** | 代码变更 artifact（diff / 文件，见 §6.8）、完整交互降级矩阵、durable interaction、push notifications。 |
+| **M4 产出与交互完善** | ~~代码变更 artifact（diff / 文件，见 §6.8）~~（已落地）、~~push notifications~~（已落地）、~~交互规范化（Canonical interaction + `input-required` DataPart + Card 扩展，见 §7.4）~~（已落地，ACP 路径）、完整交互降级矩阵（question / plan_approval / `--resume` 有损注入）、durable interaction。 |
 | **M5 安全与运维** | 容器 / worktree 沙箱、指标、审计日志、持久化 TaskStore。 |
-| **M6 进阶** | ACP 集成模式、按调用方凭据 / 登录任务（§10）、Go plugin 扩展。 |
+| **M6 进阶** | ~~ACP 集成模式~~（已落地，stdio）、按调用方凭据 / 登录任务（§10）、Go plugin 扩展。 |
 
 ---
 
@@ -1396,19 +1399,13 @@ type AgentConfig struct {
     ID             string            `yaml:"id"`
     DisplayName    string            `yaml:"display_name"`
     Binary         string            `yaml:"binary"`
-    Integration    string            `yaml:"integration"` // exec | stream-json | server | acp（server 为 M2+）
-    Parser         string            `yaml:"parser"`      // exec 模式用：stream-json | text | regex
-    ACP            *ACPConfig        `yaml:"acp"`         // integration=acp 时
-    Args           []string          `yaml:"args"`
+    Integration    string            `yaml:"integration"` // exec | stream-json | acp（server 未实现）
+    Parser         string            `yaml:"parser"`      // exec 模式用：text | codex | regex
+    Args           []string          `yaml:"args"`        // acp 模式用其选定 ACP 子命令（opencode 由 profile 默认）
     Env            map[string]string `yaml:"env"`
     AllowDangerous bool              `yaml:"allow_dangerous"`
     Session        SessionConfig     `yaml:"session"`
     Limits         LimitsConfig      `yaml:"limits"`
-}
-
-type ACPConfig struct {
-    Transport string `yaml:"transport"` // stdio | streamable-http
-    Endpoint  string `yaml:"endpoint"`  // streamable-http 时；stdio 由 Harbor 启动
 }
 
 type SessionConfig struct {

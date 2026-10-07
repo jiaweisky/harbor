@@ -25,12 +25,13 @@ type Usage struct {
 
 // Event is a transport-agnostic event normalized from a coding-agent CLI.
 type Event struct {
-	Kind      EventKind
-	Text      string
-	Tool      string
-	ToolInput map[string]any
-	SessionID string
-	Usage     *Usage
-	Err       error
-	Raw       []byte
+	Kind        EventKind
+	Text        string
+	Tool        string
+	ToolInput   map[string]any
+	SessionID   string
+	Usage       *Usage
+	Interaction *Interaction // set on EventPermissionRequest when structured
+	Err         error
+	Raw         []byte
 }

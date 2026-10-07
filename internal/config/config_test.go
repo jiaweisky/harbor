@@ -47,6 +47,37 @@ agents:
 	}
 }
 
+func TestACPProfileFillsDefaultArgs(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: oc
+    binary: opencode
+    integration: acp
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.Agents[0].Args; len(got) != 1 || got[0] != "acp" {
+		t.Fatalf("args = %v, want [acp]", got)
+	}
+}
+
+func TestACPRequiresArgs(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: acp
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "ACP mode") {
+		t.Fatalf("expected an ACP-args error, got %v", err)
+	}
+}
+
 func TestUnknownIntegrationIsRejected(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
@@ -110,6 +141,23 @@ agents:
 	_, err := config.Load(path)
 	if err == nil || !strings.Contains(err.Error(), "unknown binary") {
 		t.Fatalf("expected an unknown-binary error, got %v", err)
+	}
+}
+
+func TestIsolationWorktreeRequiresRoot(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  isolation: worktree
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "isolation_root") {
+		t.Fatalf("expected an isolation_root error, got %v", err)
 	}
 }
 

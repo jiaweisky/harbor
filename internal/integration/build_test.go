@@ -25,7 +25,8 @@ func fakeBinary(t *testing.T, name, versionOut string) string {
 
 func TestBuildRejectsOldVersion(t *testing.T) {
 	bin := fakeBinary(t, "codebuddy", "2.0.0") // below codebuddy's minimum
-	_, _, err := integration.Build(context.Background(), config.AgentConfig{ID: "cb", Binary: bin}, true)
+	ac := config.AgentConfig{ID: "cb", Binary: bin}
+	_, _, err := integration.Build(context.Background(), ac, integration.Options{InheritEnv: true})
 	if err == nil || !strings.Contains(err.Error(), "below the minimum supported version") {
 		t.Fatalf("expected a minimum-version error, got %v", err)
 	}
@@ -33,7 +34,8 @@ func TestBuildRejectsOldVersion(t *testing.T) {
 
 func TestBuildAcceptsSupportedVersion(t *testing.T) {
 	bin := fakeBinary(t, "codebuddy", "9.9.9 (Fake CLI)")
-	ln, info, err := integration.Build(context.Background(), config.AgentConfig{ID: "cb", Binary: bin}, true)
+	ac := config.AgentConfig{ID: "cb", Binary: bin}
+	ln, info, err := integration.Build(context.Background(), ac, integration.Options{InheritEnv: true})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

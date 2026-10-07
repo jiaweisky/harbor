@@ -26,7 +26,7 @@ func (echoParser) Flush(func(agent.Event)) error { return nil }
 // TestRunnerContextCancelKills verifies that canceling the context terminates
 // the process group (the regression for "exec.CommandContext only kills direct child").
 func TestRunnerContextCancelKills(t *testing.T) {
-	r := agent.NewRunner(1, true)
+	r := agent.NewRunner(1, true, "")
 	ctx, cancel := context.WithCancel(context.Background())
 	ch, err := r.Start(ctx, "task-1", &agent.Invocation{Bin: "sleep", Args: []string{"30"}}, nopParser{})
 	if err != nil {
@@ -54,7 +54,7 @@ func TestRunnerContextCancelKills(t *testing.T) {
 // reading (channel fills, sends block) and the process is killed, the read
 // goroutine aborts and its concurrency slot is released.
 func TestRunnerAbandonedConsumerReleasesSlot(t *testing.T) {
-	r := agent.NewRunner(1, true)
+	r := agent.NewRunner(1, true, "")
 	flood := &agent.Invocation{
 		Bin:  "sh",
 		Args: []string{"-c", "i=0; while [ $i -lt 100000 ]; do echo line; i=$((i+1)); done"},
@@ -82,7 +82,7 @@ func TestRunnerAbandonedConsumerReleasesSlot(t *testing.T) {
 // consumer still receives every event produced during normal operation.
 func TestRunnerDeliversAllEventsToSlowConsumer(t *testing.T) {
 	const n = 300
-	r := agent.NewRunner(1, true)
+	r := agent.NewRunner(1, true, "")
 	script := "i=0; while [ $i -lt " + strconv.Itoa(n) + " ]; do echo x; i=$((i+1)); done"
 
 	inv := &agent.Invocation{Bin: "sh", Args: []string{"-c", script}}

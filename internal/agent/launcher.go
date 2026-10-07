@@ -26,6 +26,8 @@ type LauncherConfig struct {
 	MaxConcurrent int
 	// InheritEnv passes the parent environment to the CLI when true.
 	InheritEnv bool
+	// CLIHome, when set, isolates the CLI's HOME and config roots under it.
+	CLIHome string
 	// VersionArgs is the flag(s) used to read the CLI version; nil skips probing.
 	VersionArgs []string
 	// VersionOverride, when set, is used verbatim instead of probing.
@@ -52,7 +54,7 @@ func NewHeadlessLauncher(cfg LauncherConfig) *HeadlessLauncher {
 		caps:            cfg.Capabilities,
 		parser:          cfg.Parser,
 		invoke:          cfg.Invoke,
-		runner:          NewRunner(cfg.MaxConcurrent, cfg.InheritEnv),
+		runner:          NewRunner(cfg.MaxConcurrent, cfg.InheritEnv, cfg.CLIHome),
 		versionArgs:     cfg.VersionArgs,
 		versionOverride: cfg.VersionOverride,
 	}

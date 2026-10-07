@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,25 +18,53 @@ import (
 // missing, or otherwise unusable).
 var ErrDenied = errors.New("workdir denied")
 
+// Isolation strategies.
+const (
+	IsolationShared   = "shared"
+	IsolationWorktree = "worktree"
+	IsolationCopy     = "copy"
+)
+
 // Resolver maps a requested working directory to a confined absolute path. A
 // resolver with an empty root performs no confinement.
 type Resolver struct {
 	root         string
 	allowOutside bool
+	isolation    string
+	isoRoot      string
 
 	mu    sync.Mutex
 	bound map[string]string // contextID -> resolved directory
+	locks *lockSet
 }
 
-// NewResolver creates a resolver rooted at dir. When allowOutside is true the
-// root confinement is not enforced. An empty root disables resolution.
+// NewResolver creates a resolver rooted at dir using shared isolation. When
+// allowOutside is true the root confinement is not enforced. An empty root
+// disables resolution.
 func NewResolver(root string, allowOutside bool) *Resolver {
-	return &Resolver{root: root, allowOutside: allowOutside, bound: map[string]string{}}
+	return NewResolverWithIsolation(root, allowOutside, IsolationShared, "")
 }
 
-// Resolve returns the absolute working directory for a context. A directory is
-// resolved once per context and reused, so a resumed task keeps the same tree.
-// An empty requested path yields a per-context scratch directory under the root.
+// NewResolverWithIsolation creates a resolver with an isolation strategy.
+// worktree/copy need isolationRoot (where per-context copies are created).
+func NewResolverWithIsolation(root string, allowOutside bool, isolation, isolationRoot string) *Resolver {
+	if isolation == "" {
+		isolation = IsolationShared
+	}
+	return &Resolver{
+		root:         root,
+		allowOutside: allowOutside,
+		isolation:    isolation,
+		isoRoot:      isolationRoot,
+		bound:        map[string]string{},
+		locks:        newLockSet(),
+	}
+}
+
+// Resolve returns the absolute working directory for a context, resolved once
+// and reused so a resumed task keeps the same tree. Under worktree/copy
+// isolation each context gets its own directory. An empty requested path yields
+// a per-context scratch directory under the root.
 func (r *Resolver) Resolve(contextID, requested string) (string, error) {
 	if r == nil || r.root == "" {
 		return requested, nil
@@ -49,7 +79,7 @@ func (r *Resolver) Resolve(contextID, requested string) (string, error) {
 		}
 	}
 
-	dir, err := r.resolveRooted(contextID, requested)
+	dir, err := r.resolveUnlocked(contextID, requested)
 	if err != nil {
 		return "", err
 	}
@@ -59,7 +89,7 @@ func (r *Resolver) Resolve(contextID, requested string) (string, error) {
 	return dir, nil
 }
 
-func (r *Resolver) resolveRooted(contextID, requested string) (string, error) {
+func (r *Resolver) resolveUnlocked(contextID, requested string) (string, error) {
 	root, err := filepath.EvalSymlinks(r.root)
 	if err != nil {
 		return "", fmt.Errorf("%w: workdir_root: %v", ErrDenied, err)
@@ -73,18 +103,104 @@ func (r *Resolver) resolveRooted(contextID, requested string) (string, error) {
 		return dir, nil
 	}
 
-	candidate := requested
-	if !filepath.IsAbs(candidate) {
-		candidate = filepath.Join(root, candidate)
+	source := requested
+	if !filepath.IsAbs(source) {
+		source = filepath.Join(root, source)
 	}
-	resolved, err := filepath.EvalSymlinks(candidate)
+	source, err = filepath.EvalSymlinks(source)
 	if err != nil {
 		return "", fmt.Errorf("%w: %q: %v", ErrDenied, requested, err)
 	}
-	if !r.allowOutside && !within(root, resolved) {
+	if !r.allowOutside && !within(root, source) {
 		return "", fmt.Errorf("%w: %q is outside workdir_root %q", ErrDenied, requested, root)
 	}
-	return resolved, nil
+
+	if r.isolation == IsolationShared || r.isolation == "" {
+		return source, nil
+	}
+	return r.isolate(contextID, source)
+}
+
+// isolate creates a per-context working copy of source.
+func (r *Resolver) isolate(contextID, source string) (string, error) {
+	if r.isoRoot == "" {
+		return "", fmt.Errorf("%w: isolation_root is required for %q", ErrDenied, r.isolation)
+	}
+	dst := filepath.Join(r.isoRoot, scratchName(contextID))
+	if _, err := os.Stat(dst); err == nil {
+		return dst, nil // already provisioned for this context
+	}
+	if err := os.MkdirAll(r.isoRoot, 0o755); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrDenied, err)
+	}
+
+	switch r.isolation {
+	case IsolationWorktree:
+		if err := gitWorktree(source, dst); err != nil {
+			return "", fmt.Errorf("%w: worktree: %v", ErrDenied, err)
+		}
+	case IsolationCopy:
+		if err := copyTree(source, dst); err != nil {
+			return "", fmt.Errorf("%w: copy: %v", ErrDenied, err)
+		}
+	default:
+		return "", fmt.Errorf("%w: unknown isolation %q", ErrDenied, r.isolation)
+	}
+	return dst, nil
+}
+
+// Lock acquires the lock for dir and returns its release function. It is a
+// no-op when dir is empty. Callers hold the lock for the task's lifetime.
+func (r *Resolver) Lock(dir string) func() {
+	if r == nil || r.locks == nil || dir == "" {
+		return func() {}
+	}
+	return r.locks.lock(dir)
+}
+
+func gitWorktree(repo, dst string) error {
+	cmd := exec.Command("git", "-C", repo, "worktree", "add", "--detach", dst, "HEAD")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree add: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		return copyFile(path, target)
+	})
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
 }
 
 // within reports whether path is root or a descendant of root.
@@ -103,4 +219,39 @@ func scratchName(contextID string) string {
 	}
 	sum := sha256.Sum256([]byte(contextID))
 	return "ctx-" + hex.EncodeToString(sum[:8])
+}
+
+// lockSet provides reference-counted per-key mutexes.
+type lockSet struct {
+	mu      sync.Mutex
+	entries map[string]*lockEntry
+}
+
+type lockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newLockSet() *lockSet { return &lockSet{entries: map[string]*lockEntry{}} }
+
+func (l *lockSet) lock(key string) func() {
+	l.mu.Lock()
+	e := l.entries[key]
+	if e == nil {
+		e = &lockEntry{}
+		l.entries[key] = e
+	}
+	e.refs++
+	l.mu.Unlock()
+
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		l.mu.Lock()
+		e.refs--
+		if e.refs == 0 {
+			delete(l.entries, key)
+		}
+		l.mu.Unlock()
+	}
 }

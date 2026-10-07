@@ -22,11 +22,13 @@ type Config struct {
 
 // ServerConfig configures the HTTP server and discovery.
 type ServerConfig struct {
-	Listen             string     `yaml:"listen"`
-	BaseURL            string     `yaml:"base_url"`
-	AllowInsecure      bool       `yaml:"allow_insecure"` // permit a non-loopback bind without auth
-	Auth               AuthConfig `yaml:"auth"`
-	CORSAllowedOrigins []string   `yaml:"cors_allowed_origins"`
+	Listen                   string     `yaml:"listen"`
+	BaseURL                  string     `yaml:"base_url"`
+	AllowInsecure            bool       `yaml:"allow_insecure"`              // permit a non-loopback bind without auth
+	PushAllowPrivateNetworks bool       `yaml:"push_allow_private_networks"` // disable the SSRF guard on push webhooks
+	TaskStoreFile            string     `yaml:"task_store_file"`             // persist tasks to this JSON file (optional)
+	Auth                     AuthConfig `yaml:"auth"`
+	CORSAllowedOrigins       []string   `yaml:"cors_allowed_origins"`
 }
 
 // AuthConfig configures bearer authentication for the JSON-RPC endpoints.
@@ -37,9 +39,12 @@ type AuthConfig struct {
 
 // SandboxConfig configures workspace and env constraints.
 type SandboxConfig struct {
-	WorkdirRoot  string `yaml:"workdir_root"`
-	AllowOutside bool   `yaml:"allow_outside"`
-	InheritEnv   *bool  `yaml:"inherit_env"` // default true; false restricts to an allowlisted env
+	WorkdirRoot   string `yaml:"workdir_root"`
+	AllowOutside  bool   `yaml:"allow_outside"`
+	Isolation     string `yaml:"isolation"`      // shared | worktree | copy
+	IsolationRoot string `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
+	InheritEnv    *bool  `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
+	CLIHome       string `yaml:"cli_home"`       // base dir for isolated CLI config/home
 }
 
 // InheritEnvEnabled reports whether child processes inherit the parent
@@ -128,6 +133,7 @@ type Profile struct {
 	Supported   []Integration // accepted integrations
 	MinVersion  string        // minimum supported version; below it Harbor refuses to start
 	VersionArgs []string      // version flag(s); nil disables probing
+	ACPArgs     []string      // args selecting ACP mode, when unset in the agent config
 }
 
 // Supports reports whether the profile accepts the integration.
@@ -150,7 +156,7 @@ var knownProfiles = []Profile{
 	{Binary: "claude", Integration: IntegrationStreamJSON, MinVersion: "2.1.292", VersionArgs: []string{"--version"},
 		Supported: []Integration{IntegrationStreamJSON}},
 	{Binary: "opencode", Integration: IntegrationExec, MinVersion: "1.18.35", VersionArgs: []string{"--version"},
-		Supported: []Integration{IntegrationExec}},
+		Supported: []Integration{IntegrationExec, IntegrationACP}, ACPArgs: []string{"acp"}},
 	{Binary: "codex", Integration: IntegrationExec, Parser: "codex",
 		MinVersion: "0.160.1", VersionArgs: []string{"--version"},
 		Supported: []Integration{IntegrationExec}},
@@ -223,6 +229,9 @@ func (c *Config) applyDefaults() {
 	if c.Server.Auth.Mode == "" {
 		c.Server.Auth.Mode = "none"
 	}
+	if c.Sandbox.Isolation == "" {
+		c.Sandbox.Isolation = "shared"
+	}
 	for i := range c.Agents {
 		a := &c.Agents[i]
 		if p, ok := LookupProfile(a.Binary); ok {
@@ -231,6 +240,9 @@ func (c *Config) applyDefaults() {
 			}
 			if a.Parser == "" {
 				a.Parser = p.Parser
+			}
+			if a.Integration == IntegrationACP && len(a.Args) == 0 {
+				a.Args = append([]string(nil), p.ACPArgs...)
 			}
 		}
 	}
@@ -250,6 +262,15 @@ func (c *Config) validate() error {
 		if err != nil || !info.IsDir() {
 			return fmt.Errorf("sandbox.workdir_root %q is not a directory", c.Sandbox.WorkdirRoot)
 		}
+	}
+	switch c.Sandbox.Isolation {
+	case "shared":
+	case "worktree", "copy":
+		if c.Sandbox.IsolationRoot == "" {
+			return fmt.Errorf("sandbox.isolation_root is required for isolation %q", c.Sandbox.Isolation)
+		}
+	default:
+		return fmt.Errorf("sandbox.isolation must be one of shared, worktree, copy; got %q", c.Sandbox.Isolation)
 	}
 	for i := range c.Agents {
 		a := &c.Agents[i]
@@ -280,6 +301,13 @@ func (c *Config) validate() error {
 				"agent %q: integration %q passes the prompt through args but none contains {{.Prompt}}; "+
 					"add {{.Prompt}} to args, or use %q if the CLI has a structured stream",
 				a.ID, IntegrationExec, IntegrationStreamJSON,
+			)
+		}
+		if a.Integration == IntegrationACP && len(a.Args) == 0 {
+			return fmt.Errorf(
+				"agent %q: integration %q requires args selecting the CLI's ACP mode "+
+					"(for example [\"acp\"]); without them the CLI would start its interactive UI",
+				a.ID, IntegrationACP,
 			)
 		}
 	}

@@ -6,6 +6,11 @@ import (
 	"github.com/jiaweisky/harbor/internal/agent"
 )
 
+// InteractionExtensionURI is declared when a CLI can pause a task for input:
+// the input-required message then carries a DataPart describing a permission,
+// question, or plan-approval request.
+const InteractionExtensionURI = "https://github.com/jiaweisky/harbor/extensions/interaction/v1"
+
 // BuildCard builds an AgentCard for one launcher at the given endpoint URL.
 func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool) *a2a.AgentCard {
 	caps := ln.Capabilities()
@@ -39,7 +44,8 @@ func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool)
 		}},
 		Capabilities: a2a.AgentCapabilities{
 			Streaming:         caps.Streaming != agent.StreamNone,
-			PushNotifications: false,
+			PushNotifications: true,
+			Extensions:        interactionExtensions(caps),
 		},
 		DefaultInputModes:  in,
 		DefaultOutputModes: out,
@@ -62,4 +68,17 @@ func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool)
 		}
 	}
 	return card
+}
+
+// interactionExtensions declares the interaction extension when the CLI can
+// pause for a permission, a proactive question, or a plan approval. Clients
+// that ignore it fall back to answering the human-readable text part.
+func interactionExtensions(caps agent.Capabilities) []a2a.AgentExtension {
+	if caps.Permission != agent.PermInteractive && !caps.AskQuestion && !caps.PlanApproval {
+		return nil
+	}
+	return []a2a.AgentExtension{{
+		URI:         InteractionExtensionURI,
+		Description: "Structured permission/question/plan-approval requests over input-required",
+	}}
 }

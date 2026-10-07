@@ -2,7 +2,11 @@ package bridge
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"sync"
 	"time"
@@ -26,6 +30,14 @@ const (
 	codeAgentUnavailable   = "agent_unavailable"
 )
 
+// Metadata keys carried on task status messages. The interaction id is both
+// written on an input-required prompt and read back from a client's answer.
+const (
+	metaKeyKind          = "harbor.kind"
+	metaKeyErrorCode     = "harbor.errorCode"
+	metaKeyInteractionID = "harbor.interactionId"
+)
+
 // errNoText is returned when an incoming message has no textual part.
 var errNoText = errors.New("no text part in message")
 
@@ -37,13 +49,24 @@ type SessionStore interface {
 
 // CLIExecutor turns a coding-agent CLI session into A2A task events.
 type CLIExecutor struct {
-	launcher  agent.Launcher
-	sessions  SessionStore
-	live      *agent.LiveSessions
-	workspace *workspace.Resolver
-	timeout   time.Duration // total task timeout; 0 disables
-	breaker   *breaker      // nil disables
-	baselines sync.Map      // taskID -> changes.Baseline
+	launcher     agent.Launcher
+	sessions     SessionStore
+	live         *agent.LiveSessions
+	workspace    *workspace.Resolver
+	timeout      time.Duration // total task timeout; 0 disables
+	breaker      *breaker      // nil disables
+	baselines    sync.Map      // taskID -> changes.Baseline
+	locks        sync.Map      // taskID -> func() (workdir lock release)
+	runs         sync.Map      // taskID -> *taskRun (process lifetime, decoupled from the request)
+	interactions sync.Map      // taskID -> *agent.Interaction awaiting an answer
+}
+
+// taskRun is the lifetime of one CLI process. Its context is detached from the
+// RPC context so a task paused on input-required keeps the process alive after
+// the request returns; it is canceled only on a terminal state or Cancel.
+type taskRun struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewCLIExecutor creates an executor over the given launcher. limits bounds the
@@ -74,17 +97,11 @@ func (e *CLIExecutor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) i
 			return
 		}
 		taskID := string(ec.TaskID)
-		runCtx := ctx
-		if e.timeout > 0 {
-			var cancel context.CancelFunc
-			runCtx, cancel = context.WithTimeout(ctx, e.timeout)
-			defer cancel()
-		}
 		if isWaitingForInput(ec) {
-			e.resume(runCtx, ec, taskID, yield)
+			e.resume(ec, taskID, yield)
 			return
 		}
-		e.start(runCtx, ec, taskID, yield)
+		e.start(ctx, ec, taskID, yield)
 	}
 }
 
@@ -108,39 +125,112 @@ func (e *CLIExecutor) start(
 		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
 		return
 	}
+	e.locks.Store(taskID, e.workspace.Lock(req.WorkDir))
 	if req.WorkDir != "" {
 		e.baselines.Store(taskID, changes.Snapshot(req.WorkDir))
 	}
-	sess, err := e.launcher.Start(agent.WithTaskID(ctx, taskID), req)
+	runCtx := e.beginRun(ctx, taskID)
+	sess, err := e.launcher.Start(agent.WithTaskID(runCtx, taskID), req)
 	if err != nil {
-		e.baselines.Delete(taskID)
-		e.breaker.Failure()
+		e.cleanup(taskID, true)
 		yield(failedStatus(ec, codeForStartError(err), err.Error()), nil)
 		return
 	}
 	e.live.Put(taskID, sess)
-	e.pump(ctx, ec, taskID, sess, yield)
+	e.pump(runCtx, ec, taskID, sess, yield)
+}
+
+// beginRun starts a process lifetime for a task and returns its context. The
+// context is detached from parent (which is canceled when the RPC returns) so a
+// paused task stays alive; it is bounded by the configured task timeout.
+func (e *CLIExecutor) beginRun(parent context.Context, taskID string) context.Context {
+	base := context.WithoutCancel(parent)
+	runCtx, cancel := context.WithCancel(base)
+	if e.timeout > 0 {
+		runCtx, cancel = context.WithTimeout(base, e.timeout)
+	}
+	e.runs.Store(taskID, &taskRun{ctx: runCtx, cancel: cancel})
+	return runCtx
+}
+
+// endRun cancels and forgets a task's process lifetime. It is idempotent.
+func (e *CLIExecutor) endRun(taskID string) {
+	if v, ok := e.runs.LoadAndDelete(taskID); ok {
+		v.(*taskRun).cancel()
+	}
 }
 
 // resume answers a task paused on input-required by writing to its live session.
 func (e *CLIExecutor) resume(
-	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string,
+	ec *a2asrv.ExecutorContext, taskID string,
 	yield func(a2a.Event, error) bool,
 ) {
-	sess, ok := e.live.Get(taskID)
+	v, ok := e.runs.Load(taskID)
 	if !ok {
 		yield(failedStatus(ec, codeInternal, "session lost"), nil)
 		return
 	}
-	if err := sess.Send(ctx, inputFromMessage(ec.Message)); err != nil {
-		e.live.Del(taskID)
+	run := v.(*taskRun)
+	if err := run.ctx.Err(); err != nil {
+		// The process already ended (typically the task timed out while paused).
+		e.cleanup(taskID, true)
+		yield(failedStatus(ec, codeForRunError(err), err.Error()), nil)
+		return
+	}
+	sess, ok := e.live.Get(taskID)
+	if !ok {
+		e.cleanup(taskID, true)
+		yield(failedStatus(ec, codeInternal, "session lost"), nil)
+		return
+	}
+	in, err := e.answerFromMessage(taskID, ec.Message)
+	if err != nil {
+		// A bad client reply is not an agent failure; tear the process down
+		// without penalizing the breaker.
+		e.teardown(taskID, sess)
+		yield(failedStatus(ec, codeInternal, err.Error()), nil)
+		return
+	}
+	e.interactions.Delete(taskID)
+	if err := sess.Send(run.ctx, in); err != nil {
+		e.cleanup(taskID, true)
 		yield(failedStatus(ec, codeInternal, err.Error()), nil)
 		return
 	}
 	if !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
+		e.teardown(taskID, sess)
 		return
 	}
-	e.pump(ctx, ec, taskID, sess, yield)
+	e.pump(run.ctx, ec, taskID, sess, yield)
+}
+
+// teardown stops a task's process and releases its per-task state after the
+// consumer goes away.
+func (e *CLIExecutor) teardown(taskID string, sess agent.Session) {
+	_ = sess.Cancel()
+	e.cleanup(taskID, false)
+}
+
+// cleanup releases a task's per-task state. When fail is true the failure
+// breaker is penalized; otherwise it is resolved.
+func (e *CLIExecutor) cleanup(taskID string, fail bool) {
+	e.endRun(taskID)
+	e.live.Del(taskID)
+	e.baselines.Delete(taskID)
+	e.interactions.Delete(taskID)
+	e.releaseLock(taskID)
+	if fail {
+		e.breaker.Failure()
+	} else {
+		e.breaker.Resolve()
+	}
+}
+
+func codeForRunError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return codeTimeout
+	}
+	return codeInternal
 }
 
 // pump consumes session events, coalescing text into artifact updates and
@@ -154,10 +244,7 @@ func (e *CLIExecutor) pump(
 			return true
 		}
 		// The consumer went away: tear the CLI down so no process leaks.
-		_ = sess.Cancel()
-		e.live.Del(taskID)
-		e.baselines.Delete(taskID)
-		e.breaker.Resolve()
+		e.teardown(taskID, sess)
 		return false
 	}
 	sink := newTextSink(ec, emit)
@@ -201,22 +288,70 @@ func (e *CLIExecutor) handleEvent(
 		if !sink.Flush() {
 			return false
 		}
+		itx := interactionFromEvent(ev)
+		e.interactions.Store(taskID, itx)
 		// Keep the session alive for the client's answer.
-		emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateInputRequired,
-			a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(ev.Text))))
+		emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateInputRequired, interactionMessage(ev.Text, itx)))
 		return false
 	case agent.EventError:
 		sink.Flush()
+		e.endRun(taskID)
 		e.live.Del(taskID)
+		e.interactions.Delete(taskID)
 		if sess.Canceled() {
 			return false
 		}
 		e.emitChanges(ec, taskID, emit)
+		e.releaseLock(taskID)
 		e.breaker.Failure()
 		emit(failedStatus(ec, codeInternal, eventErrorText(ev)))
 		return false
+	case agent.EventThinking, agent.EventToolCall, agent.EventToolResult, agent.EventUsage:
+		if !sink.Flush() {
+			return false
+		}
+		return emitTrace(ec, emit, ev)
 	}
 	return true
+}
+
+// emitTrace surfaces reasoning, tool activity, and usage as working status
+// updates, so a client can observe progress without polluting the answer.
+func emitTrace(ec *a2asrv.ExecutorContext, emit func(a2a.Event) bool, ev agent.Event) bool {
+	switch ev.Kind {
+	case agent.EventThinking:
+		return emit(traceStatus(ec, "thinking", ev.Text, nil))
+	case agent.EventToolCall:
+		return emit(traceStatus(ec, "tool_call", "tool: "+ev.Tool,
+			map[string]any{"tool": ev.Tool, "input": ev.ToolInput}))
+	case agent.EventToolResult:
+		return emit(traceStatus(ec, "tool_result", "tool result", nil))
+	case agent.EventUsage:
+		return emit(traceStatus(ec, "usage", "usage", usageMeta(ev.Usage)))
+	}
+	return true
+}
+
+// traceStatus builds a working status update tagged with a harbor.kind.
+func traceStatus(ec *a2asrv.ExecutorContext, kind, text string, extra map[string]any) *a2a.TaskStatusUpdateEvent {
+	m := a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(text))
+	meta := map[string]any{metaKeyKind: kind}
+	for k, v := range extra {
+		meta[k] = v
+	}
+	m.Metadata = meta
+	return a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, m)
+}
+
+func usageMeta(u *agent.Usage) map[string]any {
+	if u == nil {
+		return nil
+	}
+	return map[string]any{
+		"input_tokens":  u.InputTokens,
+		"output_tokens": u.OutputTokens,
+		"cost_usd":      u.CostUSD,
+	}
 }
 
 // finish flushes pending text and emits the terminal state after the event
@@ -226,6 +361,9 @@ func (e *CLIExecutor) finish(
 	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
 	sink *textSink, emit func(a2a.Event) bool,
 ) {
+	defer e.releaseLock(taskID)
+	defer e.endRun(taskID)
+	defer e.interactions.Delete(taskID)
 	if !sink.Flush() {
 		return
 	}
@@ -241,6 +379,13 @@ func (e *CLIExecutor) finish(
 	}
 	e.breaker.Success()
 	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil))
+}
+
+// releaseLock releases the workdir lock held for a task, if any. It is idempotent.
+func (e *CLIExecutor) releaseLock(taskID string) {
+	if v, ok := e.locks.LoadAndDelete(taskID); ok {
+		v.(func())()
+	}
 }
 
 // emitChanges captures the task's working-tree changes and emits them as a
@@ -282,7 +427,10 @@ func (e *CLIExecutor) Cancel(_ context.Context, ec *a2asrv.ExecutorContext) iter
 			_ = sess.Cancel()
 			e.live.Del(taskID)
 		}
+		e.endRun(taskID)
 		e.baselines.Delete(taskID)
+		e.interactions.Delete(taskID)
+		e.releaseLock(taskID)
 		e.breaker.Resolve()
 		yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCanceled, nil), nil)
 	}
@@ -365,7 +513,7 @@ func codedStatus(ec *a2asrv.ExecutorContext, state a2a.TaskState, code, msg stri
 	if m.Metadata == nil {
 		m.Metadata = map[string]any{}
 	}
-	m.Metadata["harbor.errorCode"] = code
+	m.Metadata[metaKeyErrorCode] = code
 	return a2a.NewStatusUpdateEvent(ec, state, m)
 }
 
@@ -390,8 +538,106 @@ func firstTextPart(m *a2a.Message) string {
 	return ""
 }
 
-func inputFromMessage(m *a2a.Message) agent.Input {
-	return agent.Input{Kind: "answer", Answer: firstTextPart(m)}
+// interactionFromEvent builds the canonical descriptor for a permission event.
+// It uses the adapter's structured interaction when present and fills the gaps
+// from the event's tool fields, assigning a fresh id for cross-talk checks.
+func interactionFromEvent(ev agent.Event) *agent.Interaction {
+	itx := &agent.Interaction{Kind: agent.InteractionPermission, Resume: true}
+	if ev.Interaction != nil {
+		c := *ev.Interaction
+		itx = &c
+	}
+	if itx.Kind == "" {
+		itx.Kind = agent.InteractionPermission
+	}
+	if itx.ID == "" {
+		itx.ID = newInteractionID()
+	}
+	if itx.Action == "" {
+		itx.Action = ev.Tool
+	}
+	return itx
+}
+
+// interactionMessage builds the input-required message: a human-readable text
+// part plus a DataPart carrying the structured interaction for rich clients.
+func interactionMessage(prompt string, itx *agent.Interaction) *a2a.Message {
+	m := a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(prompt))
+	m.Parts = append(m.Parts, a2a.NewDataPart(interactionPayload(itx)))
+	m.Metadata = map[string]any{
+		metaKeyKind:          string(itx.Kind),
+		metaKeyInteractionID: itx.ID,
+	}
+	return m
+}
+
+// interactionPayload renders an interaction as JSON-native values (string,
+// bool, []any). The DataPart must not hold the Go struct: the task store
+// serializes tasks with gob, which requires every type carried in an interface
+// to be registered. Marshaling through JSON keeps the wire form and the stored
+// form identical and derived from the struct's own tags.
+func interactionPayload(itx *agent.Interaction) map[string]any {
+	m := map[string]any{}
+	if b, err := json.Marshal(itx); err == nil {
+		_ = json.Unmarshal(b, &m)
+	}
+	return m
+}
+
+// answerFromMessage maps a client's reply onto an agent.Input. The interaction
+// id may arrive in a structured DataPart or in the message metadata; either way
+// it is checked against the pending interaction. A reply with no id is accepted
+// as a text fallback for clients that do not use the extension.
+func (e *CLIExecutor) answerFromMessage(taskID string, m *a2a.Message) (agent.Input, error) {
+	id, answer := parseAnswer(m)
+	if cur, ok := e.pendingInteraction(taskID); ok && id != "" && id != cur.ID {
+		return agent.Input{}, fmt.Errorf("interaction id mismatch: got %q, want %q", id, cur.ID)
+	}
+	return agent.Input{Kind: "answer", ID: id, Answer: answer}, nil
+}
+
+// parseAnswer extracts the interaction id and answer text from a client reply.
+// It prefers a structured DataPart and falls back to the message metadata
+// (key "harbor.interactionId") plus the first text part.
+func parseAnswer(m *a2a.Message) (id, answer string) {
+	if m == nil {
+		return "", ""
+	}
+	for _, p := range m.Parts {
+		if p == nil || p.Data() == nil {
+			continue
+		}
+		b, err := json.Marshal(p.Data())
+		if err != nil {
+			continue
+		}
+		var a agent.Answer
+		if err := json.Unmarshal(b, &a); err != nil {
+			continue
+		}
+		if a.ID != "" || a.Answer != "" {
+			return a.ID, a.Answer
+		}
+	}
+	return metaString(m.Metadata, metaKeyInteractionID), firstTextPart(m)
+}
+
+// pendingInteraction returns the input request a paused task is waiting on.
+func (e *CLIExecutor) pendingInteraction(taskID string) (*agent.Interaction, bool) {
+	v, ok := e.interactions.Load(taskID)
+	if !ok {
+		return nil, false
+	}
+	return v.(*agent.Interaction), true
+}
+
+// newInteractionID returns a short random interaction identifier.
+func newInteractionID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "itx_unknown"
+	}
+	return "itx_" + hex.EncodeToString(b[:])
 }
 
 func metaString(m map[string]any, key string) string {

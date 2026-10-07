@@ -11,12 +11,14 @@ import (
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/integration"
 	"github.com/jiaweisky/harbor/internal/session"
+	"github.com/jiaweisky/harbor/internal/store"
 	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
@@ -40,10 +42,33 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 
 	mux := http.NewServeMux()
 
+	pushStore := push.NewInMemoryStore()
+	pushSender := push.NewHTTPPushSender(&push.HTTPSenderConfig{
+		Timeout:              10 * time.Second,
+		AllowPrivateNetworks: cfg.Server.PushAllowPrivateNetworks,
+	})
+
+	handlerOptions := []a2asrv.RequestHandlerOption{
+		a2asrv.WithLogger(slog.Default()),
+		a2asrv.WithAgentInactivityTimeout(10 * time.Minute),
+		a2asrv.WithPushNotifications(pushStore, pushSender),
+		a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true, PushNotifications: true}),
+	}
+	if cfg.Server.TaskStoreFile != "" {
+		ts, err := store.NewFileStore(cfg.Server.TaskStoreFile)
+		if err != nil {
+			return nil, fmt.Errorf("task store: %w", err)
+		}
+		handlerOptions = append(handlerOptions, a2asrv.WithTaskStore(ts))
+	}
+
 	cards := make([]*a2a.AgentCard, 0, len(cfg.Agents))
 	for i := range cfg.Agents {
 		ac := cfg.Agents[i]
-		ln, info, err := integration.Build(ctx, ac, cfg.Sandbox.InheritEnvEnabled())
+		ln, info, err := integration.Build(ctx, ac, integration.Options{
+			InheritEnv: cfg.Sandbox.InheritEnvEnabled(),
+			CLIHome:    cfg.Sandbox.CLIHome,
+		})
 		if err != nil {
 			slog.Warn("agent disabled", "id", ac.ID, "err", err)
 			continue
@@ -53,13 +78,10 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 			continue
 		}
 
-		exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-			workspace.NewResolver(cfg.Sandbox.WorkdirRoot, cfg.Sandbox.AllowOutside), ac.Limits)
-		handler := a2asrv.NewHandler(exec,
-			a2asrv.WithLogger(slog.Default()),
-			a2asrv.WithAgentInactivityTimeout(10*time.Minute),
-			a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}),
-		)
+		resolver := workspace.NewResolverWithIsolation(cfg.Sandbox.WorkdirRoot,
+			cfg.Sandbox.AllowOutside, cfg.Sandbox.Isolation, cfg.Sandbox.IsolationRoot)
+		exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), resolver, ac.Limits)
+		handler := a2asrv.NewHandler(exec, handlerOptions...)
 
 		path := AgentPath(ac.ID)
 		card := bridge.BuildCard(ln, info, EndpointURL(cfg.Server.BaseURL, ac.ID), bearer)
@@ -75,6 +97,8 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 	}
 	mux.Handle("/.well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(cards[0]))
 	mux.Handle(DiscoveryPath, bridge.NewCardsHandler(cards))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	return bridge.CORSMiddleware(cfg.Server.CORSAllowedOrigins, mux), nil
 }

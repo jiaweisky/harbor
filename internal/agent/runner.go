@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,18 +41,20 @@ func (p *Process) stop() {
 type Runner struct {
 	sem        chan struct{}
 	inheritEnv bool
+	cliHome    string
 	procs      sync.Map // taskID -> *Process
 }
 
 // NewRunner creates a Runner limiting concurrency to maxConcurrent (<=0 =
 // unbounded). When inheritEnv is false the child receives only an allowlisted
-// base environment plus the adapter-provided variables.
-func NewRunner(maxConcurrent int, inheritEnv bool) *Runner {
+// base environment plus the adapter-provided variables. When cliHome is set the
+// child's HOME (and XDG dirs) are redirected under it.
+func NewRunner(maxConcurrent int, inheritEnv bool, cliHome string) *Runner {
 	var sem chan struct{}
 	if maxConcurrent > 0 {
 		sem = make(chan struct{}, maxConcurrent)
 	}
-	return &Runner{sem: sem, inheritEnv: inheritEnv}
+	return &Runner{sem: sem, inheritEnv: inheritEnv, cliHome: cliHome}
 }
 
 // Start runs the CLI and streams normalized events parsed from its stdout.
@@ -64,7 +67,7 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 	// whole process group is terminated, not just the direct child.
 	cmd := exec.Command(inv.Bin, inv.Args...)
 	cmd.Dir = inv.Dir
-	cmd.Env = buildEnv(r.inheritEnv, inv.Env)
+	cmd.Env = buildEnv(r.inheritEnv, r.cliHome, inv.Env)
 	setProcessGroup(cmd)
 
 	stdout, err := cmd.StdoutPipe()
@@ -231,17 +234,39 @@ var baseEnvKeys = map[string]bool{
 
 // buildEnv returns the child environment. When inherit is false only an
 // allowlisted base plus the adapter extras is passed (no credential leakage).
-func buildEnv(inherit bool, extra []string) []string {
-	if inherit {
-		return append(os.Environ(), extra...)
+// When cliHome is set, HOME and the XDG/CLI config roots are redirected under it.
+func buildEnv(inherit bool, cliHome string, extra []string) []string {
+	base := os.Environ()
+	if !inherit {
+		base = allowlistedEnv()
 	}
-	env := make([]string, 0, len(baseEnvKeys)+len(extra))
+	return append(base, append(cliHomeEnv(cliHome), extra...)...)
+}
+
+func allowlistedEnv() []string {
+	env := make([]string, 0, len(baseEnvKeys))
 	for _, kv := range os.Environ() {
 		if k, _, _ := strings.Cut(kv, "="); baseEnvKeys[k] {
 			env = append(env, kv)
 		}
 	}
-	return append(env, extra...)
+	return env
+}
+
+// cliHomeEnv redirects a CLI's config/home to an isolated directory.
+func cliHomeEnv(cliHome string) []string {
+	if cliHome == "" {
+		return nil
+	}
+	home := filepath.Join(cliHome, "default")
+	return []string{
+		"HOME=" + home,
+		"XDG_CONFIG_HOME=" + filepath.Join(home, ".config"),
+		"XDG_DATA_HOME=" + filepath.Join(home, ".local", "share"),
+		"XDG_CACHE_HOME=" + filepath.Join(home, ".cache"),
+		"CLAUDE_CONFIG_DIR=" + filepath.Join(home, ".claude"),
+		"CODEX_HOME=" + filepath.Join(home, ".codex"),
+	}
 }
 
 func classifyStartErr(err error) error {
