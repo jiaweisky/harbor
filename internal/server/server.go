@@ -54,7 +54,7 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 		}
 
 		exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-			workspace.NewResolver(cfg.Sandbox.WorkdirRoot, cfg.Sandbox.AllowOutside))
+			workspace.NewResolver(cfg.Sandbox.WorkdirRoot, cfg.Sandbox.AllowOutside), ac.Limits)
 		handler := a2asrv.NewHandler(exec,
 			a2asrv.WithLogger(slog.Default()),
 			a2asrv.WithAgentInactivityTimeout(10*time.Minute),

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -34,11 +35,19 @@ func scriptPath(t *testing.T, name string) string {
 func newLauncher(
 	t *testing.T, script string, integ config.Integration, args []string, env map[string]string,
 ) agent.Launcher {
+	return newLauncherParser(t, script, integ, "", args, env)
+}
+
+func newLauncherParser(
+	t *testing.T, script string, integ config.Integration, parserName string,
+	args []string, env map[string]string,
+) agent.Launcher {
 	t.Helper()
 	ac := config.AgentConfig{
 		ID:          string(integ),
 		Binary:      script,
 		Integration: integ,
+		Parser:      parserName,
 		Args:        args,
 		Env:         env,
 		Session:     config.SessionConfig{IDFlag: "--session-id", ResumeFlag: "--resume", ContinueFlag: "--continue"},
@@ -52,7 +61,7 @@ func newLauncher(
 
 func newHandler(t *testing.T, ln agent.Launcher) a2asrv.RequestHandler {
 	t.Helper()
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
 	return a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 }
 
@@ -61,7 +70,8 @@ func newHandler(t *testing.T, ln agent.Launcher) a2asrv.RequestHandler {
 func newPwdHandler(t *testing.T, root string) a2asrv.RequestHandler {
 	t.Helper()
 	ln := newLauncher(t, scriptPath(t, "fake-pwd.sh"), "exec", nil, nil)
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), workspace.NewResolver(root, false))
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
+		workspace.NewResolver(root, false), config.LimitsConfig{})
 	return a2asrv.NewHandler(exec)
 }
 
@@ -282,6 +292,170 @@ func TestErrorCode(t *testing.T) {
 	}
 }
 
+func TestSendMessage_codex(t *testing.T) {
+	ln := newLauncherParser(t, scriptPath(t, "fake-codex.sh"), "exec", "codex", []string{"exec", "{{.Prompt}}"}, nil)
+	h := newHandler(t, ln)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+	if got := artifactText(task); !strings.Contains(got, "Hello from codex") {
+		t.Fatalf("artifact text = %q", got)
+	}
+}
+
+func TestSendMessage_genericRegex(t *testing.T) {
+	ac := config.AgentConfig{
+		ID:          "my",
+		Binary:      scriptPath(t, "fake-mycoder.sh"),
+		Integration: "exec",
+		Parser:      "regex",
+		Regex:       &config.RegexConfig{Text: `^OUT:\s*(.+)$`},
+		Args:        []string{"{{.Prompt}}"},
+	}
+	ln, err := integration.New(ac, true)
+	if err != nil {
+		t.Fatalf("integration.New: %v", err)
+	}
+	h := newHandler(t, ln)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+	got := artifactText(task)
+	if !strings.Contains(got, "hello from my-coder") || strings.Contains(got, "noise") {
+		t.Fatalf("artifact text = %q", got)
+	}
+}
+
+// newHandlerTimeout returns a handler with a total task timeout.
+func newHandlerTimeout(t *testing.T, ln agent.Launcher, d time.Duration) a2asrv.RequestHandler {
+	t.Helper()
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{Timeout: d})
+	return a2asrv.NewHandler(exec)
+}
+
+func TestBreakerRejectsAfterFailures(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-fail.sh"), "stream-json", nil, nil)
+	limits := config.LimitsConfig{
+		Breaker: &config.BreakerConfig{Threshold: 2, Cooldown: time.Hour, MaxCooldown: time.Hour},
+	}
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, limits)
+	h := a2asrv.NewHandler(exec)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for i := 0; i < 2; i++ {
+		resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")})
+		if err != nil {
+			t.Fatalf("SendMessage: %v", err)
+		}
+		if task := resp.(*a2a.Task); task.Status.State != a2a.TaskStateFailed {
+			t.Fatalf("run %d: state = %s", i, task.Status.State)
+		}
+	}
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateRejected {
+		t.Fatalf("expected rejected, got %s", task.Status.State)
+	}
+	if task.Status.Message == nil || task.Status.Message.Metadata["harbor.errorCode"] != "agent_unavailable" {
+		t.Fatalf("expected agent_unavailable: %+v", task.Status.Message)
+	}
+}
+
+func TestTimeout(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-slow.sh"), "stream-json", nil, nil)
+	h := newHandlerTimeout(t, ln, 400*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateFailed {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+	if task.Status.Message == nil || task.Status.Message.Metadata["harbor.errorCode"] != "timeout" {
+		t.Fatalf("expected timeout code: %+v", task.Status.Message)
+	}
+}
+
+// gitRepo creates a git repository with one committed file.
+func gitRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init")
+	if err := os.WriteFile(filepath.Join(dir, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "init")
+	return dir
+}
+
+func TestChangesArtifact(t *testing.T) {
+	repo := gitRepo(t)
+	ln := newLauncher(t, scriptPath(t, "fake-mutate.sh"), "exec", nil, nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
+		workspace.NewResolver(repo, false), config.LimitsConfig{})
+	h := a2asrv.NewHandler(exec)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m := message("hi")
+	m.Metadata = map[string]any{"harbor.workDir": "."}
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+
+	var diff string
+	for _, a := range task.Artifacts {
+		if a.Name == "changes" {
+			for _, p := range a.Parts {
+				diff += p.Text()
+			}
+		}
+	}
+	if !strings.Contains(diff, "tracked.txt") || !strings.Contains(diff, "+appended line") {
+		t.Fatalf("changes artifact missing diff:\n%s", diff)
+	}
+}
+
 func TestWorkdirApplied(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
@@ -397,7 +571,7 @@ func TestAuthScope(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
 	card := bridge.BuildCard(ln, ln.Probe(context.Background()), "http://example/agents/x/", true)
 
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
 	h := a2asrv.NewHandler(exec)
 
 	mux := http.NewServeMux()

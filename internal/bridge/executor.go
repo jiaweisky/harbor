@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"sync"
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/changes"
+	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
@@ -19,6 +22,8 @@ const (
 	codeCLINotFound        = "cli_not_found"
 	codeUnsupportedContent = "unsupported_content"
 	codeWorkdirDenied      = "workdir_denied"
+	codeTimeout            = "timeout"
+	codeAgentUnavailable   = "agent_unavailable"
 )
 
 // errNoText is returned when an incoming message has no textual part.
@@ -36,25 +41,50 @@ type CLIExecutor struct {
 	sessions  SessionStore
 	live      *agent.LiveSessions
 	workspace *workspace.Resolver
+	timeout   time.Duration // total task timeout; 0 disables
+	breaker   *breaker      // nil disables
+	baselines sync.Map      // taskID -> changes.Baseline
 }
 
-// NewCLIExecutor creates an executor over the given launcher.
+// NewCLIExecutor creates an executor over the given launcher. limits bounds the
+// task duration and the failure circuit breaker.
 func NewCLIExecutor(
-	ln agent.Launcher, sessions SessionStore, live *agent.LiveSessions, ws *workspace.Resolver,
+	ln agent.Launcher, sessions SessionStore, live *agent.LiveSessions,
+	ws *workspace.Resolver, limits config.LimitsConfig,
 ) *CLIExecutor {
-	return &CLIExecutor{launcher: ln, sessions: sessions, live: live, workspace: ws}
+	return &CLIExecutor{
+		launcher:  ln,
+		sessions:  sessions,
+		live:      live,
+		workspace: ws,
+		timeout:   limits.Timeout,
+		breaker:   newBreaker(limits.Breaker),
+	}
 }
 
 // Execute implements a2asrv.AgentExecutor. A task paused on input-required is
 // resumed; any other task starts a new CLI session.
 func (e *CLIExecutor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
-		taskID := string(ec.TaskID)
-		if isWaitingForInput(ec) {
-			e.resume(ctx, ec, taskID, yield)
+		if !e.breaker.Allow() {
+			if ec.StoredTask == nil && !yield(a2a.NewSubmittedTask(ec, ec.Message), nil) {
+				return
+			}
+			yield(rejectedStatus(ec, "agent is temporarily unavailable after repeated failures"), nil)
 			return
 		}
-		e.start(ctx, ec, taskID, yield)
+		taskID := string(ec.TaskID)
+		runCtx := ctx
+		if e.timeout > 0 {
+			var cancel context.CancelFunc
+			runCtx, cancel = context.WithTimeout(ctx, e.timeout)
+			defer cancel()
+		}
+		if isWaitingForInput(ec) {
+			e.resume(runCtx, ec, taskID, yield)
+			return
+		}
+		e.start(runCtx, ec, taskID, yield)
 	}
 }
 
@@ -74,16 +104,22 @@ func (e *CLIExecutor) start(
 
 	req, err := e.toRequest(ec)
 	if err != nil {
+		e.breaker.Resolve()
 		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
 		return
 	}
+	if req.WorkDir != "" {
+		e.baselines.Store(taskID, changes.Snapshot(req.WorkDir))
+	}
 	sess, err := e.launcher.Start(agent.WithTaskID(ctx, taskID), req)
 	if err != nil {
+		e.baselines.Delete(taskID)
+		e.breaker.Failure()
 		yield(failedStatus(ec, codeForStartError(err), err.Error()), nil)
 		return
 	}
 	e.live.Put(taskID, sess)
-	e.pump(ec, taskID, sess, yield)
+	e.pump(ctx, ec, taskID, sess, yield)
 }
 
 // resume answers a task paused on input-required by writing to its live session.
@@ -104,13 +140,13 @@ func (e *CLIExecutor) resume(
 	if !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
 		return
 	}
-	e.pump(ec, taskID, sess, yield)
+	e.pump(ctx, ec, taskID, sess, yield)
 }
 
 // pump consumes session events, coalescing text into artifact updates and
 // keeping the task alive across an input-required pause.
 func (e *CLIExecutor) pump(
-	ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
+	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
 	yield func(a2a.Event, error) bool,
 ) {
 	emit := func(ev a2a.Event) bool {
@@ -120,6 +156,8 @@ func (e *CLIExecutor) pump(
 		// The consumer went away: tear the CLI down so no process leaks.
 		_ = sess.Cancel()
 		e.live.Del(taskID)
+		e.baselines.Delete(taskID)
+		e.breaker.Resolve()
 		return false
 	}
 	sink := newTextSink(ec, emit)
@@ -132,7 +170,7 @@ func (e *CLIExecutor) pump(
 		select {
 		case ev, ok := <-ch:
 			if !ok {
-				e.finish(ec, taskID, sess, sink, emit)
+				e.finish(ctx, ec, taskID, sess, sink, emit)
 				return
 			}
 			if !e.handleEvent(ec, taskID, sess, sink, emit, ev) {
@@ -173,6 +211,8 @@ func (e *CLIExecutor) handleEvent(
 		if sess.Canceled() {
 			return false
 		}
+		e.emitChanges(ec, taskID, emit)
+		e.breaker.Failure()
 		emit(failedStatus(ec, codeInternal, eventErrorText(ev)))
 		return false
 	}
@@ -180,9 +220,10 @@ func (e *CLIExecutor) handleEvent(
 }
 
 // finish flushes pending text and emits the terminal state after the event
-// channel closes (the CLI process has exited).
+// channel closes (the CLI process has exited). A context deadline is reported
+// as a timeout failure.
 func (e *CLIExecutor) finish(
-	ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
+	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
 	sink *textSink, emit func(a2a.Event) bool,
 ) {
 	if !sink.Flush() {
@@ -192,7 +233,45 @@ func (e *CLIExecutor) finish(
 	if sess.Canceled() {
 		return // Cancel already emitted the canceled state.
 	}
+	e.emitChanges(ec, taskID, emit)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		e.breaker.Failure()
+		emit(failedStatus(ec, codeTimeout, "task timed out"))
+		return
+	}
+	e.breaker.Success()
 	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil))
+}
+
+// emitChanges captures the task's working-tree changes and emits them as a
+// "changes" artifact. It is a no-op when there is no baseline or no diff.
+func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool) {
+	v, ok := e.baselines.LoadAndDelete(taskID)
+	if !ok {
+		return
+	}
+	dir, err := e.workspace.Resolve(ec.ContextID, metaString(mergeMetadata(ec), "harbor.workDir"))
+	if err != nil || dir == "" {
+		return
+	}
+	res := changes.Capture(dir, v.(changes.Baseline), 0)
+	if res.Diff == "" {
+		return
+	}
+	part := a2a.NewTextPart(res.Diff)
+	part.MediaType = "text/x-diff"
+	evt := a2a.NewArtifactEvent(ec, part)
+	evt.Artifact.Name = "changes"
+	evt.Artifact.Metadata = map[string]any{"files": toAnySlice(res.Files), "truncated": res.Truncated}
+	emit(evt)
+}
+
+func toAnySlice(values []string) []any {
+	out := make([]any, len(values))
+	for i, v := range values {
+		out[i] = v
+	}
+	return out
 }
 
 // Cancel implements a2asrv.AgentExecutor.
@@ -203,6 +282,8 @@ func (e *CLIExecutor) Cancel(_ context.Context, ec *a2asrv.ExecutorContext) iter
 			_ = sess.Cancel()
 			e.live.Del(taskID)
 		}
+		e.baselines.Delete(taskID)
+		e.breaker.Resolve()
 		yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCanceled, nil), nil)
 	}
 }
@@ -270,12 +351,22 @@ func mergeMetadata(ec *a2asrv.ExecutorContext) map[string]any {
 
 // failedStatus builds a failed status event carrying a machine-readable code.
 func failedStatus(ec *a2asrv.ExecutorContext, code, msg string) *a2a.TaskStatusUpdateEvent {
+	return codedStatus(ec, a2a.TaskStateFailed, code, msg)
+}
+
+// rejectedStatus builds a rejected status event (the agent did not run).
+func rejectedStatus(ec *a2asrv.ExecutorContext, msg string) *a2a.TaskStatusUpdateEvent {
+	return codedStatus(ec, a2a.TaskStateRejected, codeAgentUnavailable, msg)
+}
+
+// codedStatus builds a terminal status event carrying a machine-readable code.
+func codedStatus(ec *a2asrv.ExecutorContext, state a2a.TaskState, code, msg string) *a2a.TaskStatusUpdateEvent {
 	m := a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(msg))
 	if m.Metadata == nil {
 		m.Metadata = map[string]any{}
 	}
 	m.Metadata["harbor.errorCode"] = code
-	return a2a.NewStatusUpdateEvent(ec, a2a.TaskStateFailed, m)
+	return a2a.NewStatusUpdateEvent(ec, state, m)
 }
 
 func eventErrorText(ev agent.Event) string {

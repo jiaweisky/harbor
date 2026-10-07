@@ -79,9 +79,13 @@ func New(ac config.AgentConfig, inheritEnv bool) (agent.Launcher, error) {
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
 		}), nil
 	case config.IntegrationExec:
+		p, err := buildExecParser(ac)
+		if err != nil {
+			return nil, err
+		}
 		return agent.NewHeadlessLauncher(agent.LauncherConfig{
 			Name: ac.ID, Binary: ac.Binary, Capabilities: textCaps(),
-			Parser: parser.NewText(), Invoke: textInvoke(ac),
+			Parser: p, Invoke: textInvoke(ac),
 			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: inheritEnv,
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
 		}), nil
@@ -122,6 +126,20 @@ func textCaps() agent.Capabilities {
 		SessionResume: true,
 		Streaming:     agent.StreamTurn,
 	}
+}
+
+// buildExecParser builds the parser for a one-shot (exec) invocation. The
+// parser name comes from config (default "text"); "regex" also needs a pattern.
+func buildExecParser(ac config.AgentConfig) (agent.Parser, error) {
+	name := ac.Parser
+	if name == "" {
+		name = "text"
+	}
+	pattern := ""
+	if ac.Regex != nil {
+		pattern = ac.Regex.Text
+	}
+	return parser.Build(name, pattern)
 }
 
 // streamJSONInvoke builds a duplex invocation: the prompt is written to stdin

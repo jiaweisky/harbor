@@ -21,7 +21,7 @@ agents:
     integration: stream-json
     args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages"]
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
-    limits: { max_concurrent: 3 }
+    limits: { max_concurrent: 3, timeout: 30m, breaker: { threshold: 3, cooldown: 30s, max_cooldown: 10m } }
 
   - id: opencode
     display_name: "OpenCode"
@@ -29,5 +29,22 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]
     session: { id_flag: "--session", continue_flag: "--continue" }
+    limits: { max_concurrent: 2 }
+
+  - id: codex
+    display_name: "Codex"
+    binary: codex
+    integration: exec
+    args: ["exec", "--json", "--skip-git-repo-check", "{{.Prompt}}"]
+    limits: { max_concurrent: 2 }
+
+  # Zero-code custom CLI: extract text from output with a regex.
+  - id: my-coder
+    display_name: "My Coder"
+    binary: my-coder
+    integration: exec
+    parser: regex
+    regex: { text: '^OUT:\s*(.+)$' }
+    args: ["--prompt", "{{.Prompt}}"]
     limits: { max_concurrent: 2 }
 

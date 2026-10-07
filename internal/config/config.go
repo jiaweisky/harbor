@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -102,6 +103,8 @@ type AgentConfig struct {
 	DisplayName    string            `yaml:"display_name"`
 	Binary         string            `yaml:"binary"`
 	Integration    Integration       `yaml:"integration"`
+	Parser         string            `yaml:"parser"` // exec framing: text | codex | regex; default text
+	Regex          *RegexConfig      `yaml:"regex"`  // parser: regex
 	Args           []string          `yaml:"args"`
 	Env            map[string]string `yaml:"env"`
 	AllowDangerous bool              `yaml:"allow_dangerous"`
@@ -110,12 +113,18 @@ type AgentConfig struct {
 	Limits         LimitsConfig      `yaml:"limits"`
 }
 
+// RegexConfig configures the regex parser.
+type RegexConfig struct {
+	Text string `yaml:"text"`
+}
+
 // Profile describes a known coding-agent CLI: which integrations it supports,
 // the default integration, the minimum supported version, and how to read the
 // version.
 type Profile struct {
 	Binary      string        // matched against the binary's base name
 	Integration Integration   // default integration
+	Parser      string        // default exec parser
 	Supported   []Integration // accepted integrations
 	MinVersion  string        // minimum supported version; below it Harbor refuses to start
 	VersionArgs []string      // version flag(s); nil disables probing
@@ -142,7 +151,8 @@ var knownProfiles = []Profile{
 		Supported: []Integration{IntegrationStreamJSON}},
 	{Binary: "opencode", Integration: IntegrationExec, MinVersion: "1.18.35", VersionArgs: []string{"--version"},
 		Supported: []Integration{IntegrationExec}},
-	{Binary: "codex", Integration: IntegrationExec, MinVersion: "0.160.1", VersionArgs: []string{"--version"},
+	{Binary: "codex", Integration: IntegrationExec, Parser: "codex",
+		MinVersion: "0.160.1", VersionArgs: []string{"--version"},
 		Supported: []Integration{IntegrationExec}},
 }
 
@@ -166,7 +176,16 @@ type SessionConfig struct {
 
 // LimitsConfig bounds concurrent execution for an agent.
 type LimitsConfig struct {
-	MaxConcurrent int `yaml:"max_concurrent"`
+	MaxConcurrent int            `yaml:"max_concurrent"`
+	Timeout       time.Duration  `yaml:"timeout"` // total task timeout; 0 disables
+	Breaker       *BreakerConfig `yaml:"breaker"` // optional failure circuit breaker
+}
+
+// BreakerConfig configures the per-agent failure circuit breaker.
+type BreakerConfig struct {
+	Threshold   int           `yaml:"threshold"`    // consecutive failures that open the breaker
+	Cooldown    time.Duration `yaml:"cooldown"`     // open duration before a probe
+	MaxCooldown time.Duration `yaml:"max_cooldown"` // backoff cap
 }
 
 // Load reads and validates a config file, applying defaults.
@@ -206,9 +225,12 @@ func (c *Config) applyDefaults() {
 	}
 	for i := range c.Agents {
 		a := &c.Agents[i]
-		if a.Integration == "" {
-			if p, ok := LookupProfile(a.Binary); ok {
+		if p, ok := LookupProfile(a.Binary); ok {
+			if a.Integration == "" {
 				a.Integration = p.Integration
+			}
+			if a.Parser == "" {
+				a.Parser = p.Parser
 			}
 		}
 	}
