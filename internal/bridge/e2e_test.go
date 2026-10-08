@@ -1,6 +1,7 @@
 package bridge_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -89,6 +90,18 @@ func artifactText(task *a2a.Task) string {
 		}
 	}
 	return b.String()
+}
+
+// firstDataPart returns the first JSON object artifact part, or nil.
+func firstDataPart(task *a2a.Task) map[string]any {
+	for _, a := range task.Artifacts {
+		for _, p := range a.Parts {
+			if m, ok := p.Data().(map[string]any); ok {
+				return m
+			}
+		}
+	}
+	return nil
 }
 
 // sendTask runs one prompt and returns the completed task and its elapsed time,
@@ -394,6 +407,62 @@ func TestStreamJSONQuestionResume(t *testing.T) {
 	}
 }
 
+// TestStreamJSONStructuredOutput verifies a harbor.outputSchema request produces
+// a schema-validated JSON DataPart artifact.
+func TestStreamJSONStructuredOutput(t *testing.T) {
+	h, _, cancel := newStreamJSONHandler(t, "fake-structured.sh")
+	defer cancel()
+
+	m := message("capital of France")
+	m.Metadata = map[string]any{"harbor.outputSchema": map[string]any{"type": "object"}}
+	task, _ := sendTask(t, h, m)
+
+	data := firstDataPart(task)
+	if data == nil || data["city"] != "Paris" {
+		t.Fatalf("structured artifact = %v, want city Paris", data)
+	}
+}
+
+// TestStreamJSONImageInput verifies a raw image part reaches the CLI as a native
+// image content block on stdin (stream-json), not a file path.
+func TestStreamJSONImageInput(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "stdin.log")
+	script := "#!/bin/sh\nread -r line\n" +
+		`echo "$line" >> "$HARBOR_STDIN_LOG"` + "\n" +
+		`echo '{"type":"result","result":"ok","is_error":false}'` + "\n"
+	// Name the fake "codebuddy" so it picks up the profile's image capability.
+	ln, err := integration.New(config.AgentConfig{
+		ID: "cb", Binary: fakeBin(t, "codebuddy", script), Integration: config.IntegrationStreamJSON,
+		Args: []string{"-p"}, Env: map[string]string{"HARBOR_STDIN_LOG": logPath},
+	}, integration.Options{InheritEnv: true})
+	if err != nil {
+		t.Fatalf("integration.New: %v", err)
+	}
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{Timeout: 30 * time.Second})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	img := a2a.NewRawPart([]byte("PNGBYTES"))
+	img.MediaType = "image/png"
+	img.Filename = "x.png"
+	m := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("describe this"), img)
+	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+
+	sent, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read stdin log: %v", err)
+	}
+	got := string(sent)
+	if !strings.Contains(got, `"type":"image"`) || !strings.Contains(got, `"media_type":"image/png"`) {
+		t.Fatalf("stdin = %s, want a native image content block", got)
+	}
+}
+
 func TestInputRequiredAcceptsTextWithMetadataID(t *testing.T) {
 	h, ctx, cancel, task := newPausedACPTask(t)
 	defer cancel()
@@ -651,9 +720,12 @@ func TestCancel(t *testing.T) {
 	}
 }
 
-func TestExecutorMetricsCompleted(t *testing.T) {
+// runMetricsTask runs one prompt against a stream-json fake CLI and returns the
+// executor so its metrics snapshot can be asserted.
+func runMetricsTask(t *testing.T, script string) *bridge.CLIExecutor {
+	t.Helper()
 	exec := bridge.NewCLIExecutor(
-		newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil),
+		newLauncher(t, scriptPath(t, script), "stream-json", nil, nil),
 		session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
@@ -662,13 +734,44 @@ func TestExecutorMetricsCompleted(t *testing.T) {
 	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("hi")}); err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
+	return exec
+}
 
+func TestExecutorMetricsCompleted(t *testing.T) {
+	exec := runMetricsTask(t, "fake-codebuddy.sh")
 	snap := exec.Snapshot()
 	if snap.Submitted != 1 || snap.Completed != 1 || snap.Active != 0 {
 		t.Fatalf("snapshot = %+v, want 1 submitted, 1 completed, 0 active", snap)
 	}
 	if !exec.Ready() || snap.BreakerState != "closed" {
 		t.Fatalf("ready=%v breaker=%q, want ready and closed", exec.Ready(), snap.BreakerState)
+	}
+	if snap.DurationCount != 1 || snap.DurationSumSeconds < 0 {
+		t.Fatalf("duration = %+v, want one observation", snap)
+	}
+}
+
+// TestExecutorMetricsUsage verifies token/cost totals and the Prometheus
+// duration histogram/usage counters are recorded and rendered.
+func TestExecutorMetricsUsage(t *testing.T) {
+	snap := runMetricsTask(t, "fake-usage.sh").Snapshot()
+	if snap.TokensIn != 11 || snap.TokensOut != 22 || snap.CostUSD < 0.012 {
+		t.Fatalf("usage = %+v, want 11/22 tokens and cost >= 0.012", snap)
+	}
+
+	var buf bytes.Buffer
+	bridge.WritePrometheus(&buf, []bridge.MetricsSnapshot{snap})
+	out := buf.String()
+	for _, want := range []string{
+		`harbor_task_duration_seconds_bucket{agent="stream-json",le="+Inf"} 1`,
+		`harbor_task_duration_seconds_count{agent="stream-json"} 1`,
+		`harbor_task_tokens_total{agent="stream-json",direction="input"} 11`,
+		`harbor_task_tokens_total{agent="stream-json",direction="output"} 22`,
+		`harbor_task_cost_usd_total{agent="stream-json"}`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics missing %q\n%s", want, out)
+		}
 	}
 }
 

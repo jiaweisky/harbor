@@ -25,7 +25,12 @@ type Request struct {
 	SessionID   string
 	Continue    bool
 	MaxTurns    int
-	Meta        map[string]any
+	// OutputSchema, when set, asks the CLI to produce a schema-validated JSON
+	// result, surfaced as a structured DataPart artifact.
+	OutputSchema map[string]any
+	// Images are native image inputs for structured (stream-json) CLIs.
+	Images []Image
+	Meta   map[string]any
 }
 
 // Invocation is a concrete CLI invocation.

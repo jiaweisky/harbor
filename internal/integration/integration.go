@@ -3,6 +3,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os/exec"
@@ -94,8 +95,8 @@ func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 	switch integ {
 	case config.IntegrationStreamJSON:
 		return agent.NewHeadlessLauncher(agent.LauncherConfig{
-			Name: ac.ID, Binary: ac.Binary, Capabilities: streamJSONCaps(),
-			Parser: parser.NewStreamJSON(), Invoke: streamJSONInvoke(ac),
+			Name: ac.ID, Binary: ac.Binary, Capabilities: streamJSONCaps(profile.InputImage),
+			NewParser: func() agent.Parser { return parser.NewStreamJSON() }, Invoke: streamJSONInvoke(ac),
 			Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
 			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
@@ -174,12 +175,16 @@ func authenticator(ac config.AgentConfig) agent.Authenticator {
 }
 
 // streamJSONCaps describes a CLI driven over its structured, duplex stream mode.
-func streamJSONCaps() agent.Capabilities {
+// inputImage lists the image MIME types the CLI accepts in an image content
+// block (empty when it does not accept images on this channel).
+func streamJSONCaps(inputImage []string) agent.Capabilities {
 	return agent.Capabilities{
 		InputText:           true,
+		InputImage:          inputImage,
 		InputFile:           true,
 		InputPrompt:         true,
 		OutputText:          true,
+		OutputData:          true, // --json-schema structured output
 		Permission:          agent.PermInteractive,
 		InputRequiredResume: true,
 		SessionResume:       true,
@@ -220,8 +225,8 @@ func streamJSONInvoke(ac config.AgentConfig) agent.InvokeFunc {
 	return func(req *agent.Request) (*agent.Invocation, error) {
 		args := append([]string{}, ac.Args...)
 		args = append(args, sessionArgs(ac, req)...)
-		args = appendModelAndSystem(args, ac, req)
-		stdin := agent.EncodeStreamJSONUserMessage(req.Prompt)
+		args = appendCommonFlags(args, ac, req)
+		stdin := agent.EncodeStreamJSONInput(req.Prompt, req.Images)
 		if ac.SDKCaps {
 			// Declare SDK capabilities first so the CLI routes AskUserQuestion
 			// through can_use_tool.
@@ -270,14 +275,20 @@ func sessionArgs(ac config.AgentConfig, req *agent.Request) []string {
 	return nil
 }
 
-// appendModelAndSystem adds model and system-prompt flags when requested. These
-// flags are shared by the Claude-family CLIs; other integrations use templates.
-func appendModelAndSystem(args []string, ac config.AgentConfig, req *agent.Request) []string {
+// appendCommonFlags adds the model, system-prompt, structured-output, and
+// dangerous-mode flags shared by the Claude-family CLIs; other integrations use
+// argument templates.
+func appendCommonFlags(args []string, ac config.AgentConfig, req *agent.Request) []string {
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)
 	}
 	if req.SystemExtra != "" {
 		args = append(args, "--append-system-prompt", req.SystemExtra)
+	}
+	if req.OutputSchema != nil {
+		if b, err := json.Marshal(req.OutputSchema); err == nil {
+			args = append(args, "--json-schema", string(b))
+		}
 	}
 	if ac.AllowDangerous {
 		args = append(args, "--dangerously-skip-permissions")

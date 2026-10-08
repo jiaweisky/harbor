@@ -14,6 +14,7 @@ const (
 	EventUsage
 	EventError
 	EventDone
+	EventStructuredOutput // a schema-validated structured result (Data)
 )
 
 // Usage carries token/cost information when the CLI reports it.
@@ -31,7 +32,8 @@ type Event struct {
 	ToolInput   map[string]any
 	SessionID   string
 	Usage       *Usage
-	Interaction *Interaction // set on EventPermissionRequest when structured
+	Interaction *Interaction   // set on EventPermissionRequest when structured
+	Data        map[string]any // set on EventStructuredOutput
 	Err         error
 	Raw         []byte
 }

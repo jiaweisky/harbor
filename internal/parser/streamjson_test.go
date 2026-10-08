@@ -55,6 +55,75 @@ func TestStreamJSONControlRequest(t *testing.T) {
 	}
 }
 
+func TestStreamJSONFinalTextFallback(t *testing.T) {
+	p := parser.NewStreamJSON()
+	var sawDelta, sawFinal bool
+	for _, e := range collect(t, p, `{"type":"result","result":"done","is_error":false}`) {
+		switch e.Kind {
+		case agent.EventTextDelta:
+			sawDelta = true
+		case agent.EventTextFinal:
+			sawFinal = true
+		}
+	}
+	if sawDelta || !sawFinal {
+		t.Fatalf("want a final-text fallback with no delta, got delta=%v final=%v", sawDelta, sawFinal)
+	}
+}
+
+func TestStreamJSONAssistantMessagesAccumulate(t *testing.T) {
+	p := parser.NewStreamJSON()
+	evs := collect(t, p, `{"type":"assistant","message":{"content":[{"type":"text","text":"Hello "}]}}`)
+	evs = append(evs, collect(t, p, `{"type":"assistant","message":{"content":[{"type":"text","text":"world"}]}}`)...)
+	evs = append(evs, collect(t, p, `{"type":"result","result":"Hello world","is_error":false}`)...)
+
+	var text string
+	finals := 0
+	for _, e := range evs {
+		switch e.Kind {
+		case agent.EventTextDelta:
+			text += e.Text
+		case agent.EventTextFinal:
+			finals++
+		}
+	}
+	if text != "Hello world" || finals != 0 {
+		t.Fatalf("text = %q (finals=%d), want Hello world with no final fallback", text, finals)
+	}
+}
+
+func TestStreamJSONPartialDedup(t *testing.T) {
+	p := parser.NewStreamJSON()
+	evs := collect(t, p, `{"type":"stream_event","event":{"delta":{"text":"Hi"}}}`)
+	evs = append(evs, collect(t, p, `{"type":"assistant","message":{"content":[{"type":"text","text":"Hi there"}]}}`)...)
+
+	var text string
+	for _, e := range evs {
+		if e.Kind == agent.EventTextDelta {
+			text += e.Text
+		}
+	}
+	if text != "Hi" {
+		t.Fatalf("text = %q, want Hi (the full assistant message is skipped after a delta)", text)
+	}
+}
+
+func TestStreamJSONStructuredOutput(t *testing.T) {
+	p := parser.NewStreamJSON()
+	rec := `{"type":"result","result":"done","is_error":false,` +
+		`"structured_output":{"city":"Paris","population_millions":2.1}}`
+
+	var data map[string]any
+	for _, e := range collect(t, p, rec) {
+		if e.Kind == agent.EventStructuredOutput {
+			data = e.Data
+		}
+	}
+	if data == nil || data["city"] != "Paris" {
+		t.Fatalf("structured output = %v, want city Paris", data)
+	}
+}
+
 func TestStreamJSONAskUserQuestion(t *testing.T) {
 	p := parser.NewStreamJSON()
 	rec := `{"type":"control_request","request_id":"perm_q1",` +

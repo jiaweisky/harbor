@@ -151,6 +151,9 @@ type Profile struct {
 	MinVersion  string        // minimum supported version; below it Harbor refuses to start
 	VersionArgs []string      // version flag(s); nil disables probing
 	ACPArgs     []string      // args selecting ACP mode, when unset in the agent config
+	// InputImage lists image MIME types the CLI accepts natively in its
+	// structured (stream-json) input; nil means images are not accepted.
+	InputImage []string
 }
 
 // Supports reports whether the profile accepts the integration.
@@ -169,7 +172,8 @@ func (p Profile) Supports(i Integration) bool {
 // through to explicit configuration.
 var knownProfiles = []Profile{
 	{Binary: "codebuddy", Integration: IntegrationStreamJSON, MinVersion: "2.161.4", VersionArgs: []string{"--version"},
-		Supported: []Integration{IntegrationStreamJSON, IntegrationExec, IntegrationACP, IntegrationServer}},
+		Supported:  []Integration{IntegrationStreamJSON, IntegrationExec, IntegrationACP, IntegrationServer},
+		InputImage: []string{"image/png", "image/jpeg", "image/gif", "image/webp"}},
 	{Binary: "claude", Integration: IntegrationStreamJSON, MinVersion: "2.1.292", VersionArgs: []string{"--version"},
 		Supported: []Integration{IntegrationStreamJSON}},
 	{Binary: "opencode", Integration: IntegrationExec, MinVersion: "1.18.35", VersionArgs: []string{"--version"},

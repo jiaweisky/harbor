@@ -3,8 +3,12 @@
 package bridge_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"os"
 	"os/exec"
@@ -142,6 +146,75 @@ func TestRealCodebuddyServerResume(t *testing.T) {
 	m2 := message("reply with the single word: beta")
 	m2.ContextID = "real-cb-serve-resume"
 	sendAndExpect(t, h, m2, "beta")
+}
+
+// TestRealCodebuddyImage verifies a raw image part is interpreted natively via a
+// stream-json image content block.
+func TestRealCodebuddyImage(t *testing.T) {
+	requireCodebuddy(t)
+	h := codebuddyHandler(t, config.AgentConfig{
+		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		Args: []string{
+			"-p", "--input-format", "stream-json",
+			"--output-format", "stream-json", "--include-partial-messages",
+		},
+		Session: config.SessionConfig{IDFlag: "--session-id", ResumeFlag: "--resume", ContinueFlag: "-c"},
+	})
+
+	img := a2a.NewRawPart(testRedPNG(t))
+	img.MediaType = "image/png"
+	img.Filename = "red.png"
+	m := a2a.NewMessage(a2a.MessageRoleUser,
+		a2a.NewTextPart("What color is this image? Reply with one word."), img)
+
+	task, _ := sendTask(t, h, m)
+	if got := strings.ToLower(artifactText(task)); !strings.Contains(got, "red") {
+		t.Errorf("artifact = %q, want it to mention red", got)
+	}
+}
+
+// testRedPNG returns a 64x64 solid red PNG.
+func testRedPNG(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			img.Set(x, y, color.RGBA{R: 220, G: 20, B: 20, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestRealCodebuddyStructuredOutput verifies a harbor.outputSchema request
+// yields a schema-validated DataPart artifact via --json-schema.
+func TestRealCodebuddyStructuredOutput(t *testing.T) {
+	requireCodebuddy(t)
+	h := codebuddyHandler(t, config.AgentConfig{
+		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		Args: []string{
+			"-p", "--input-format", "stream-json",
+			"--output-format", "stream-json", "--include-partial-messages",
+		},
+		Session: config.SessionConfig{IDFlag: "--session-id", ResumeFlag: "--resume", ContinueFlag: "-c"},
+	})
+
+	m := message("What is the capital of France, and its population in millions (about 2.1)?")
+	m.Metadata = map[string]any{"harbor.outputSchema": map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"city":                map[string]any{"type": "string"},
+			"population_millions": map[string]any{"type": "number"},
+		},
+		"required": []any{"city", "population_millions"},
+	}}
+	task, _ := sendTask(t, h, m)
+	if data := firstDataPart(task); data == nil || data["city"] == nil {
+		t.Fatalf("structured artifact = %v, want a city", data)
+	}
 }
 
 // TestRealCodebuddyPermission verifies a headless (stream-json) tool permission

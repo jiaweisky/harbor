@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -20,8 +21,11 @@ type LauncherConfig struct {
 	Name         string
 	Binary       string
 	Capabilities Capabilities
-	Parser       Parser
-	Invoke       InvokeFunc
+	// Parser is a shared parser; NewParser, when set, is preferred and yields a
+	// fresh parser per task so parser state cannot leak across concurrent tasks.
+	Parser    Parser
+	NewParser func() Parser
+	Invoke    InvokeFunc
 	// Env is the adapter's environment, applied to auth probes and task
 	// invocations.
 	Env []string
@@ -46,6 +50,7 @@ type HeadlessLauncher struct {
 	binary          string
 	caps            Capabilities
 	parser          Parser
+	newParser       func() Parser
 	invoke          InvokeFunc
 	env             []string
 	auth            Authenticator
@@ -61,6 +66,7 @@ func NewHeadlessLauncher(cfg LauncherConfig) *HeadlessLauncher {
 		binary:          cfg.Binary,
 		caps:            cfg.Capabilities,
 		parser:          cfg.Parser,
+		newParser:       cfg.NewParser,
 		invoke:          cfg.Invoke,
 		env:             cfg.Env,
 		auth:            cfg.Auth,
@@ -102,7 +108,11 @@ func (l *HeadlessLauncher) Start(ctx context.Context, req *Request) (Session, er
 	if err != nil {
 		return nil, err
 	}
-	events, err := l.runner.Start(ctx, TaskIDFrom(ctx), inv, l.parser)
+	p := l.parser
+	if l.newParser != nil {
+		p = l.newParser()
+	}
+	events, err := l.runner.Start(ctx, TaskIDFrom(ctx), inv, p)
 	if err != nil {
 		return nil, err
 	}
@@ -167,14 +177,30 @@ func (lineParser) Parse(rec []byte, out func(Event)) error {
 
 func (lineParser) Flush(func(Event)) error { return nil }
 
-// EncodeStreamJSONUserMessage encodes a text turn as a stream-json user message.
-func EncodeStreamJSONUserMessage(text string) string {
+// EncodeStreamJSONUserMessage encodes a text-only stream-json user message.
+func EncodeStreamJSONUserMessage(text string) string { return EncodeStreamJSONInput(text, nil) }
+
+// EncodeStreamJSONInput encodes a stream-json user message with optional native
+// image content blocks (base64-encoded). It is used for the initial turn and,
+// with no images, for a lossy resume's injected text.
+func EncodeStreamJSONInput(text string, images []Image) string {
+	content := make([]map[string]any, 0, len(images)+1)
+	if text != "" {
+		content = append(content, map[string]any{"type": "text", "text": text})
+	}
+	for _, img := range images {
+		content = append(content, map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": img.MediaType,
+				"data":       base64.StdEncoding.EncodeToString(img.Data),
+			},
+		})
+	}
 	msg := map[string]any{
-		"type": "user",
-		"message": map[string]any{
-			"role":    "user",
-			"content": []map[string]any{{"type": "text", "text": text}},
-		},
+		"type":    "user",
+		"message": map[string]any{"role": "user", "content": content},
 	}
 	b, _ := json.Marshal(msg)
 	return string(b) + "\n"

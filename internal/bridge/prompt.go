@@ -18,16 +18,18 @@ import (
 // never spawns a process.
 var errUnsupportedContent = errors.New("unsupported content type")
 
-// promptFromParts assembles the normalized prompt from a message's parts. Text
-// parts are concatenated, structured data parts are serialized as JSON, and file
-// parts are materialized into dir (or referenced by URL) with a line naming the
-// target so the agent can open it. Parts the agent cannot accept are rejected.
-func (e *CLIExecutor) promptFromParts(m *a2a.Message, dir string) (string, error) {
+// promptFromParts assembles the normalized prompt and native image inputs from a
+// message's parts. Text parts are concatenated, structured data parts are
+// serialized as JSON, raw image parts the CLI can accept become native image
+// blocks, and other file parts are materialized into dir (or referenced by URL)
+// with a line naming the target. Parts the agent cannot accept are rejected.
+func (e *CLIExecutor) promptFromParts(m *a2a.Message, dir string) (string, []agent.Image, error) {
 	if m == nil {
-		return "", errNoText
+		return "", nil, errNoText
 	}
 	caps := e.launcher.Capabilities()
 	var b strings.Builder
+	var images []agent.Image
 	files := 0
 	for _, p := range m.Parts {
 		if p == nil {
@@ -39,15 +41,36 @@ func (e *CLIExecutor) promptFromParts(m *a2a.Message, dir string) (string, error
 		case p.Data() != nil:
 			appendDataBlock(&b, p.Data())
 		case p.Raw() != nil || p.URL() != "":
+			img, err := imageInput(p, caps)
+			if err != nil {
+				return "", nil, err
+			}
+			if img != nil {
+				images = append(images, *img)
+				continue
+			}
 			files++
 			ref, err := materializeFile(p, dir, files, caps)
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
 			appendBlock(&b, ref)
 		}
 	}
-	return strings.TrimSpace(b.String()), nil
+	return strings.TrimSpace(b.String()), images, nil
+}
+
+// imageInput returns a native image input for a raw image part the CLI accepts,
+// nil for non-images and URL image parts (handled as file references), or an
+// error when an image's MIME type is unsupported.
+func imageInput(p *a2a.Part, caps agent.Capabilities) (*agent.Image, error) {
+	if p.Raw() == nil || !strings.HasPrefix(strings.ToLower(p.MediaType), "image/") {
+		return nil, nil
+	}
+	if !supportsMIME(caps.InputImage, p.MediaType) {
+		return nil, fmt.Errorf("%w: image %s", errUnsupportedContent, p.MediaType)
+	}
+	return &agent.Image{MediaType: p.MediaType, Data: p.Raw()}, nil
 }
 
 // appendBlock appends a block to the prompt, separated from any earlier block.

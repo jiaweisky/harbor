@@ -378,6 +378,8 @@ func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
 ```
 
 > 本段为**简化示意**；完整实现以 **A.7** 为准（含 `stream_event` 嵌套与 thinking / tool_result）。
+>
+> **文本规则**：`stream_event` 增量优先——见过增量后，`assistant` 整段文本跳过（避免重复）；两者都没出现时，用 `result.result` 作**兜底**（`EventTextFinal`，由 Executor 写入）。解析器有状态，按任务各建一个实例（`NewParser`），避免并发任务互相干扰。
 
 ### 5.4 各 CLI 的启动参数与环境变量（落地值）
 
@@ -439,6 +441,7 @@ Harbor **只以非交互模式**驱动 CLI：**凭据一律经环境变量注入
 - **模型 / 系统提示**：claude / codebuddy 由 Harbor 追加 `--model` / `--append-system-prompt`；opencode / codex 走各自模板（如 `-m {{.Model}}`）。
 - **配置根隔离**：各 CLI 从 **cwd** 加载项目级配置（`opencode.json`/`.opencode`、`.codebuddy`、`.claude`、`.codex` 等），Harbor 只把 cwd 设为任务工作目录并可选重定向配置根（§10.3、§6.7）。
 - **权限模式**：`allow_dangerous` 映射到各 CLI 的危险参数（见上）；codebuddy 另需 `CODEBUDDY_IS_SANDBOX=1`。
+- **结构化输出 / 提问**：请求带 `harbor.outputSchema` 时 stream-json 追加 `--json-schema`，结果作为 `result` DataPart（§6.8）；`sdk_capabilities: true` 声明 `askUserQuestion`，使 agent 的提问走 `input-required`（§7.4）。
 
 ---
 
@@ -705,6 +708,7 @@ coding agent 的核心产出是**代码改动**，必须作为 artifact 交付�
 | `harbor.fork` | bool | 分叉会话而非续写 |
 | `harbor.maxTurns` | int | 最大轮次 |
 | `harbor.continue` | bool | 无 sessionId 时续用最近会话（`--continue`） |
+| `harbor.outputSchema` | object | JSON Schema：要求 CLI 产出结构化结果，作为 `result` DataPart artifact 返回（stream-json：`--json-schema`，见 §7.6） |
 | `harbor.interactionId` | string | 回答 `input-required` 时回带的交互 id（§7.4） |
 
 **错误码**（失败时置于 `TaskStatus.Message.Metadata["harbor.errorCode"]`，值域固定）：
@@ -830,13 +834,19 @@ type Capabilities struct {
 | 请求 Part | 通用处理 | 各 CLI 落地（示例） |
 |---|---|---|
 | `TextPart` | 拼 prompt | 全部 |
-| `FilePart`(raw/URL) | 落到临时/工作目录 | claude：`--add-dir` + 提示引用路径 / `--file`；opencode：`@path`；codebuddy：`--image-to-image-model` / 附件参数 |
+| `FilePart`(raw/URL) | 图片且 CLI 声明 `InputImage` → native image block；其余 → 落到临时/工作目录并提示路径 | codebuddy：图片经 `--input-format stream-json` 的 image block（已落地）；claude 的 stream-json 不支持图片；其余 `--add-dir`/附件参数；opencode：`@path` |
 | `DataPart` | 结构化入参 | 经 `--input-format stream-json` 直传（claude/codebuddy）；否则序列化进 prompt。**结构化输出**另用 `--json-schema`/`--output-schema`（见 §7.6）。 |
 | 输出文件/图片 | 监听工作目录变更 | 无标准接口：以 git diff / 新增文件生成 `FilePart` artifact；codebuddy 文生图结果按图片 artifact 输出 |
 
 要点：**能力校验前置**——请求中的媒体类型/交互若不在生效能力内，立即以 `ErrUnsupportedContentType` / 拒绝态返回，**不要**启动 CLI 后再失败。
 
-**已落地**：Executor 按 part 类型拼装 prompt——多个 `TextPart` 拼接；`DataPart` 序列化为 JSON 进入 prompt；`FilePart(raw)` 落到 `<workDir>/.harbor/uploads/` 并在 prompt 中给出路径，`FilePart(URL)` 直接引用 URL。**能力校验前置**：图片 MIME 不在 `InputImage` 内、或文件而无 `InputFile` 时，返回 `unsupported_content` 且不启动 CLI；`InputModes()` 在 `InputFile` 时投影 `application/octet-stream`。未接入：CLI 专用附件参数（`--file`/`@path`/`--add-dir`）、`DataPart` 经 `--input-format stream-json` 直传、结构化输出（`--json-schema`/`--output-schema`）。
+**已落地**：Executor 按 part 类型拼装 prompt——多个 `TextPart` 拼接；`DataPart` 序列化为 JSON 进入 prompt；`FilePart(raw)` 落到 `<workDir>/.harbor/uploads/` 并在 prompt 中给出路径，`FilePart(URL)` 直接引用 URL。**能力校验前置**：图片 MIME 不在 `InputImage` 内、或文件而无 `InputFile` 时，返回 `unsupported_content` 且不启动 CLI；`InputModes()` 在 `InputFile` 时投影 `application/octet-stream`。
+
+**图片输入（已落地，codebuddy 的 stream-json）**：profile 的 `InputImage`（png/jpeg/gif/webp）声明后，`FilePart(raw)` 的图片**不再落盘**，而是作为 native **image content block**（base64）随首条 user message 经 stdin 发送，模型直接看到像素；URL 图片仍按引用处理。实测 codebuddy：发送纯红 PNG → 回答 `Red`。claude 的 stream-json 输入对图片返回 `[Unsupported Image]`，故**不**为其声明 `InputImage`（图片回落为落盘 + 路径引用）。
+
+**结构化输出（已落地，stream-json）**：请求元数据 `harbor.outputSchema` 提供 JSON Schema 时，Harbor 追加 `--json-schema`，CLI 的 `structured_output` 解析为 `EventStructuredOutput` 并作为 `result` DataPart artifact 返回（claude/codebuddy 实测通过）。
+
+未接入：CLI 专用附件参数（opencode `@path`/`-f`、codex `-i/--image`、`--add-dir`）、`DataPart` 经 `--input-format stream-json` 直传、codex `--output-schema`（exec）。
 
 ### 7.6 功能支持矩阵（依据本机 `-h` 实测）
 
@@ -845,10 +855,10 @@ type Capabilities struct {
 | 功能 \ Agent | claude | codebuddy | opencode | codex | generic |
 |---|---|---|---|---|---|
 | 文本输入/输出 | ✅ | ✅ | ✅ | ✅（`exec`） | ✅ |
-| 图片输入 | ✅（内置读取） | ✅（`--image-to-image-model`） | ✗ | ✅（`-i/--image`） | 配置 |
+| 图片输入 | ✅（交互内置读取；stream-json 不支持） | ✅（已落地，stream-json native image block） | ✗ | ✅（`-i/--image`，未接入） | 配置 |
 | 图片输出 | ✗ | ✅（`--text-to-image-model`） | ✗ | ✗ | 配置 |
 | 文件/补丁输出 | ✅（内置） | ✅（内置） | ✅（内置） | ✅（内置 + `apply`） | 配置 |
-| 结构化输出（`--json-schema`） | ✅ | ✅ | ✗ | ✅（`--output-schema`） | 配置 |
+| 结构化输出（`--json-schema`） | ✅（已落地，`harbor.outputSchema`→DataPart） | ✅（同左） | ✗ | ✅（`--output-schema`，未接入） | 配置 |
 | 结构化输入（`--input-format stream-json`） | ✅ | ✅ | ✗ | ✗（prompt 走参数/stdin） | 配置 |
 | 流式粒度 | token（`stream-json` + `--include-partial-messages`） | token（同上） | turn（`run`）；可通过 `serve` 走 SSE | JSONL 事件流（`exec --json`）；`app-server` 可流式 | 配置 |
 | 权限交互 | ✅（`--permission-mode` / `--allowedTools` / `--permission-prompts`） | ✅（同左 + `--subagent-permission-mode`） | ✅（`--auto`；权限系统） | ✅（`-a/--ask-for-approval`、`--approve-for-me`） | 配置 |
@@ -1142,7 +1152,7 @@ limits:
 - **追踪**：OpenTelemetry，A2A 请求 → CLI 子进程 span。
 - **健康检查**：`/healthz`（服务）、`/readyz`（各 CLI `Probe` + **认证状态**，见 §10.5）。
 
-**已落地**：`/metrics` 以 Prometheus 文本格式暴露每 agent 的 `harbor_tasks_submitted_total`、`harbor_tasks_total{outcome}`、`harbor_tasks_active`、`harbor_breaker_state`；`/readyz` 返回 JSON（`{ready, agents{id:{breaker,auth,ready}}}`），agent 就绪 = 熔断关闭 **且** CLI 已认证（§10.5），全部不可用则 503；任务提交/终态经 `log/slog` 审计（`agent`/`task`/`user`/`outcome`）。未实现：任务时长直方图、token/费用指标、OpenTelemetry 追踪。
+**已落地**：`/metrics` 以 Prometheus 文本格式暴露每 agent 的 `harbor_tasks_submitted_total`、`harbor_tasks_total{outcome}`、`harbor_tasks_active`、`harbor_breaker_state`、**任务时长直方图 `harbor_task_duration_seconds`（提交→终态，跨 resume）、`harbor_task_tokens_total{direction}` 与 `harbor_task_cost_usd_total`（由 CLI usage 事件累计）**；`/readyz` 返回 JSON（`{ready, agents{id:{breaker,auth,ready}}}`），agent 就绪 = 熔断关闭 **且** CLI 已认证（§10.5），全部不可用则 503；任务提交/终态经 `log/slog` 审计（`agent`/`task`/`user`/`outcome`）。未实现：OpenTelemetry 追踪。
 
 ## 14. 目录结构
 

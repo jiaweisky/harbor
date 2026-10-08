@@ -61,6 +61,7 @@ type CLIExecutor struct {
 	locks        sync.Map      // taskID -> func() (workdir lock release)
 	runs         sync.Map      // taskID -> *taskRun (process lifetime, decoupled from the request)
 	interactions sync.Map      // taskID -> *agent.Interaction awaiting an answer
+	taskStart    sync.Map      // taskID -> time.Time (submission, for duration)
 	metrics      *agentMetrics
 }
 
@@ -102,16 +103,26 @@ func (e *CLIExecutor) BreakerState() string { return e.breaker.State() }
 
 // Snapshot returns a point-in-time copy of the agent's counters and health.
 func (e *CLIExecutor) Snapshot() MetricsSnapshot {
-	return MetricsSnapshot{
-		Name:         e.Name(),
-		Submitted:    e.metrics.submitted.Load(),
-		Active:       e.metrics.active.Load(),
-		Completed:    e.metrics.completed.Load(),
-		Failed:       e.metrics.failed.Load(),
-		Canceled:     e.metrics.canceled.Load(),
-		Rejected:     e.metrics.rejected.Load(),
-		BreakerState: e.breaker.State(),
+	snap := MetricsSnapshot{
+		Name:               e.Name(),
+		Submitted:          e.metrics.submitted.Load(),
+		Active:             e.metrics.active.Load(),
+		Completed:          e.metrics.completed.Load(),
+		Failed:             e.metrics.failed.Load(),
+		Canceled:           e.metrics.canceled.Load(),
+		Rejected:           e.metrics.rejected.Load(),
+		BreakerState:       e.breaker.State(),
+		DurationSumSeconds: float64(e.metrics.durSumMS.Load()) / 1000,
+		DurationCount:      e.metrics.durCount.Load(),
+		TokensIn:           e.metrics.tokensIn.Load(),
+		TokensOut:          e.metrics.tokensOut.Load(),
+		CostUSD:            float64(e.metrics.costMicro.Load()) / 1e6,
 	}
+	snap.DurationBuckets = make([]int64, len(durationBucketBounds))
+	for i := range durationBucketBounds {
+		snap.DurationBuckets[i] = e.metrics.durBuckets[i].Load()
+	}
+	return snap
 }
 
 // Execute implements a2asrv.AgentExecutor. A task paused on input-required is
@@ -137,8 +148,9 @@ func (e *CLIExecutor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) i
 
 // instrument wraps yield to record per-task metrics and audit log entries as
 // events flow to the client. It records a submission and a terminal outcome at
-// most once per invocation, so a resumed task counts its outcome when it truly
-// finishes rather than when it pauses.
+// most once per invocation, and observes the task duration (from submission,
+// across a resume) on the terminal. A resumed task counts its outcome when it
+// truly finishes rather than when it pauses.
 func (e *CLIExecutor) instrument(
 	taskID string, user *a2asrv.User, yield func(a2a.Event, error) bool,
 ) func(a2a.Event, error) bool {
@@ -147,12 +159,14 @@ func (e *CLIExecutor) instrument(
 		username = user.Name
 	}
 	name := e.Name()
+	start := time.Now()
 	submitted, finished := false, false
 	return func(ev a2a.Event, err error) bool {
 		if !submitted {
 			if tk, ok := ev.(*a2a.Task); ok && tk.Status.State == a2a.TaskStateSubmitted {
 				submitted = true
 				e.metrics.submitted.Add(1)
+				e.taskStart.Store(taskID, start)
 				slog.Info("task submitted", "agent", name, "task", taskID, "user", username)
 			}
 		}
@@ -160,6 +174,10 @@ func (e *CLIExecutor) instrument(
 			if outcome, ok := terminalOutcome(ev); ok {
 				finished = true
 				e.metrics.record(outcome)
+				if ts, ok := e.taskStart.LoadAndDelete(taskID); ok {
+					start = ts.(time.Time) // measure from submission, across a resume
+				}
+				e.metrics.observeDuration(time.Since(start))
 				slog.Info("task finished", "agent", name, "task", taskID, "outcome", outcome, "user", username)
 			}
 		}
@@ -368,8 +386,15 @@ func (e *CLIExecutor) handleEvent(
 	case agent.EventSession:
 		e.sessions.Bind(contextKey(ec), ev.SessionID)
 		return true
-	case agent.EventTextDelta:
+	case agent.EventTextDelta, agent.EventTextFinal:
+		// TextFinal is the result-record fallback, emitted only when no textual
+		// output was seen, so it never duplicates a delta.
 		return sink.Write(ev.Text)
+	case agent.EventStructuredOutput:
+		if !sink.Flush() {
+			return false
+		}
+		return emitStructured(ec, emit, ev.Data)
 	case agent.EventPermissionRequest:
 		if !sink.Flush() {
 			return false
@@ -404,9 +429,24 @@ func (e *CLIExecutor) handleEvent(
 		if !sink.Flush() {
 			return false
 		}
+		if ev.Kind == agent.EventUsage {
+			e.metrics.addUsage(ev.Usage)
+		}
 		return emitTrace(ec, emit, ev)
 	}
 	return true
+}
+
+// emitStructured delivers a schema-validated result as a JSON DataPart artifact.
+func emitStructured(ec *a2asrv.ExecutorContext, emit func(a2a.Event) bool, data map[string]any) bool {
+	if data == nil {
+		return true
+	}
+	evt := a2a.NewArtifactEvent(ec, a2a.NewDataPart(data))
+	if evt.Artifact != nil {
+		evt.Artifact.Name = "result"
+	}
+	return emit(evt)
 }
 
 // emitTrace surfaces reasoning, tool activity, and usage as working status
@@ -564,24 +604,26 @@ func (e *CLIExecutor) toRequest(ec *a2asrv.ExecutorContext) (*agent.Request, err
 	if err != nil {
 		return nil, err
 	}
-	prompt, err := e.promptFromParts(ec.Message, dir)
+	prompt, images, err := e.promptFromParts(ec.Message, dir)
 	if err != nil {
 		return nil, err
 	}
-	if prompt == "" {
+	if prompt == "" && len(images) == 0 {
 		return nil, errNoText
 	}
 	sid, _ := e.sessions.Get(contextKey(ec))
 	return &agent.Request{
-		Prompt:      prompt,
-		SystemExtra: metaString(meta, "harbor.systemPrompt"),
-		Model:       metaString(meta, "harbor.model"),
-		Agent:       metaString(meta, "harbor.agent"),
-		WorkDir:     dir,
-		SessionID:   sid,
-		Continue:    sid == "" && metaBool(meta, "harbor.continue"),
-		MaxTurns:    metaInt(meta, "harbor.maxTurns"),
-		Meta:        meta,
+		Prompt:       prompt,
+		SystemExtra:  metaString(meta, "harbor.systemPrompt"),
+		Model:        metaString(meta, "harbor.model"),
+		Agent:        metaString(meta, "harbor.agent"),
+		WorkDir:      dir,
+		SessionID:    sid,
+		Continue:     sid == "" && metaBool(meta, "harbor.continue"),
+		MaxTurns:     metaInt(meta, "harbor.maxTurns"),
+		OutputSchema: metaMap(meta, "harbor.outputSchema"),
+		Images:       images,
+		Meta:         meta,
 	}, nil
 }
 
@@ -799,4 +841,10 @@ func metaInt(m map[string]any, key string) int {
 		return int(v)
 	}
 	return 0
+}
+
+// metaMap returns a nested JSON object under key, or nil when absent.
+func metaMap(m map[string]any, key string) map[string]any {
+	v, _ := m[key].(map[string]any)
+	return v
 }
