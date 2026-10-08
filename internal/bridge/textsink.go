@@ -21,7 +21,8 @@ const (
 type textSink struct {
 	ec         *a2asrv.ExecutorContext
 	artifactID a2a.ArtifactID
-	buf        strings.Builder
+	buf        strings.Builder // unflushed text
+	all        strings.Builder // every text written, for post-run extraction
 	emit       func(a2a.Event) bool
 }
 
@@ -33,11 +34,15 @@ func newTextSink(ec *a2asrv.ExecutorContext, emit func(a2a.Event) bool) *textSin
 // false when the consumer has gone away.
 func (s *textSink) Write(text string) bool {
 	s.buf.WriteString(text)
+	s.all.WriteString(text)
 	if s.buf.Len() < flushBytes {
 		return true
 	}
 	return s.Flush()
 }
+
+// Text returns all text written so far, flushed or not.
+func (s *textSink) Text() string { return s.all.String() }
 
 // Flush emits any buffered text. It returns false when the consumer is gone.
 func (s *textSink) Flush() bool {

@@ -13,7 +13,7 @@ func (nopParserInternal) Flush(func(Event)) error         { return nil }
 // TestRunnerReapsProcessEntry verifies the process table entry is removed once
 // the process completes normally, so it does not grow without bound.
 func TestRunnerReapsProcessEntry(t *testing.T) {
-	r := NewRunner(1, true, "")
+	r := NewRunner(1, true, "", nil)
 	ch, err := r.Start(context.Background(), "t1",
 		&Invocation{Bin: "sh", Args: []string{"-c", "echo hi"}}, nopParserInternal{})
 	if err != nil {

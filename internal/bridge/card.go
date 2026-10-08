@@ -6,6 +6,14 @@ import (
 	"github.com/jiaweisky/harbor/internal/agent"
 )
 
+// RESTMount is the HTTP+JSON (A2A REST) binding path segment under an agent's
+// base path; RESTPath is that segment with a trailing slash, i.e. the REST base
+// URL suffix of an agent's endpoint.
+const (
+	RESTMount = "rest"
+	RESTPath  = RESTMount + "/"
+)
+
 // InteractionExtensionURI is declared when a CLI can pause a task for input:
 // the input-required message then carries a DataPart describing a permission,
 // question, or plan-approval request.
@@ -37,11 +45,18 @@ func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool)
 		Name:        "Harbor/" + displayName,
 		Description: "Remote A2A wrapper for the " + displayName + " coding agent CLI",
 		Version:     version,
-		SupportedInterfaces: []*a2a.AgentInterface{{
-			URL:             endpoint,
-			ProtocolBinding: a2a.TransportProtocolJSONRPC,
-			ProtocolVersion: a2a.Version,
-		}},
+		SupportedInterfaces: []*a2a.AgentInterface{
+			{
+				URL:             endpoint,
+				ProtocolBinding: a2a.TransportProtocolJSONRPC,
+				ProtocolVersion: a2a.Version,
+			},
+			{
+				URL:             endpoint + RESTPath,
+				ProtocolBinding: a2a.TransportProtocolHTTPJSON,
+				ProtocolVersion: a2a.Version,
+			},
+		},
 		Capabilities: a2a.AgentCapabilities{
 			Streaming:         caps.Streaming != agent.StreamNone,
 			PushNotifications: true,

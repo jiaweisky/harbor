@@ -20,14 +20,38 @@ func TestEncodeQuestionResponse(t *testing.T) {
 			} `json:"response"`
 		} `json:"response"`
 	}
-	if err := json.Unmarshal([]byte(agent.EncodeQuestionResponse("perm_q1", "Favorite color?", "Blue")), &frame); err != nil {
+	line := agent.EncodeQuestionResponse("perm_q1", map[string]string{
+		"Favorite color?": "Blue", "Favorite animal?": "Cat",
+	})
+	if err := json.Unmarshal([]byte(line), &frame); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if frame.Type != "control_response" || frame.Response.RequestID != "perm_q1" || !frame.Response.Response.Allowed {
 		t.Fatalf("frame = %+v", frame)
 	}
-	if got := frame.Response.Response.UpdatedInput.Answers["Favorite color?"]; got != "Blue" {
-		t.Fatalf("answers = %v, want the question keyed to Blue", frame.Response.Response.UpdatedInput.Answers)
+	answers := frame.Response.Response.UpdatedInput.Answers
+	if answers["Favorite color?"] != "Blue" || answers["Favorite animal?"] != "Cat" {
+		t.Fatalf("answers = %v, want both questions keyed", answers)
+	}
+}
+
+func TestEncodeElicitationResponse(t *testing.T) {
+	var frame struct {
+		Response struct {
+			RequestID string         `json:"request_id"`
+			Response  map[string]any `json:"response"`
+		} `json:"response"`
+	}
+	line := agent.EncodeElicitationResponse("el_1", "accept", map[string]any{"color": "blue"})
+	if err := json.Unmarshal([]byte(line), &frame); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if frame.Response.RequestID != "el_1" || frame.Response.Response["action"] != "accept" {
+		t.Fatalf("frame = %+v", frame)
+	}
+	content, _ := frame.Response.Response["content"].(map[string]any)
+	if content["color"] != "blue" {
+		t.Fatalf("content = %v, want color blue", content)
 	}
 }
 

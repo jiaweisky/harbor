@@ -25,14 +25,30 @@ type Interaction struct {
 	Target  string          `json:"target,omitempty"`
 	Risk    string          `json:"risk,omitempty"`
 	Options []string        `json:"options,omitempty"`
-	Resume  bool            `json:"resume"`
+	// Questions lists every question of a multi-question interaction (kind
+	// "question", action "question"), so a client can answer each one. A single
+	// question is also reflected in Target/Options for text-only clients.
+	Questions []Question `json:"questions,omitempty"`
+	// Schema is a form's requested JSON Schema (interaction kind "question",
+	// action "form"), so a client can render fields and answer with content.
+	Schema map[string]any `json:"schema,omitempty"`
+	Resume bool           `json:"resume"`
+}
+
+// Question is one item of a multi-question interaction: the question text and
+// its allowed option labels (empty for free text).
+type Question struct {
+	Question string   `json:"question"`
+	Header   string   `json:"header,omitempty"`
+	Options  []string `json:"options,omitempty"`
 }
 
 // Answer is a client's structured reply to an Interaction. It travels in a
 // DataPart of the client's message; the ID must match the pending interaction.
 // A plain-text reply remains valid for clients that do not use the extension.
 type Answer struct {
-	Kind   InteractionKind `json:"kind,omitempty"`
-	ID     string          `json:"id,omitempty"`
-	Answer string          `json:"answer"`
+	Kind    InteractionKind `json:"kind,omitempty"`
+	ID      string          `json:"id,omitempty"`
+	Answer  string          `json:"answer"`
+	Content map[string]any  `json:"content,omitempty"` // form answers, keyed by field
 }

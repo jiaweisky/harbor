@@ -14,21 +14,42 @@ import (
 
 // Config is the root configuration.
 type Config struct {
-	Version int           `yaml:"version"`
-	Server  ServerConfig  `yaml:"server"`
-	Sandbox SandboxConfig `yaml:"sandbox"`
+	Version   int             `yaml:"version"`
+	Server    ServerConfig    `yaml:"server"`
+	Sandbox   SandboxConfig   `yaml:"sandbox"`
+	Telemetry TelemetryConfig `yaml:"telemetry"`
+	// Plugins are Go plugin (.so) paths loaded at startup; each must export a
+	// Register() func that registers CLI adapters (optional, experimental).
+	Plugins []string      `yaml:"plugins"`
 	Agents  []AgentConfig `yaml:"agents"`
+}
+
+// TelemetryConfig configures OpenTelemetry trace export.
+type TelemetryConfig struct {
+	Endpoint    string `yaml:"endpoint"`     // OTLP gRPC collector address (host:port); empty disables tracing
+	Insecure    bool   `yaml:"insecure"`     // send traces without TLS
+	ServiceName string `yaml:"service_name"` // resource service.name; default harbor
 }
 
 // ServerConfig configures the HTTP server and discovery.
 type ServerConfig struct {
 	Listen                   string     `yaml:"listen"`
 	BaseURL                  string     `yaml:"base_url"`
-	AllowInsecure            bool       `yaml:"allow_insecure"`              // permit a non-loopback bind without auth
-	PushAllowPrivateNetworks bool       `yaml:"push_allow_private_networks"` // disable the SSRF guard on push webhooks
-	TaskStoreFile            string     `yaml:"task_store_file"`             // persist tasks to this JSON file (optional)
+	AllowInsecure            bool       `yaml:"allow_insecure"`              // allow a non-loopback unauthenticated bind
+	PushAllowPrivateNetworks bool       `yaml:"push_allow_private_networks"` // disable the push webhook SSRF guard
+	TaskStoreFile            string     `yaml:"task_store_file"`             // persist tasks (durable interaction)
+	SessionStoreDir          string     `yaml:"session_store_dir"`           // persist CLI session ids per agent
 	Auth                     AuthConfig `yaml:"auth"`
 	CORSAllowedOrigins       []string   `yaml:"cors_allowed_origins"`
+
+	RateLimit *RateLimitConfig `yaml:"rate_limit"`
+}
+
+// RateLimitConfig configures a per-(user, agent) token-bucket rate limit on the
+// invocation endpoints. A zero PerMinute disables it.
+type RateLimitConfig struct {
+	PerMinute int `yaml:"per_minute"` // sustained requests per minute per key
+	Burst     int `yaml:"burst"`      // bucket capacity; default PerMinute
 }
 
 // AuthConfig configures bearer authentication for the JSON-RPC endpoints.
@@ -39,13 +60,35 @@ type AuthConfig struct {
 
 // SandboxConfig configures workspace and env constraints.
 type SandboxConfig struct {
-	WorkdirRoot   string `yaml:"workdir_root"`
-	AllowOutside  bool   `yaml:"allow_outside"`
-	Isolation     string `yaml:"isolation"`      // shared | worktree | copy
-	IsolationRoot string `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
-	InheritEnv    *bool  `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
-	CLIHome       string `yaml:"cli_home"`       // optional root for the CLI's config/home
-	StateDir      string `yaml:"state_dir"`      // runtime state (orphan tracking); default under the temp dir
+	WorkdirRoot   string           `yaml:"workdir_root"`
+	AllowOutside  bool             `yaml:"allow_outside"`
+	Isolation     string           `yaml:"isolation"`      // shared | worktree | copy
+	IsolationRoot string           `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
+	InheritEnv    *bool            `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
+	CLIHome       string           `yaml:"cli_home"`       // optional root for the CLI's config/home
+	StateDir      string           `yaml:"state_dir"`      // runtime state (orphan tracking); default under the temp dir
+	Container     *ContainerConfig `yaml:"container"`      // optional strong isolation: run each CLI in a container
+	// RequireContainerForDangerous refuses to start when an agent has
+	// allow_dangerous while no container sandbox is configured (optional hardening).
+	RequireContainerForDangerous bool `yaml:"require_container_for_dangerous"`
+	// FileArtifacts emits a per-file FilePart artifact for each changed file, in
+	// addition to the textual diff (optional; bounded per file).
+	FileArtifacts bool `yaml:"file_artifacts"`
+	// RawStreamDir, when set, writes each task's raw CLI stdout/stderr to a file
+	// under it for replay/debugging (optional).
+	RawStreamDir string `yaml:"raw_stream_dir"`
+	// RawStreamCompress gzips the raw stream files.
+	RawStreamCompress bool `yaml:"raw_stream_compress"`
+}
+
+// ContainerConfig runs each CLI inside a container for filesystem and network
+// isolation. The task working directory (and the CLI home, when set) are
+// bind-mounted at their host paths, so paths inside the container match the host
+// and the CLI reaches exactly the task's files.
+type ContainerConfig struct {
+	Image   string `yaml:"image"`
+	Network string `yaml:"network"` // none | bridge; default none
+	Runtime string `yaml:"runtime"` // container runtime binary; default docker
 }
 
 // InheritEnvEnabled reports whether child processes inherit the parent
@@ -81,8 +124,13 @@ const (
 const (
 	// ServerProtocolHTTP proxies the CLI's REST/HTTP API (default).
 	ServerProtocolHTTP = "http"
-	// ServerProtocolACP speaks ACP over the CLI's HTTP/SSE endpoint.
+	// ServerProtocolACP speaks ACP over the CLI's HTTP/SSE endpoint (codebuddy
+	// --serve).
 	ServerProtocolACP = "acp"
+	// ServerProtocolACPStreamableHTTP speaks ACP over a dedicated streamable-http
+	// endpoint (codebuddy --acp --acp-transport streamable-http); the client
+	// protocol is identical to ServerProtocolACP.
+	ServerProtocolACPStreamableHTTP = "acp-streamable-http"
 )
 
 // knownIntegrations lists every recognized integration value.
@@ -121,7 +169,8 @@ type AgentConfig struct {
 	Parser         string            `yaml:"parser"`          // exec framing: text | codex | regex; default text
 	Regex          *RegexConfig      `yaml:"regex"`           // parser: regex
 	ServerURL      string            `yaml:"server_url"`      // integration: server; connect instead of spawning
-	ServerProtocol string            `yaml:"server_protocol"` // integration: server; "http" (default) or "acp"
+	ServerProtocol string            `yaml:"server_protocol"` // "http" (default) | "acp" | "acp-streamable-http"
+	GRPCListen     string            `yaml:"grpc_listen"`     // optional A2A gRPC bind address
 	Workdir        string            `yaml:"workdir"`         // default working dir (under workdir_root)
 	Args           []string          `yaml:"args"`
 	Env            map[string]string `yaml:"env"`
@@ -129,10 +178,28 @@ type AgentConfig struct {
 	// SDKCaps declares stream-json SDK capabilities (currently askUserQuestion)
 	// before the first prompt, so the CLI routes AskUserQuestion through
 	// can_use_tool and Harbor can surface it as an input-required question.
-	SDKCaps bool          `yaml:"sdk_capabilities"`
-	Version string        `yaml:"version"` // optional card version override; skips probing
-	Session SessionConfig `yaml:"session"`
-	Limits  LimitsConfig  `yaml:"limits"`
+	SDKCaps bool `yaml:"sdk_capabilities"`
+	// OutputSchemaArgs are appended (after writing the request's JSON Schema to a
+	// file) when a request carries harbor.outputSchema. {{.SchemaFile}} is
+	// replaced with the schema file path; {{.Schema}} with the schema JSON. Used
+	// by CLIs whose structured-output flag is not --json-schema (e.g. codex
+	// --output-schema). The CLI's final text is then emitted as a DataPart.
+	OutputSchemaArgs []string `yaml:"output_schema_args"`
+	// FileArgs are appended once per materialized file part ({{.File}} replaced
+	// with the file path), so the CLI attaches the file natively (e.g. opencode
+	// -f) instead of only mentioning its path in the prompt.
+	FileArgs []string `yaml:"file_args"`
+	// ImageArgs are appended once per materialized image part ({{.Image}}
+	// replaced with the file path), for a CLI that takes images as arguments
+	// (e.g. codex -i) rather than native content blocks.
+	ImageArgs []string `yaml:"image_args"`
+	// InputImage lists the image MIME types this agent accepts; unset uses the
+	// CLI profile's list. They are sent as native content blocks when the
+	// integration supports structured input, otherwise via ImageArgs.
+	InputImage []string      `yaml:"input_image"`
+	Version    string        `yaml:"version"` // optional card version override; skips probing
+	Session    SessionConfig `yaml:"session"`
+	Limits     LimitsConfig  `yaml:"limits"`
 }
 
 // RegexConfig configures the regex parser.
@@ -151,9 +218,24 @@ type Profile struct {
 	MinVersion  string        // minimum supported version; below it Harbor refuses to start
 	VersionArgs []string      // version flag(s); nil disables probing
 	ACPArgs     []string      // args selecting ACP mode, when unset in the agent config
-	// InputImage lists image MIME types the CLI accepts natively in its
-	// structured (stream-json) input; nil means images are not accepted.
+	ForkFlag    string        // default session-fork flag (e.g. --fork-session)
+	// OutputSchemaArgs is the default structured-output args for this CLI,
+	// applied when the agent config leaves output_schema_args unset.
+	OutputSchemaArgs []string
+	// FileArgs is the default file-attachment args for this CLI, applied when
+	// the agent config leaves file_args unset.
+	FileArgs []string
+	// ImageArgs is the default image-attachment args for this CLI, applied when
+	// the agent config leaves image_args unset.
+	ImageArgs []string
+	// InputImage lists image MIME types the CLI accepts; nil means images are
+	// not accepted. They are sent as native content blocks when the CLI's
+	// integration supports structured input, otherwise attached via ImageArgs.
 	InputImage []string
+	// OutputImage lists image MIME types the CLI can produce (for example a
+	// text-to-image model writing files into the workdir); nil means Harbor does
+	// not advertise image output for this CLI.
+	OutputImage []string
 }
 
 // Supports reports whether the profile accepts the integration.
@@ -172,15 +254,21 @@ func (p Profile) Supports(i Integration) bool {
 // through to explicit configuration.
 var knownProfiles = []Profile{
 	{Binary: "codebuddy", Integration: IntegrationStreamJSON, MinVersion: "2.161.4", VersionArgs: []string{"--version"},
-		Supported:  []Integration{IntegrationStreamJSON, IntegrationExec, IntegrationACP, IntegrationServer},
-		InputImage: []string{"image/png", "image/jpeg", "image/gif", "image/webp"}},
+		Supported:   []Integration{IntegrationStreamJSON, IntegrationExec, IntegrationACP, IntegrationServer},
+		InputImage:  []string{"image/png", "image/jpeg", "image/gif", "image/webp"},
+		OutputImage: []string{"image/png", "image/jpeg", "image/gif", "image/webp"},
+		ForkFlag:    "--fork-session"},
 	{Binary: "claude", Integration: IntegrationStreamJSON, MinVersion: "2.1.292", VersionArgs: []string{"--version"},
-		Supported: []Integration{IntegrationStreamJSON}},
+		Supported: []Integration{IntegrationStreamJSON}, ForkFlag: "--fork-session"},
 	{Binary: "opencode", Integration: IntegrationExec, MinVersion: "1.18.35", VersionArgs: []string{"--version"},
-		Supported: []Integration{IntegrationExec, IntegrationACP, IntegrationServer}, ACPArgs: []string{"acp"}},
+		Supported: []Integration{IntegrationExec, IntegrationACP, IntegrationServer}, ACPArgs: []string{"acp"},
+		FileArgs: []string{"-f", "{{.File}}"}, ForkFlag: "--fork"},
 	{Binary: "codex", Integration: IntegrationExec, Parser: "codex",
 		MinVersion: "0.160.1", VersionArgs: []string{"--version"},
-		Supported: []Integration{IntegrationExec, IntegrationServer}},
+		Supported:        []Integration{IntegrationExec, IntegrationServer},
+		OutputSchemaArgs: []string{"--output-schema", "{{.SchemaFile}}"},
+		InputImage:       []string{"image/png", "image/jpeg", "image/gif", "image/webp"},
+		ImageArgs:        []string{"-i", "{{.Image}}"}},
 }
 
 // LookupProfile returns the profile for a binary path or name.
@@ -199,6 +287,7 @@ type SessionConfig struct {
 	IDFlag       string `yaml:"id_flag"`
 	ResumeFlag   string `yaml:"resume_flag"`
 	ContinueFlag string `yaml:"continue_flag"`
+	ForkFlag     string `yaml:"fork_flag"` // forks the session when resuming (harbor.fork)
 }
 
 // LimitsConfig bounds concurrent execution for an agent.
@@ -206,6 +295,7 @@ type LimitsConfig struct {
 	MaxConcurrent int            `yaml:"max_concurrent"`
 	Timeout       time.Duration  `yaml:"timeout"`      // total task timeout; 0 disables
 	IdleTimeout   time.Duration  `yaml:"idle_timeout"` // fail if the CLI produces no output for this long; 0 disables
+	MaxTurns      int            `yaml:"max_turns"`    // max turns (start + resumes) per task; 0 disables
 	Breaker       *BreakerConfig `yaml:"breaker"`      // optional failure circuit breaker
 }
 
@@ -251,11 +341,22 @@ func (c *Config) applyDefaults() {
 	if c.Server.Auth.Mode == "" {
 		c.Server.Auth.Mode = "none"
 	}
+	if c.Telemetry.ServiceName == "" {
+		c.Telemetry.ServiceName = "harbor"
+	}
 	if c.Sandbox.Isolation == "" {
 		c.Sandbox.Isolation = "shared"
 	}
 	if c.Sandbox.StateDir == "" {
 		c.Sandbox.StateDir = filepath.Join(os.TempDir(), "harbor")
+	}
+	if ct := c.Sandbox.Container; ct != nil {
+		if ct.Network == "" {
+			ct.Network = "none"
+		}
+		if ct.Runtime == "" {
+			ct.Runtime = "docker"
+		}
 	}
 	for i := range c.Agents {
 		a := &c.Agents[i]
@@ -269,19 +370,53 @@ func (c *Config) applyDefaults() {
 			if a.Integration == IntegrationACP && len(a.Args) == 0 {
 				a.Args = append([]string(nil), p.ACPArgs...)
 			}
+			if a.Session.ForkFlag == "" {
+				a.Session.ForkFlag = p.ForkFlag
+			}
+			if len(a.OutputSchemaArgs) == 0 {
+				a.OutputSchemaArgs = append([]string(nil), p.OutputSchemaArgs...)
+			}
+			if len(a.FileArgs) == 0 {
+				a.FileArgs = append([]string(nil), p.FileArgs...)
+			}
+			if len(a.ImageArgs) == 0 {
+				a.ImageArgs = append([]string(nil), p.ImageArgs...)
+			}
+			if len(a.InputImage) == 0 {
+				a.InputImage = append([]string(nil), p.InputImage...)
+			}
 		}
 	}
 }
 
 func (c *Config) validate() error {
-	switch c.Server.Auth.Mode {
-	case "none", "bearer":
-	default:
-		return fmt.Errorf("server.auth.mode must be one of none, bearer; got %q", c.Server.Auth.Mode)
-	}
 	if len(c.Agents) == 0 {
 		return fmt.Errorf("at least one agent must be configured")
 	}
+	if err := c.validateServer(); err != nil {
+		return err
+	}
+	if err := c.validateSandbox(); err != nil {
+		return err
+	}
+	for i := range c.Agents {
+		if err := validateAgent(i, &c.Agents[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateServer() error {
+	switch c.Server.Auth.Mode {
+	case "none", "bearer":
+		return nil
+	default:
+		return fmt.Errorf("server.auth.mode must be one of none, bearer; got %q", c.Server.Auth.Mode)
+	}
+}
+
+func (c *Config) validateSandbox() error {
 	if c.Sandbox.WorkdirRoot != "" {
 		info, err := os.Stat(c.Sandbox.WorkdirRoot)
 		if err != nil || !info.IsDir() {
@@ -297,52 +432,73 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("sandbox.isolation must be one of shared, worktree, copy; got %q", c.Sandbox.Isolation)
 	}
-	for i := range c.Agents {
-		a := &c.Agents[i]
-		if a.ID == "" {
-			return fmt.Errorf("agents[%d]: id is required", i)
+	if ct := c.Sandbox.Container; ct != nil {
+		if ct.Image == "" {
+			return fmt.Errorf("sandbox.container.image is required")
 		}
-		if a.Binary == "" {
-			return fmt.Errorf("agent %q: binary is required", a.ID)
+		switch ct.Network {
+		case "none", "bridge":
+		default:
+			return fmt.Errorf("sandbox.container.network must be one of none, bridge; got %q", ct.Network)
 		}
-		if p, ok := LookupProfile(a.Binary); ok {
-			if !p.Supports(a.Integration) {
+	}
+	if c.Sandbox.RequireContainerForDangerous && c.Sandbox.Container == nil {
+		for i := range c.Agents {
+			if c.Agents[i].AllowDangerous {
 				return fmt.Errorf(
-					"agent %q: binary %q does not support integration %q (supported: %s)",
-					a.ID, filepath.Base(a.Binary), a.Integration, integrationNames(p.Supported),
+					"agent %q: allow_dangerous requires sandbox.container when require_container_for_dangerous is set",
+					c.Agents[i].ID,
 				)
 			}
-		} else if a.Integration == "" {
+		}
+	}
+	return nil
+}
+
+func validateAgent(i int, a *AgentConfig) error {
+	if a.ID == "" {
+		return fmt.Errorf("agents[%d]: id is required", i)
+	}
+	if a.Binary == "" {
+		return fmt.Errorf("agent %q: binary is required", a.ID)
+	}
+	if p, ok := LookupProfile(a.Binary); ok {
+		if !p.Supports(a.Integration) {
 			return fmt.Errorf(
-				"agent %q: unknown binary %q; set \"integration\" explicitly (known values: %s)",
-				a.ID, a.Binary, integrationList(),
+				"agent %q: binary %q does not support integration %q (supported: %s)",
+				a.ID, filepath.Base(a.Binary), a.Integration, integrationNames(p.Supported),
 			)
 		}
-		if !a.Integration.Known() {
-			return fmt.Errorf("agent %q: unknown integration %q (known values: %s)", a.ID, a.Integration, integrationList())
-		}
-		if a.Integration == IntegrationExec && !hasPromptTemplate(a.Args) {
-			return fmt.Errorf(
-				"agent %q: integration %q passes the prompt through args but none contains {{.Prompt}}; "+
-					"add {{.Prompt}} to args, or use %q if the CLI has a structured stream",
-				a.ID, IntegrationExec, IntegrationStreamJSON,
-			)
-		}
-		if a.Integration == IntegrationACP && len(a.Args) == 0 {
-			return fmt.Errorf(
-				"agent %q: integration %q requires args selecting the CLI's ACP mode "+
-					"(for example [\"acp\"]); without them the CLI would start its interactive UI",
-				a.ID, IntegrationACP,
-			)
-		}
-		switch a.ServerProtocol {
-		case "", ServerProtocolHTTP, ServerProtocolACP:
-		default:
-			return fmt.Errorf(
-				"agent %q: server_protocol must be %q or %q; got %q",
-				a.ID, ServerProtocolHTTP, ServerProtocolACP, a.ServerProtocol,
-			)
-		}
+	} else if a.Integration == "" {
+		return fmt.Errorf(
+			"agent %q: unknown binary %q; set \"integration\" explicitly (known values: %s)",
+			a.ID, a.Binary, integrationList(),
+		)
+	}
+	if !a.Integration.Known() {
+		return fmt.Errorf("agent %q: unknown integration %q (known values: %s)", a.ID, a.Integration, integrationList())
+	}
+	if a.Integration == IntegrationExec && !hasPromptTemplate(a.Args) {
+		return fmt.Errorf(
+			"agent %q: integration %q passes the prompt through args but none contains {{.Prompt}}; "+
+				"add {{.Prompt}} to args, or use %q if the CLI has a structured stream",
+			a.ID, IntegrationExec, IntegrationStreamJSON,
+		)
+	}
+	if a.Integration == IntegrationACP && len(a.Args) == 0 {
+		return fmt.Errorf(
+			"agent %q: integration %q requires args selecting the CLI's ACP mode "+
+				"(for example [\"acp\"]); without them the CLI would start its interactive UI",
+			a.ID, IntegrationACP,
+		)
+	}
+	switch a.ServerProtocol {
+	case "", ServerProtocolHTTP, ServerProtocolACP, ServerProtocolACPStreamableHTTP:
+	default:
+		return fmt.Errorf(
+			"agent %q: server_protocol must be one of %q, %q, %q; got %q",
+			a.ID, ServerProtocolHTTP, ServerProtocolACP, ServerProtocolACPStreamableHTTP, a.ServerProtocol,
+		)
 	}
 	return nil
 }

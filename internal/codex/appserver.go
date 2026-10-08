@@ -23,6 +23,7 @@ type Config struct {
 	Env             []string
 	InheritEnv      bool
 	CLIHome         string
+	Container       *agent.ContainerSpec
 	Auth            agent.Authenticator
 	VersionArgs     []string
 	VersionOverride string
@@ -44,7 +45,11 @@ func NewServerLauncher(lifecycle context.Context, cfg Config) *Launcher {
 	if lifecycle == nil {
 		lifecycle = context.Background()
 	}
-	return &Launcher{cfg: cfg, runner: agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome), lifecycle: lifecycle}
+	return &Launcher{
+		cfg:       cfg,
+		runner:    agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container),
+		lifecycle: lifecycle,
+	}
 }
 
 func (l *Launcher) Name() string { return l.cfg.Name }

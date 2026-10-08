@@ -6,6 +6,21 @@ server:
   auth:
     mode: none
     tokens: []
+  # Optional per-(caller, agent) token-bucket rate limit (0 disables).
+  # rate_limit: { per_minute: 120, burst: 20 }
+  # Persist tasks (durable interaction) and CLI session ids across restarts.
+  # task_store_file: "/var/lib/harbor/tasks.json"
+  # session_store_dir: "/var/lib/harbor/sessions"
+
+# Optional OpenTelemetry export (OTLP/gRPC): traces and metrics. Empty endpoint
+# disables it.
+# telemetry:
+#   endpoint: "localhost:4317"
+#   insecure: true
+#   service_name: "harbor"
+
+# Optional runtime adapter plugins (Go .so, each exporting Register()).
+# plugins: ["/opt/harbor/plugins/my-cli.so"]
 
 sandbox:
   # workdir_root is required to confine tasks to a directory tree; the directory
@@ -13,6 +28,14 @@ sandbox:
   # workdir_root: "/srv/workspaces"
   allow_outside: false
   inherit_env: true
+  # Optional strong isolation: run each CLI inside a container. The task working
+  # directory (and cli_home, when set) are bind-mounted at their host paths.
+  # The image must provide the CLI; network defaults to none.
+  # container: { image: "harbor/claude:latest", network: none, runtime: docker }
+  # require_container_for_dangerous: true   # refuse allow_dangerous without a container
+  # file_artifacts: true                    # emit a FilePart per changed file
+  # raw_stream_dir: "/var/log/harbor/raw"   # write raw CLI stdout/stderr per task
+  # raw_stream_compress: true
 
 agents:
   - id: codebuddy
@@ -36,7 +59,11 @@ agents:
     binary: codex
     integration: exec
     args: ["exec", "--json", "--skip-git-repo-check", "{{.Prompt}}"]
+    # Images are passed as arguments; input_image declares the accepted types.
+    # image_args/top-level input_image default from the codex profile.
     limits: { max_concurrent: 2 }
+    # Optional A2A gRPC binding for this agent (host:port).
+    # grpc_listen: "127.0.0.1:50051"
 
   # Zero-code custom CLI: extract text from output with a regex.
   - id: my-coder

@@ -88,6 +88,23 @@ func TestRealCodebuddyACP(t *testing.T) {
 	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")
 }
 
+// TestRealCodebuddyACPResume verifies stdio ACP continuity: a second task on the
+// same context loads the first task's session (session/load).
+func TestRealCodebuddyACPResume(t *testing.T) {
+	requireCodebuddy(t)
+	h := codebuddyHandler(t, config.AgentConfig{
+		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationACP,
+		Args: []string{"--acp"},
+	})
+	m1 := message("reply with the single word: alpha")
+	m1.ContextID = "real-cb-acp-resume"
+	sendAndExpect(t, h, m1, "alpha")
+
+	m2 := message("reply with the single word: beta")
+	m2.ContextID = "real-cb-acp-resume"
+	sendAndExpect(t, h, m2, "beta")
+}
+
 func TestRealCodebuddyExec(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
@@ -110,6 +127,18 @@ func TestRealCodebuddyServerACP(t *testing.T) {
 	h := codebuddyHandler(t, config.AgentConfig{
 		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
 		ServerProtocol: config.ServerProtocolACP,
+	})
+	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")
+}
+
+// TestRealCodebuddyACPStreamableHTTP drives codebuddy's dedicated streamable-http
+// ACP endpoint (`--acp --acp-transport streamable-http`); the client protocol is
+// identical to the --serve ACP transport.
+func TestRealCodebuddyACPStreamableHTTP(t *testing.T) {
+	requireCodebuddy(t)
+	h := codebuddyHandler(t, config.AgentConfig{
+		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
+		ServerProtocol: config.ServerProtocolACPStreamableHTTP,
 	})
 	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")
 }
@@ -278,6 +307,81 @@ func TestRealCodebuddyQuestion(t *testing.T) {
 	}
 	if got := artifactText(done); !strings.Contains(strings.ToLower(got), "blue") {
 		t.Errorf("artifact = %q, want it to mention the chosen answer (blue)", got)
+	}
+}
+
+// TestRealCodebuddyElicitation verifies a form (elicitation_create) surfaces as
+// an input-required question and the submitted content is accepted.
+func TestRealCodebuddyElicitation(t *testing.T) {
+	requireCodebuddy(t)
+	h := codebuddyHandler(t, config.AgentConfig{
+		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		SDKCaps: true,
+		Args: []string{
+			"-p", "--input-format", "stream-json",
+			"--output-format", "stream-json", "--include-partial-messages",
+		},
+		Session: config.SessionConfig{IDFlag: "--session-id", ResumeFlag: "--resume", ContinueFlag: "-c"},
+		Env:     map[string]string{"CODEBUDDY_ENABLE_ASK_USER_FOR_STRUCTURED_INPUT": "1"},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+
+	prompt := "Use the AskUserForStructuredInput tool to ask my name and my favorite color " +
+		"(red or blue), then reply with my answers."
+	task := sendPaused(t, h, ctx, prompt)
+	itx := interactionFromMessage(t, task.Status.Message)
+	if itx.Kind != agent.InteractionQuestion || itx.Action != "form" || itx.Schema == nil {
+		t.Fatalf("interaction = %+v, want a form question with a schema", itx)
+	}
+
+	// The form's field names are model-generated; answer every field generically.
+	content := map[string]any{}
+	props, _ := itx.Schema["properties"].(map[string]any)
+	for field, raw := range props {
+		p, _ := raw.(map[string]any)
+		if enum, ok := p["enum"].([]any); ok && len(enum) > 0 {
+			content[field] = enum[0]
+		} else {
+			content[field] = "Ada"
+		}
+	}
+	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{
+		"id": itx.ID, "content": content,
+	}))
+	done := resumeTask(t, h, ctx, task, answer)
+	if done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed (text=%q)", done.Status.State, artifactText(done))
+	}
+}
+
+// TestRealCodebuddyPlanApproval verifies ExitPlanMode surfaces as a plan
+// approval in plan mode.
+func TestRealCodebuddyPlanApproval(t *testing.T) {
+	requireCodebuddy(t)
+	h := codebuddyHandler(t, config.AgentConfig{
+		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		Args: []string{
+			"-p", "--input-format", "stream-json",
+			"--output-format", "stream-json", "--include-partial-messages",
+			"--permission-mode", "plan",
+		},
+		Session: config.SessionConfig{IDFlag: "--session-id", ResumeFlag: "--resume", ContinueFlag: "-c"},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+
+	prompt := "Do not explore. Immediately present this plan for approval using the " +
+		"ExitPlanMode tool: create README.md with one line."
+	task := sendPaused(t, h, ctx, prompt)
+	if itx := interactionFromMessage(t, task.Status.Message); itx.Kind != agent.InteractionPlanApproval {
+		t.Fatalf("interaction = %+v, want a plan approval", itx)
+	}
+	// Cancel rather than approving: post-approval the agent would proceed to
+	// implement and prompt again for write permissions, which this test does not
+	// cover.
+	if _, err := h.CancelTask(ctx, &a2a.CancelTaskRequest{ID: task.ID}); err != nil {
+		t.Fatalf("CancelTask: %v", err)
 	}
 }
 

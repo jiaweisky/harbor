@@ -143,14 +143,14 @@ package agent
 type EventKind int
 
 const (
-    EventSession    EventKind = iota // 发现 CLI 会话 ID
-    EventTextDelta                   // 增量文本（流式）
-    EventTextFinal                   // 最终文本
-    EventThinking                    // 思考/推理内容（可选）
-    EventToolCall                    // 工具调用开始
-    EventToolResult                  // 工具调用结果
-    EventPermissionRequest           // CLI 请求权限/澄清 → 映射到 input-required
-    EventUsage                       // token/费用
+    EventSession    EventKind = iota // a CLI session id was discovered
+    EventTextDelta                   // incremental streamed text
+    EventTextFinal                   // final text
+    EventThinking                    // reasoning/thinking content (optional)
+    EventToolCall                    // a tool call started
+    EventToolResult                  // a tool call finished
+    EventPermissionRequest           // the CLI asks for permission/clarification
+    EventUsage                       // token/cost usage
     EventError
     EventDone
 )
@@ -163,7 +163,7 @@ type Event struct {
     SessionID string
     Usage     *Usage
     Err       error
-    Raw       []byte // 原始记录，便于透传/调试
+    Raw       []byte // raw record, for passthrough/debugging
 }
 ```
 
@@ -172,11 +172,11 @@ type Event struct {
 ```go
 type Request struct {
     Prompt      string
-    SystemExtra string // 追加系统提示
+    SystemExtra string // appended system prompt
     Model       string
-    Agent       string // CLI 内部 agent 名（claude/codebuddy 支持）
+    Agent       string // CLI-internal agent name (claude/codebuddy)
     WorkDir     string
-    SessionID   string // CLI 原生会话 ID（续跑）
+    SessionID   string // CLI-native session id (for resume)
     Continue    bool   // --continue
     MaxTurns    int
     Meta        map[string]any
@@ -187,15 +187,16 @@ type Request struct {
 
 ```go
 type Adapter interface {
-    // Name 返回 agentID，如 "opencode"。
+    // Name returns the agent id, e.g. "opencode".
     Name() string
-    // Probe 探测二进制是否存在/版本，用于健康检查与 AgentCard。
+    // Probe checks the binary's presence/version, for health checks and the AgentCard.
     Probe(ctx context.Context) (Info, error)
-    // Invocation 根据请求构造一次 CLI 调用（命令、参数、环境变量）。
+    // Invocation builds one CLI invocation (command, args, env) from a request.
     Invocation(req *Request) (*Invocation, error)
-    // Parser 返回该 CLI 输出解析器。
+    // Parser returns the output parser for this CLI.
     Parser() Parser
-    // Capabilities 声明生效能力（§7.2），驱动 AgentCard 投影与请求校验。
+    // Capabilities declares the effective capabilities, driving AgentCard projection
+    // and request validation.
     Capabilities() Capabilities
 }
 
@@ -204,11 +205,11 @@ type Invocation struct {
     Args []string
     Env  []string
     Dir  string
-    Stdin io.Reader // 可选：stream-json 输入模式
+    Stdin io.Reader // optional: stream-json input mode
 }
 
 type Parser interface {
-    // Parse 处理一条记录（行/JSON），回调产生 0..N 个事件。
+    // Parse handles one record (line/JSON) and emits 0..N events via out.
     Parse(rec []byte, out func(Event)) error
     Flush(out func(Event)) error
 }
@@ -222,17 +223,17 @@ type Parser interface {
 type Runner struct {
     MaxConcurrent int
     sem           chan struct{}
-    procs         sync.Map // taskID -> *Process（完整实现见 A.6）
+    procs         sync.Map // taskID -> *Process
 }
 
 func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Parser) (<-chan Event, error) {
     cmd := exec.CommandContext(ctx, inv.Bin, inv.Args...)
     cmd.Dir = inv.Dir
-    cmd.Env = sandboxEnv(inv.Env) // 显式构造，不隐式继承父环境
-    // 独立进程组，确保可连同子进程一起杀死（平台相关，见 §10.3）
+    cmd.Env = sandboxEnv(inv.Env) // build explicitly; do not inherit the parent env implicitly
+    // Separate process group so the whole tree can be killed together.
     setProcessGroup(cmd)
-    // stdout 逐行泵入 Parser；stderr 单独收集为诊断日志
-    // ctx.Done() → SIGTERM 进程组，宽限期后 SIGKILL
+    // Pipe stdout line by line into the Parser; collect stderr separately as a log.
+    // ctx.Done() -> SIGTERM the process group, then SIGKILL after a grace period.
     ...
 }
 ```
@@ -257,18 +258,18 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 5. **回退是显式可选**：确需“某模式不可用则降级”时，用**显式 composite launcher**或配置策略，而非核心默认行为。
 
 ```go
-// 核心唯一契约：模式无关
+// The single core contract; transport-agnostic.
 type Session interface {
     Events() <-chan Event
-    Send(ctx context.Context, in Input) error // duplex（ACP / stream-json stdin）用于权限/澄清/续答；单向 exec 模式 no-op
+    Send(ctx context.Context, in Input) error // duplex (ACP / stream-json stdin) for permission/clarification/answers; no-op for one-shot exec
     Cancel() error
     Wait() error
 }
 
-type Launcher interface { // 每种模式实现一次，多个 CLI 复用
+type Launcher interface { // implemented once per mode, reused by many CLIs
     Name() string
     Capabilities() Capabilities
-    Probe(ctx context.Context) Info              // 仅存活/版本/能力探测，不做模式协商
+    Probe(ctx context.Context) Info              // liveness/version/capability only; no mode negotiation
     Start(ctx context.Context, req *Request) (Session, error)
 }
 ```
@@ -314,10 +315,11 @@ Adapter 针对不同 CLI 选择“集成模式”。以下基于各 CLI `-h` 实
 
 - **HTTP API**（默认，`server_protocol: http`）：Harbor spawn `codebuddy --serve --host 127.0.0.1 --auth none`（从 stdout 的 `Endpoint` 行解析监听 URL；也可用 `server_url` 连接既有实例），驱动其 runs API：`POST /api/v1/runs`（Gateway 消息体，`source.conversation.id` = 会话 id）→ `runId` → `GET /api/v1/runs/:runId/stream`（SSE）。回复为**回合级**：一条 `message`（`content.markdown` 为整段文本）后接 `done`；`POST /api/v1/runs/:runId/cancel` 取消。多轮连续性按 `source.conversation.id` 维持，Harbor 把生成的会话 id 作为 `EventSession` 回报并复用。全部请求带 `X-CodeBuddy-Request: 1`（CSRF 头）。
 - **ACP over HTTP**（`server_protocol: acp`）：同一 server 的 `/api/v1/acp`（JSON-RPC over SSE，与 `--acp`(stdio) 同一 ACP 协议，仅传输不同）。Harbor `POST /api/v1/acp/connect` 取 `connectionId`；**命令用 `POST /api/v1/acp` 发出，其响应与该命令相关的通知在该 POST 自身的 SSE 回复里流回**；另有一条 `GET /api/v1/acp`（`acp-connection-id` 头）接收服务器**主动**通知。Harbor 复用与 stdio ACP 完全相同的 `conn`/`session` 映射（`initialize` → `session/new`（或 `session/load`）→ `session/prompt`，`session/update` 流、`session/request_permission` 桥接），因此能力与 `--acp` 一致（逐 token、工具轨迹、权限交互）。`connectionId` 按任务建立、回合结束即 `DELETE`，服务器进程跨任务复用。
+  - **`--acp-transport streamable-http`（`server_protocol: acp-streamable-http`）**：`codebuddy --acp --acp-transport streamable-http` 启动一个常驻 ACP 服务，向 **stderr** 打印 `ACP streamable-http endpoint: http://host:port/api/v1/acp`（故 `SpawnServer` 同时扫描 stdout 与 stderr 获取监听地址）。其线协议与上面**完全一致**（`POST /api/v1/acp/connect` 取 `connectionId`，`POST /api/v1/acp` + `acp-connection-id` 头发命令、SSE 回帧，`GET` 订阅主动通知，均带 `X-CodeBuddy-Request: 1`），故复用同一 ACP-over-HTTP 客户端，唯一差别是启动参数（改为 `--acp --acp-transport streamable-http`）与 **endpoint 归一化**：打印的 URL 已含 `/api/v1/acp`，Harbor 剥离该后缀得到 base，再拼回 `acpPath`，使 `--serve`（打印 server 根）与此模式共用同一路径拼装。
 
 **已落地：codex**——`codex app-server`（**换行分隔 JSON-RPC over stdio**；协议由 `codex app-server generate-json-schema` 产出、并经真机 `initialize`/`thread/start`/`turn/start` 验证）。流程：`initialize` → 按 context `thread/start`（`approvalPolicy:"never"` 以无人值守）或 `thread/resume {threadId}` → `turn/start {threadId, input:[{type:"text",text}]}`；`item/agentMessage/delta` 的 `delta` 作增量输出，`turn/completed`（`status`）收尾，`error`（`willRetry:false`）失败，`turn/interrupt` 取消。Harbor 作客户端代理其 API。（注：本机 codex 登录已失效，真机只能验证 handshake/thread/turn/错误路由，成功增量路径由假服务器测试覆盖。）
 
-**C. ACP**：CLI 常驻 ACP（`opencode acp`、`codebuddy --acp`）经 stdio；Harbor 作 ACP 客户端，双向。**已实现**（stdio；`--acp-transport streamable-http` 未实现）。
+**C. ACP**：CLI 常驻 ACP（`opencode acp`、`codebuddy --acp`）经 stdio；Harbor 作 ACP 客户端，双向。**已实现**（stdio；`codebuddy --acp --acp-transport streamable-http` 的服务化端点已实现，见 §5.4 `server_protocol: acp-streamable-http`）。
 
 > 交互式 TUI 不使用。`-p/--print` 是**无头标志**（claude/codebuddy 都有），**不是 serve**——它是 `stream-json` / `text` 模式的载体。
 >
@@ -342,15 +344,15 @@ ACP（Agent Client Protocol）很诱人，但属于**条件性最优**，并非�
 
 - **模式在注册/配置时静态选定（一个 Adapter 一种模式）**，核心不做运行时模式协商；`Probe()` 只做存活/版本/能力探测（详见 §4.5）。选型依据：需富交互且支持 ACP → `acp`；需结构化流 → 无头 `stream-json`/JSONL；有稳定 serve/app-server 且需高并发/会话复用 → `server`；否则无头 `text`。
 - 真正的硬约束是**覆盖**（claude/codex 无 ACP）与**Harbor 作为 client 的实现成本**，而非“ACP 只能 stdio/编辑器”。
-- **实现顺序按“覆盖 + 成本”**：v1 用 stream-json/exec 先覆盖 4 家 → v2 用 ACP 收敛统一（仅对支持的 CLI）。codebuddy 的服务化路径 `--serve` 已落地（`--acp-transport streamable-http` 未实现）。
+- **实现顺序按“覆盖 + 成本”**：v1 用 stream-json/exec 先覆盖 4 家 → v2 用 ACP 收敛统一（仅对支持的 CLI）。codebuddy 的两条服务化路径均已落地：`--serve`（`server_protocol: acp`）与 `--acp --acp-transport streamable-http`（`server_protocol: acp-streamable-http`），二者用同一 ACP-over-HTTP 客户端。
 - ACP 是唯一**跨 CLI 标准化**的集成协议，长期确实是最优收敛点；但“长期统一”不等于“短期优先”。（各家 HTTP `app-server`/`serve` 也各不同、不标准化，故仍以 ACP 为长期目标。）
-- **ACP 已按此路径落地（stdio）**，`opencode acp` 实测端到端通过。覆盖：`initialize` → `session/new` → `session/prompt` 的一轮生命周期、`session/update` 流式映射（`agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update`）、以及 `session/request_permission` → A2A `input-required` 的桥接（应答为被选 `optionId`）。`fs/*` 与 `terminal/*` **不声明也不实现**：实测 opencode 自带工具、不回调这些方法，故仅对未声明能力返回 method-not-found。跨任务会话续接（`session/load`）暂缓：一轮 prompt 结束即停止进程，一个 A2A 任务对应一次 ACP 会话生命周期。
+- **ACP 已按此路径落地（stdio）**，`opencode acp` 实测端到端通过。覆盖：`initialize` → `session/new` → `session/prompt` 的一轮生命周期、`session/update` 流式映射（`agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update`）、以及 `session/request_permission` → A2A `input-required` 的桥接（应答为被选 `optionId`）。`fs/*` 与 `terminal/*` **不声明也不实现**：实测 opencode 自带工具、不回调这些方法，故仅对未声明能力返回 method-not-found。跨任务会话续接（`session/load`）**已落地**：每个任务仍对应一次进程/会话生命周期，但当请求带 `sessionId`（由 executor 按 `contextId` 记录自 `EventSession`）时，`initialize` 后改用 `session/load` 载入该会话（CLI 不支持则回退 `session/new`），并在启动后回报 `EventSession` 以便后续任务续接。
 
 ### 5.3 stream-json → 统一事件映射（示意）
 
 ```go
-// 输入形如 {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
-// 或 {"type":"content_block_delta","delta":{"text":"..."}}, {"type":"result",...}
+// Input looks like {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+// or {"type":"content_block_delta","delta":{"text":"..."}}, {"type":"result",...}
 func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
     var e struct {
         Type    string          `json:"type"`
@@ -363,9 +365,9 @@ func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
     if err := json.Unmarshal(rec, &e); err != nil { return err }
     if e.Session != "" { out(Event{Kind: EventSession, SessionID: e.Session}) }
     switch e.Type {
-    case "content_block_delta": // 增量文本
+    case "content_block_delta": // incremental text
         out(Event{Kind: EventTextDelta, Text: extractDelta(e)})
-    case "assistant": // 完整助手消息（含工具调用）
+    case "assistant": // a full assistant message (may contain tool calls)
         for _, blk := range extractBlocks(e) {
             if blk.Type == "tool_use" { out(Event{Kind: EventToolCall, Tool: blk.Name, ToolInput: blk.Input}) }
         }
@@ -453,27 +455,27 @@ Harbor **只以非交互模式**驱动 CLI：**凭据一律经环境变量注入
 
 ```go
 func CardFor(a agent.Launcher, info agent.Info, endpoint string) *a2a.AgentCard {
-    caps := a.Capabilities() // 生效能力（§7.2）→ Card 投影（§7.3）
+    caps := a.Capabilities() // effective capabilities, projected onto the card
     return &a2a.AgentCard{
         Name:        "Harbor/" + a.Name(),
         Description: "Remote A2A wrapper for the " + a.Name() + " coding agent CLI",
         Version:     info.Version,
         SupportedInterfaces: []*a2a.AgentInterface{
             {
-                URL:             endpoint, // 形如 https://host/agents/<id>/（**带尾斜杠**，见 §6.1.1）
-                ProtocolBinding: a2a.TransportProtocolJSONRPC, // M1 仅 JSON-RPC
-                ProtocolVersion: a2a.Version,                  // 固定 A2A v1.0
+                URL:             endpoint, // e.g. https://host/agents/<id>/ (with a trailing slash)
+                ProtocolBinding: a2a.TransportProtocolJSONRPC,
+                ProtocolVersion: a2a.Version, // fixed A2A v1.0
             },
         },
         Capabilities: a2a.AgentCapabilities{
-            Streaming:         caps.Streaming != agent.StreamNone, // 由能力投影；exec 模式为 false
-            PushNotifications: false,                              // 未实现（见 §20）
+            Streaming:         caps.Streaming != agent.StreamNone, // projected from capabilities; false for exec
+            PushNotifications: true,
         },
-        DefaultInputModes:  caps.InputModes(),   // text/plain[, image/*, application/json…]
+        DefaultInputModes:  caps.InputModes(),   // text/plain[, image/*, application/json...]
         DefaultOutputModes: caps.OutputModes(),
-        // 鉴权是 A2A 协议面的一部分；仅在 server.auth.mode != none 时声明（§9）
-        SecuritySchemes:      cardSecuritySchemes(),      // none 时返回 nil
-        SecurityRequirements: cardSecurityRequirements(), // none 时返回 nil
+        // Auth is part of the A2A surface; only declared when the server enforces it.
+        SecuritySchemes:      cardSecuritySchemes(),      // nil when auth is none
+        SecurityRequirements: cardSecurityRequirements(), // nil when auth is none
         Skills: []a2a.AgentSkill{{
             ID: a.Name(), Name: a.Name(),
             Description: "Run a coding task with " + a.Name(),
@@ -490,7 +492,7 @@ func CardFor(a agent.Launcher, info agent.Info, endpoint string) *a2a.AgentCard 
 
 - `a2asrv.NewStaticAgentCardHandler(card)` 挂在 `/.well-known/agent-card.json`；
 - 多 agent：`/agents/{id}/.well-known/agent-card.json` + `/agents/{id}/`（JSON-RPC handler，**带尾斜杠**，与卡片 url 一致）；
-- **M1 仅 JSON-RPC**（`TransportProtocolJSONRPC`）；REST/gRPC（`NewRESTHandler` 等）留后续。
+- **传输**：JSON-RPC（默认）、HTTP+JSON（A2A REST，`a2asrv.NewRESTHandler`，挂载于 `<agent>/rest/`）与 gRPC（`a2agrpc.NewHandler`，按 `agents[].grpc_listen` 各起一个监听）。三种绑定均在 AgentCard 的 `supportedInterfaces` 声明。
 - **协议版本固定 A2A v1.0**（`ProtocolVersion: a2a.Version`）：`A2A-Version` 不匹配时返回 `ErrVersionNotSupported`。
 
 #### 6.1.1 兼容发现端点（codebuddy）
@@ -502,13 +504,14 @@ codebuddy 自带 A2A 客户端，其远程发现 `CODEBUDDY_REMOTE_AGENTS_URL` �
 - **卡片与发现端点公开**（不含 RPC）：即使 `auth.mode=bearer`，也不要求 token（见 §9）。
 
 ```go
-// 聚合发现（追加式兼容端点）：返回**已构建好的卡片数组**（含各自 /agents/{id}/ 的 url）。
+// Aggregate discovery (additive compatibility endpoint): returns the built card
+// array (each with its own /agents/{id}/ url).
 func NewCardsHandler(cards []*a2a.AgentCard, cors ...string) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
         setCORS(w, cors)
         w.Header().Set("Content-Type", "application/json")
-        _ = json.NewEncoder(w).Encode(cards) // 顶层数组
+        _ = json.NewEncoder(w).Encode(cards) // top-level array
     })
 }
 ```
@@ -533,7 +536,7 @@ func NewCardsHandler(cards []*a2a.AgentCard, cors ...string) http.Handler {
 
 > **实时性要求**：默认**逐 token 输出**（claude/codebuddy 加 `--include-partial-messages`），避免“半天没反应”。逐 token 会对 `TaskArtifactUpdateEvent` 做**合并节流**（每 ~50–100ms 或累计 N 字符 flush 一次），既尽快看到首字、又不刷爆 SSE。无 partial 能力的 CLI（opencode `run` / codex `exec`）用 `Working` 状态与工具事件作为 activity 心跳。
 >
-> 上表中 `EventThinking / EventToolCall / EventToolResult / EventUsage` 为**目标映射**；M1 仅落地 `EventTextDelta`（及 session/permission/error），其余归 M4（见 §6.3）。
+> 上表所有事件均已落地：`EventThinking / EventToolCall / EventToolResult / EventUsage` 作为工具/推理轨迹事件（默认折叠进 artifact metadata，见 §6.3）。
 
 ### 6.3 执行器骨架（Launcher/Session）
 
@@ -542,13 +545,14 @@ func NewCardsHandler(cards []*a2a.AgentCard, cors ...string) http.Handler {
 ```go
 type CLIExecutor struct {
     launcher agent.Launcher
-    sessions SessionStore  // contextId → cliSessionID
-    live     LiveSessions  // taskID → agent.Session（duplex 时保活）
+    sessions SessionStore  // contextId -> cliSessionID
+    live     LiveSessions  // taskID -> agent.Session (kept alive for duplex)
 }
 
 func (e *CLIExecutor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
     return func(yield func(a2a.Event, error) bool) {
-        // A. input-required 恢复：客户端以同一 taskId 回传答复 → 写回原进程并继续
+        // A. input-required resume: the client replies with the same taskId; write
+        //    the answer back to the original process and continue.
         if t := execCtx.StoredTask; t != nil && t.Status.State == a2a.TaskStateInputRequired {
             sess, ok := e.live.Get(execCtx.TaskID())
             if !ok { yield(failed(execCtx, "session lost"), nil); return }
@@ -556,32 +560,33 @@ func (e *CLIExecutor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorConte
                 e.live.Del(execCtx.TaskID()); yield(failed(execCtx, err.Error()), nil); return
             }
             if !yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateWorking, nil), nil) { return }
-            e.pump(execCtx, sess, yield) // 继续消费
+            e.pump(execCtx, sess, yield) // keep consuming
             return
         }
 
-        // B. 首次执行
+        // B. First execution
         if execCtx.StoredTask == nil {
             if !yield(a2a.NewSubmittedTask(execCtx, execCtx.Message), nil) { return }
         }
         if !yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateWorking, nil), nil) { return }
 
-        req, err := e.toRequest(ctx, execCtx) // 提取 prompt/model/workdir/session
+        req, err := e.toRequest(ctx, execCtx) // extract prompt/model/workdir/session
         if err != nil { yield(failed(execCtx, err.Error()), nil); return }
 
-        sess, err := e.launcher.Start(ctx, req) // Session 契约（line-based 或 ACP 均实现）
+        sess, err := e.launcher.Start(ctx, req) // Session contract, implemented by line-based or ACP
         if err != nil { yield(failed(execCtx, err.Error()), nil); return }
         e.live.Put(execCtx.TaskID(), sess)
         e.pump(execCtx, sess, yield)
     }
 }
 
-// pump 消费会话事件，对逐 token 做合并节流；遇 input-required 时保留会话后返回。
+// pump consumes session events, coalescing token deltas; on input-required it
+// keeps the session and returns.
 func (e *CLIExecutor) pump(ec *a2asrv.ExecutorContext, sess agent.Session,
     yield func(a2a.Event, error) bool) {
 
     var artifactID a2a.ArtifactID
-    co := newCoalescer(80*time.Millisecond, 1024) // ~80ms 或累计 1KB flush
+    co := newCoalescer(80*time.Millisecond, 1024) // flush every ~80ms or 1KB
     emit := func(s string) bool { return yield(e.artifactEvent(ec, &artifactID, s), nil) }
 
     for ev := range sess.Events() {
@@ -591,8 +596,8 @@ func (e *CLIExecutor) pump(ec *a2asrv.ExecutorContext, sess agent.Session,
         case agent.EventTextDelta:
             if !co.Add(ev.Text, emit) { return }
         case agent.EventPermissionRequest:
-            co.Flush(emit) // 先冲掉已缓冲文本
-            // 保留 sess（不 Del），任务进入 input-required 等客户端答复
+            co.Flush(emit) // flush buffered text first
+            // Keep sess (do not delete it); the task enters input-required.
             yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateInputRequired,
                 a2a.NewMessage(a2a.MessageRoleAgent, interactionPart(ev))), nil)
             return
@@ -602,7 +607,7 @@ func (e *CLIExecutor) pump(ec *a2asrv.ExecutorContext, sess agent.Session,
         }
     }
     co.Flush(emit)
-    e.emitChanges(ec, yield) // §6.8：终态前发代码变更 artifact
+    e.emitChanges(ec, yield) // emit the code-change artifact before the terminal state
     e.live.Del(ec.TaskID())
     yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil), nil)
 }
@@ -625,7 +630,7 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 - **taskID 贯通**：Executor 把 `taskID` 经 ctx 交给 Launcher/Session（`agent.WithTaskID`）；line-based Launcher 用它对齐 `Runner.Start/Kill` 的 key，避免“cancel 找不到进程”。
 - **合并节流**：`coalescer` 按时间 / 字节 flush，避免逐 token 刷爆 SSE。
 - **单向 exec 模式**：`Session.Send` 为 no-op，且 Capabilities 声明不支持交互，故不会走到 `input-required`。
-- **M1 的 pump 范围**：仅处理 `EventTextDelta / EventSession / EventPermissionRequest / EventError`；§6.2 表中的 `EventThinking / EventToolCall / EventToolResult / EventUsage` 在 **M4** 补齐（当前忽略或仅记日志）。
+- **pump 范围（已落地）**：处理 `EventSession / EventTextDelta / EventTextFinal / EventStructuredOutput / EventPermissionRequest / EventThinking / EventToolCall / EventToolResult / EventUsage / EventError / EventDone`；工具/推理/用量事件作为轨迹与用量记录。
 - **live TTL/reaper**：`live` 条目带最后活动时间与 TTL；客户端久不答复时到期自动 `Cancel` 并清理，避免进程/条目泄漏（与 §11 交互持久化呼应）。
 
 ### 6.4 会话与多轮续跑
@@ -634,7 +639,7 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 - 首个任务从 CLI 输出解析出原生 `sessionId`，写入 `SessionStore：contextId → sessionId`。
 - 后续同 `contextId` 的请求，Adapter 自动附加 `--resume <sessionId>`（claude/codebuddy）或 `--session <id>` / `--continue`（opencode）。
 - **按调用方作用域**：`contextId` 由客户端提供，故 `contextId → CLI session` 与 `contextId → 工作树` 的绑定都加上**已鉴权用户**（key = `user + "\x00" + contextId`）；否则 A 复用 B 的 `contextId` 就能续到 B 的会话/工作树。未鉴权（无 user）时退化为仅按 `contextId`。
-- `--fork` / `--fork-session` 语义可用 A2A 元数据（`SendMessageConfig` / `Message.Metadata`）选择“续写或分叉”。
+- **fork（已落地）**：`--fork` / `--fork-session` 语义经 A2A 元数据 `harbor.fork`（`Message.Metadata`）选择“续写或分叉”；请求带 sessionId 时在 resume 之后追加 `agents[].session.fork_flag`（profile 默认：claude/codebuddy `--fork-session`、opencode `--fork`），新会话 id 由 CLI 回报并顶替。
 
 ### 6.5 权限/澄清交互（input-required）
 
@@ -688,7 +693,7 @@ coding agent 的核心产出是**代码改动**，必须作为 artifact 交付�
 - **产出 diff**：终态（或工具报告编辑后）计算变更：git 用 `git diff <base>`（含已跟踪）+ 未跟踪文件；非 git 与基线哈希对比生成 unified diff。
 - **artifact 形态**：
   - **diff artifact**：`Name="changes"`，`TextPart`（mime `text/x-diff`）或大改动走 `FilePart`(URL，由 Harbor 提供)；
-  - 可选**逐文件 artifact**：每个文件一个 `FilePart`（受大小限制）；
+  - **逐文件 artifact（已落地，可选）**：`sandbox.file_artifacts: true` 时，除 diff 外每个变更文件各发一个 `FilePart`（按扩展名定 MIME，单文件 ≤1MiB，图片不重复）；
   - `Artifact.Metadata = {"agent","base","files":[...],"truncated":bool}`。
 - **流式 vs 收尾**：默认**收尾一次性**交付（稳定）；若 CLI 能报告逐文件编辑（tool_result 带 path），可增量为每文件发 `ArtifactUpdateEvent`。
 - **边界**：只采集 `workDir`（及允许的 `--add-dir`）内变更；超长 diff 裁剪并标 `truncated`；二进制只报路径。
@@ -746,23 +751,23 @@ coding agent 的核心产出是**代码改动**，必须作为 artifact 交付�
 
 ```go
 type Capabilities struct {
-    // 输入
+    // Input
     InputText   bool
-    InputImage  []string // 支持的 MIME，如 image/png
-    InputFile   bool     // 以文件/目录引用输入
-    InputData   bool     // 结构化 DataPart 入参
-    InputPrompt bool     // 支持 system / append system prompt
-    // 输出
+    InputImage  []string // accepted MIME types, e.g. image/png
+    InputFile   bool     // accepts file/directory references
+    InputData   bool     // accepts structured DataPart input
+    InputPrompt bool     // supports system / append system prompt
+    // Output
     OutputText bool
-    OutputFile bool // 产出文件 / 补丁
-    OutputData bool // 结构化 JSON（json-schema）
-    ToolTrace  bool // 可观测工具调用
-    // 交互
+    OutputFile bool // produces files / patches
+    OutputData bool // structured JSON (json-schema)
+    ToolTrace  bool // tool calls are observable
+    // Interaction
     Permission          PermissionModel   // none | flag_only | interactive
-    AskQuestion         bool              // 主动澄清（多选 / 自由文本）
+    AskQuestion         bool              // proactive clarification (choice / free text)
     PlanApproval        bool
-    InputRequiredResume bool              // 挂起后能否在原进程继续应答
-    // 会话 / 流式 / 其它
+    InputRequiredResume bool              // can answer within the original process after a pause
+    // Session / streaming / other
     SessionResume bool
     SessionFork   bool
     Streaming     StreamGranularity // none | turn | token
@@ -824,29 +829,35 @@ type Capabilities struct {
 - **ACP**：`session/request_permission` → `input-required`（optionId 作答）。
 - **stream-json**：`control_request` 且 `request.subtype="can_use_tool"`（claude/codebuddy 无头模式的实际权限/提问通道），按 `tool_name` 分流：
   - 默认 → `InteractionPermission`（`id`=`request_id`，选项 `allow`/`deny`）；答复编码为 `control_response`（`response.response` 同时带 codebuddy 的 `allowed` 与 claude 的 `behavior`，两种 CLI 通用）。
-  - `AskUserQuestion` → `InteractionQuestion`（`id`=`request_id`，`target`=问题文本，`options`=选项 label）；答复编码为 `control_response` 的 `updatedInput.answers{问题: 选择}` 注入。因该工具需客户端先声明能力，`agents[].sdk_capabilities: true` 会在首个 prompt 前发送 `initialize` 声明 `askUserQuestion`（见 §5.4）；未开启时 CLI 不暴露该工具。
-  - 两种情形**原进程挂起**等待 stdin，无需重启。实测 codebuddy：权限（暂停→`allow`→Bash 执行→完成）与提问（暂停→选择 `Blue`→完成）均通过。
+  - `AskUserQuestion` → `InteractionQuestion`（`id`=`request_id`，`target`=第一个问题文本，`options`=其选项 label，`questions` 列出**全部**问题及其选项）；答复编码为 `control_response` 的 `updatedInput.answers{问题: 选择}` 注入——多问题时客户端用 `DataPart{id,content:{问题:选择,...}}` 一次性回答所有问题。因该工具需客户端先声明能力，`agents[].sdk_capabilities: true` 会在首个 prompt 前发送 `initialize` 声明 `askUserQuestion`（见 §5.4）；未开启时 CLI 不暴露该工具。
+  - `request.subtype="elicitation_create"`（**表单**）→ `InteractionQuestion`（`action:"form"`，`schema` 携带 `requestedSchema`，单字段 enum 时 `options` 直接列出）；客户端以 `DataPart{id,content}` 作答，答复编码为 `control_response` `{action:"accept",content:{...}}`（无 content 则 `decline`）。需 `sdk_capabilities: true` 声明 `elicitation.form`。
+  - `tool_name="ExitPlanMode"`（plan 模式）→ `InteractionPlanApproval`（选项 allow/deny），答复同权限（`control_response` 的 `allowed`）。
+  - 以上情形**原进程挂起**等待 stdin，无需重启。实测 codebuddy：权限（暂停→`allow`→Bash 执行→完成）、`AskUserQuestion` 提问（暂停→选择 `Blue`→完成）、表单 elicitation（暂停→提交 `content`→完成）、plan approval（`ExitPlanMode`→暂停）均通过。
 
-尚未接入：`elicitation_create`（表单式，入口同样经 SDK 能力声明，但响应形状为 `{action,content}`，与 `can_use_tool` 不同）、`plan_approval`，以及“不支持挂起续答”时的 `--resume` 有损注入。
+**活进程丢失恢复（有损）**：`input-required` 消息元数据记录 CLI 会话 id（`harbor.sessionId`，来自 `EventSession`）。当答复到达而活进程已不存在（典型为 Harbor 重启后 `runs`/`live` 已清空）时，若该会话 id 存在且 CLI `SessionResume` 能力为真，则**以 `--resume <id>` 重启**并把答复文本作为下一个 prompt 注入（`resumeFresh`）；否则以 `internal` 失败并提示重发。注入是有损的：CLI 重启、可能重放上下文，且工作目录取自答复消息的 `harbor.workDir`（缺省回退）。ACP 未上报会话 id，故重启后走此路会因缺少 id 而失败。
 
 ### 7.5 媒体类型对齐
 
 | 请求 Part | 通用处理 | 各 CLI 落地（示例） |
 |---|---|---|
 | `TextPart` | 拼 prompt | 全部 |
-| `FilePart`(raw/URL) | 图片且 CLI 声明 `InputImage` → native image block；其余 → 落到临时/工作目录并提示路径 | codebuddy：图片经 `--input-format stream-json` 的 image block（已落地）；claude 的 stream-json 不支持图片；其余 `--add-dir`/附件参数；opencode：`@path` |
-| `DataPart` | 结构化入参 | 经 `--input-format stream-json` 直传（claude/codebuddy）；否则序列化进 prompt。**结构化输出**另用 `--json-schema`/`--output-schema`（见 §7.6）。 |
+| `FilePart`(raw/URL) | 图片：native image block（`InlineImages`）或经 `image_args`（`{{.Image}}`）落盘附加；其余且配置 `file_args` → 落盘并经参数附加（`{{.File}}`）；否则 → 落盘并在 prompt 提示路径 | codebuddy：图片经 image block（已落地）；opencode：`-f {{.File}}`（已落地，实测）；codex：`-i {{.Image}}`（已落地，假 CLI 覆盖）；claude stream-json 不支持图片 |
+| `DataPart` | 每个 part 一个内容块 | stream-json：`TextPart`/`DataPart` 各成独立 `text` content block（DataPart 为 JSON 块）；exec：序列化并入 prompt。**结构化输出**另见 §6.8/§7.6。 |
 | 输出文件/图片 | 监听工作目录变更 | 无标准接口：以 git diff / 新增文件生成 `FilePart` artifact；codebuddy 文生图结果按图片 artifact 输出 |
 
 要点：**能力校验前置**——请求中的媒体类型/交互若不在生效能力内，立即以 `ErrUnsupportedContentType` / 拒绝态返回，**不要**启动 CLI 后再失败。
 
-**已落地**：Executor 按 part 类型拼装 prompt——多个 `TextPart` 拼接；`DataPart` 序列化为 JSON 进入 prompt；`FilePart(raw)` 落到 `<workDir>/.harbor/uploads/` 并在 prompt 中给出路径，`FilePart(URL)` 直接引用 URL。**能力校验前置**：图片 MIME 不在 `InputImage` 内、或文件而无 `InputFile` 时，返回 `unsupported_content` 且不启动 CLI；`InputModes()` 在 `InputFile` 时投影 `application/octet-stream`。
+**已落地**：Executor 按 part 类型拼装输入——每个 `TextPart`/`DataPart`（后者为 JSON）在 stream-json 下成为**独立 content block**（`EncodeStreamJSONBlocks`），exec 下并入 prompt 文本；`FilePart(raw)` 落到 `<workDir>/.harbor/uploads/` 并**经 `agents[].file_args` 附加**（`{{.File}}` → 路径；opencode profile 默认 `-f {{.File}}`，实测把文件内容交给模型）——未配置 `file_args` 时退回“prompt 中给出路径”；`FilePart(URL)` 直接引用 URL。**能力校验前置**：图片 MIME 不在 `InputImage` 内、或文件而无 `InputFile` 时，返回 `unsupported_content` 且不启动 CLI；`InputModes()` 在 `InputFile` 时投影 `application/octet-stream`。
 
 **图片输入（已落地，codebuddy 的 stream-json）**：profile 的 `InputImage`（png/jpeg/gif/webp）声明后，`FilePart(raw)` 的图片**不再落盘**，而是作为 native **image content block**（base64）随首条 user message 经 stdin 发送，模型直接看到像素；URL 图片仍按引用处理。实测 codebuddy：发送纯红 PNG → 回答 `Red`。claude 的 stream-json 输入对图片返回 `[Unsupported Image]`，故**不**为其声明 `InputImage`（图片回落为落盘 + 路径引用）。
 
-**结构化输出（已落地，stream-json）**：请求元数据 `harbor.outputSchema` 提供 JSON Schema 时，Harbor 追加 `--json-schema`，CLI 的 `structured_output` 解析为 `EventStructuredOutput` 并作为 `result` DataPart artifact 返回（claude/codebuddy 实测通过）。
+**图片输出（已落地）**：任务结束时 `emitChanges` 在既有 diff 之外，把工作目录内**新增/变更的图片文件**（按扩展名 png/jpg/jpeg/gif/webp，单个 ≤8MiB）作为 **raw image artifact**（`FilePart`，带 `MediaType`/`Filename`/`path` 元数据）发出——文生图结果（如 codebuddy `--text-to-image-model` 落盘的图片）因此以图片而非仅 diff 行到达客户端。`Profile.OutputImage` 声明可产出的图片 MIME，经 `Capabilities.OutputImage` 投影到卡片的 `defaultOutputModes`（codebuddy 已声明）。注：机制是通用的工作目录监听，不绑定具体 CLI。
 
-未接入：CLI 专用附件参数（opencode `@path`/`-f`、codex `-i/--image`、`--add-dir`）、`DataPart` 经 `--input-format stream-json` 直传、codex `--output-schema`（exec）。
+**结构化输出（已落地）**：
+- **stream-json**：请求元数据 `harbor.outputSchema` 提供 JSON Schema 时，Harbor 追加 `--json-schema`，CLI 的 `structured_output` 解析为 `EventStructuredOutput` 并作为 `result` DataPart artifact 返回（claude/codebuddy 实测通过）。
+- **exec**：`agents[].output_schema_args`（codex profile 默认 `["--output-schema","{{.SchemaFile}}"]`）在请求带 schema 时把 schema 写入临时文件并追加参数（`{{.SchemaFile}}`/`{{.Schema}}`）；因 exec CLI 无显式结构化事件，Harbor 在任务完成时把**最终文本**尝试解析为 JSON object 并作为 `result` DataPart（未配置 schema 或文本非 JSON 时不触发）。codex 本机未登录，仅假 CLI 覆盖。
+
+**图片/附件参数（已落地，codex）**：`agents[].image_args`（codex profile 默认 `["-i","{{.Image}}"]`）让 CLI 以参数方式接收图片——图片落盘（保留/补全扩展名）后按 `{{.Image}}` 追加，`InputImage` 声明后图片被接受且投影为输入 MIME；`add_dir` 等其余参数可直接写入 `agents[].args`（模板含 `{{.WorkDir}}`）。codex 本机未登录，仅假 CLI 覆盖。
 
 ### 7.6 功能支持矩阵（依据本机 `-h` 实测）
 
@@ -855,10 +866,10 @@ type Capabilities struct {
 | 功能 \ Agent | claude | codebuddy | opencode | codex | generic |
 |---|---|---|---|---|---|
 | 文本输入/输出 | ✅ | ✅ | ✅ | ✅（`exec`） | ✅ |
-| 图片输入 | ✅（交互内置读取；stream-json 不支持） | ✅（已落地，stream-json native image block） | ✗ | ✅（`-i/--image`，未接入） | 配置 |
+| 图片输入 | ✅（交互内置读取；stream-json 不支持） | ✅（已落地，stream-json native image block） | ✗ | ✅（已落地，`image_args` → `-i`；本机未登录，假 CLI 覆盖） | 配置 |
 | 图片输出 | ✗ | ✅（`--text-to-image-model`） | ✗ | ✗ | 配置 |
 | 文件/补丁输出 | ✅（内置） | ✅（内置） | ✅（内置） | ✅（内置 + `apply`） | 配置 |
-| 结构化输出（`--json-schema`） | ✅（已落地，`harbor.outputSchema`→DataPart） | ✅（同左） | ✗ | ✅（`--output-schema`，未接入） | 配置 |
+| 结构化输出（`--json-schema`/`--output-schema`） | ✅（已落地，`harbor.outputSchema`→DataPart） | ✅（同左） | ✗ | ✅（已落地，`output_schema_args`；本机 codex 未登录，假 CLI 覆盖） | 配置 |
 | 结构化输入（`--input-format stream-json`） | ✅ | ✅ | ✗ | ✗（prompt 走参数/stdin） | 配置 |
 | 流式粒度 | token（`stream-json` + `--include-partial-messages`） | token（同上） | turn（`run`）；可通过 `serve` 走 SSE | JSONL 事件流（`exec --json`）；`app-server` 可流式 | 配置 |
 | 权限交互 | ✅（`--permission-mode` / `--allowedTools` / `--permission-prompts`） | ✅（同左 + `--subagent-permission-mode`） | ✅（`--auto`；权限系统） | ✅（`-a/--ask-for-approval`、`--approve-for-me`） | 配置 |
@@ -901,7 +912,7 @@ agents:
     env:
       MY_CODER_MODE: "ci"
     session:
-      id_flag: "--session-id"  # 用于续跑
+      id_flag: "--session-id"  # used for resume
       resume_flag: "--resume"
       continue_flag: "--continue"
     limits:
@@ -921,27 +932,24 @@ func init() {
 }
 ```
 
-### 级别 3：完整 Adapter（复杂 CLI）
+### 级别 3：完整 Adapter（复杂 CLI）— **已落地（编译期注册）**
 
-实现 `Adapter` 接口并注册，例如需要握手、多次 stdin 往返、专用协议的 CLI。（未落地：现有复杂适配器 ACP 仍经 `config.Integration` 分支装配；抽出注册表需先解耦 config 校验与构建，留后续。）
-
-```go
-func init() { agent.RegisterAdapter("weird-cli", newWeirdAdapter) }
-```
-
-### 级别 3：完整 Adapter（复杂 CLI）
-
-实现 `Adapter` 接口并注册，例如需要握手、多次 stdin 往返、专用协议的 CLI。
+实现并注册一个 **AdapterBuilder**，用于需要握手、多次 stdin 往返、专用传输的 CLI。注册按 **CLI 二进制基名**：`integration.New` 在该名字有注册时优先调用它；builder 返回 `agent.ErrUnhandled` 表示该集成不归它管，回退到内建的通用装配（`stream-json`/`exec`）。新增一个复杂 CLI = **新建一个包 + `init()` 注册**，不改中心 switch。
 
 ```go
-func init() { agent.RegisterAdapter("weird-cli", newWeirdAdapter) }
+func init() {
+    agent.RegisterAdapter("weird-cli", func(ac config.AgentConfig, opts agent.AdapterOptions) (agent.Launcher, error) {
+        if ac.Integration != config.IntegrationServer { return nil, agent.ErrUnhandled }
+        return newWeirdLauncher(ac, opts), nil
+    })
+}
 ```
 
 **加载方式**：
 
-- **编译期注册**（推荐）：`internal/adapters/...` 通过 `_ "github.com/jiaweisky/harbor/internal/adapters/codex"` 触发 `init()`。
-- **Go plugin（`plugin` 包）**：可运行时加载 `.so`，但受 CGO/平台/版本限制，仅作可选实验特性。
-- 统一通过 `Registry` 暴露，HTTP 层与 A2A 层完全不感知具体 CLI。
+- **编译期注册**（采用）：`agent.RegisterAdapter`（`internal/agent/adapter.go`）维护 `二进制名 → AdapterBuilder` 的注册表。首方适配器（`opencode`/`codebuddy`/`codex` 的 `acp`/`server`）在 `internal/integration/adapters.go` 的 `init()` 注册；外部/新增 CLI 在其自身包的 `init()` 注册（由编译期 import 触发）。
+- **Go plugin（`plugin` 包）**：可运行时加载 `.so`（**已落地**，实验性）：`plugins: ["/path/x.so"]` 在启动时打开每个插件并调用其导出的 `Register()`（内部用 `agent.RegisterAdapter` 注册适配器）。受 CGO/平台限制——仅在 `cgo` 且 linux/darwin/freebsd 可用（`internal/plugins` 按 build tag 提供实现与降级）。
+- 统一通过注册表暴露，HTTP 层与 A2A 层完全不感知具体 CLI。config 仍校验**配置形状**（集成取值、profile 版本、参数模板），adapter 构建只发生在 `integration.New`。
 
 ---
 
@@ -958,8 +966,8 @@ func init() { agent.RegisterAdapter("weird-cli", newWeirdAdapter) }
 2. **上游凭据与登录**：见 **§10**（CLI 自身的 provider 登录/凭据隔离，与本条的服务鉴权是两件事）。
 3. **工作目录沙箱**：所有任务限定在 `sandbox.workdir_root` 内；`allow_outside` 默认 `false`；realpath/前缀校验拒绝 `..` 与 symlink 逃逸（详见 §6.7）。
 4. **环境变量**：**默认继承启动用户环境**（不少 CLI 依赖它）；`sandbox.inherit_env: false` 时仅注入白名单（`PATH`/`HOME`/`LANG`/`LC_ALL`/`TERM`/`TMPDIR`）+ `agents[].env`，以减少凭据暴露。
-5. **危险开关显式化**：`--dangerously-skip-permissions`/`-y`/`bypassPermissions` 只能由部署方在配置（`agents[].allow_dangerous`，默认 `false`）中开启，**无环境变量旁路**，并在启动日志高亮告警。可选加固：开启危险开关要求容器沙箱同时开启，否则拒绝启动。
-6. **可选容器沙箱**：对接 codebuddy `--sandbox`、或以容器运行整个 CLI，隔离文件系统与网络。
+5. **危险开关显式化**：`--dangerously-skip-permissions`/`-y`/`bypassPermissions` 只能由部署方在配置（`agents[].allow_dangerous`，默认 `false`）中开启，**无环境变量旁路**，并在启动日志高亮告警。加固（已落地，可选）：`sandbox.require_container_for_dangerous: true` 时，任何 `allow_dangerous` agent 必须在配置了 `sandbox.container` 时才允许启动，否则 `config.Load` 报错拒启。
+6. **可选容器沙箱（已落地）**：`sandbox.container: {image, network, runtime}` 开启后，每个 CLI 进程以 `<runtime> run --rm -i --network <network>` 启动（`Runner`，覆盖 exec/stream-json/acp 及 server 的常驻进程）。**沙箱根**（`workdir_root`、`isolation_root`、`cli_home`）按**宿主原路径**绑定挂载（`-v <path>:<path>`），任务工作目录经 `-w` 指定，故 `PWD` 与各 CLI 配置根在容器内仍有效；环境经 `--env` 逐条转发（含 `inherit_env`/`cli_home` 的结果）。`network` 默认 `none`，`runtime` 默认 `docker`（可设 `podman`）。镜像须自带对应 CLI。取舍：容器内路径与宿主一致，不重写 `inv.Bin`；镜像选择与凭据注入由部署方负责。
 7. **资源限制**：并发上限、CPU/内存（`ulimit`/cgroup）、单任务超时与最大轮次，防止失控循环。
 8. **审计日志**：记录 `user → agent → prompt 摘要 → taskId → 结果状态`，敏感内容可脱敏。
 9. **网络**：CORS 仅允许受信域；AgentCard 可公开但调用接口需鉴权。
@@ -1001,8 +1009,8 @@ CLAUDE_CONFIG_DIR=<cli_home>/.claude
 CODEBUDDY_CONFIG_DIR=<cli_home>/.codebuddy
 OPENCODE_CONFIG_DIR=<cli_home>/.config/opencode
 CODEX_HOME=<cli_home>/.codex
-XDG_CONFIG_HOME=<cli_home>/.config   # opencode 等遵循 XDG
-USERPROFILE=<cli_home>               # Windows 根
+XDG_CONFIG_HOME=<cli_home>/.config   # opencode and others follow XDG
+USERPROFILE=<cli_home>               # Windows root
 APPDATA=<cli_home>/AppData/Roaming
 ```
 
@@ -1077,10 +1085,10 @@ Harbor 只以**非交互模式**启动 CLI，凭据通过**环境变量**注入�
 | 并发 | 每 agent `max_concurrent` 信号量；`a2asrv.WithConcurrencyConfig` 限制总并发。 |
 | 进程清理 | 进程组 kill + `defer`；服务退出时遍历 `procs` 全部回收。 |
 | 崩溃恢复 | TaskStore 持久化；重启后 `GetTask`/`SubscribeToTask` 仍可用；孤儿进程由启动时清理。 |
-| 交互持久化 | `input-required` 依赖**活进程**，不跨重启；重启后若客户端答复，则按 §7.4 降级为 `--resume` 注入答复（有损），会话未知则以 `internal` 失败并提示重发。 |
-| 幂等 | `messageId` 去重；重复 `message/send` 命中已有 task 不重复执行。 |
+| 交互持久化 | **已落地（durable interaction）**：`input-required` 的交互随 TaskStore 持久化，重启后从存储的 input-required 消息**重建交互**（无需内存态），答复优先在原进程写回；进程已失则按 §7.4 降级为 `--resume` 注入答复（有损）。配合 `server.session_store_dir` 持久化 CLI 会话 id，跨重启续跑亦可用。 |
+| 幂等 | **已落地**：按 `messageId` 去重；重复 `message/send` 不重复执行 CLI，而是**重放原 task 的 artifacts/状态**到新 task（新 task 元数据 `harbor.duplicateOf` 指向原 task）。另对已完成 task 的重复消息直接返回其结果。 |
 | 超时 | 空闲超时（无事件）+ 总超时；超时按 `TaskStateFailed` 处理。 |
-| 限流 | 按用户/agent 的令牌桶，防滥用（也是成本控制）。 |
+| 限流 | 按 (用户,agent) 的令牌桶（已落地）：`server.rate_limit: {per_minute, burst}`；bearer 以 token 哈希为键、匿名以客户端 IP 为键，作用于 JSON-RPC/REST/gRPC，超限 429 / `ResourceExhausted`。 |
 | 优雅停机 | 停止接收新任务 → 等待在途任务或超时强杀 → 关闭监听。 |
 
 ### 11.1 失败模式与处理
@@ -1138,10 +1146,10 @@ limits:
 
 ## 12. 持久化与状态存储
 
-- **TaskStore**：默认内存，生产可接 SQLite/Postgres/Redis（实现 `a2asrv/taskstore.Store`）。
-- **SessionStore**：`contextId → {agentID, cliSessionID, updatedAt}`，可与会话表合并。
-- **PushConfigStore / Sender**：`a2asrv.WithPushNotifications(store, sender)`；`sender` 为 HTTP webhook 投递（校验 URL 防 SSRF、签名载荷、失败重试）。M1 关闭（Card `PushNotifications:false`），M4 随长任务开启。
-- **执行日志**：每 task 落一份原始 stream（可选压缩），便于回放与排障。
+- **TaskStore**：默认内存；`server.task_store_file` 落盘 JSON。**durable interaction** 依赖它：`input-required` 的交互随 task 持久化，重启后从存储消息重建（§11）。
+- **SessionStore**：`contextId → cliSessionID`；`server.session_store_dir` 时每个 agent 落一份 `<dir>/<id>.json`，使 CLI 会话续跑跨重启可用。
+- **PushConfigStore / Sender**：`a2asrv.WithPushNotifications(store, sender)`；`sender` 为 HTTP webhook 投递（校验 URL 防 SSRF、失败重试）。**已落地**，Card `PushNotifications:true`。
+- **执行日志（已落地，可选）**：`sandbox.raw_stream_dir`（+ `raw_stream_compress`）时，每 task 的原始 stdout/stderr 落盘为 `<taskID>.out/.err(.gz)`，便于回放与排障。
 
 ---
 
@@ -1152,48 +1160,50 @@ limits:
 - **追踪**：OpenTelemetry，A2A 请求 → CLI 子进程 span。
 - **健康检查**：`/healthz`（服务）、`/readyz`（各 CLI `Probe` + **认证状态**，见 §10.5）。
 
-**已落地**：`/metrics` 以 Prometheus 文本格式暴露每 agent 的 `harbor_tasks_submitted_total`、`harbor_tasks_total{outcome}`、`harbor_tasks_active`、`harbor_breaker_state`、**任务时长直方图 `harbor_task_duration_seconds`（提交→终态，跨 resume）、`harbor_task_tokens_total{direction}` 与 `harbor_task_cost_usd_total`（由 CLI usage 事件累计）**；`/readyz` 返回 JSON（`{ready, agents{id:{breaker,auth,ready}}}`），agent 就绪 = 熔断关闭 **且** CLI 已认证（§10.5），全部不可用则 503；任务提交/终态经 `log/slog` 审计（`agent`/`task`/`user`/`outcome`）。未实现：OpenTelemetry 追踪。
+**已落地**：`/metrics` 以 Prometheus 文本格式暴露每 agent 的 `harbor_tasks_submitted_total`、`harbor_tasks_total{outcome}`、`harbor_tasks_active`、`harbor_breaker_state`、**任务时长直方图 `harbor_task_duration_seconds`（提交→终态，跨 resume）、`harbor_task_tokens_total{direction}` 与 `harbor_task_cost_usd_total`（由 CLI usage 事件累计）**；`/readyz` 返回 JSON（`{ready, agents{id:{breaker,auth,ready}}}`），agent 就绪 = 熔断关闭 **且** CLI 已认证（§10.5），全部不可用则 503；任务提交/终态经 `log/slog` 审计（`agent`/`task`/`user`/`outcome`）。
+
+**OpenTelemetry 追踪（已落地）**：`telemetry: {endpoint, insecure, service_name}` 配置 OTLP/gRPC 导出（缺省关闭，未配置时用 no-op provider，零开销）。每个 A2A 请求产生 `harbor.task` span（属性 `harbor.agent`/`harbor.task_id`/`harbor.user`，终态时置 `harbor.outcome`；取消走 `harbor.cancel`），CLI 子进程产生其子 span `harbor.cli`（属性 `process.executable.name`/`harbor.workdir`，随进程退出结束）。追踪经全局 `TracerProvider` 注入（`internal/telemetry`），主进程退出时 flush。**指标**：同一 `telemetry.endpoint` 亦导出 OTLP 指标（`harbor.tasks.submitted`/`harbor.tasks{outcome}`/`harbor.tasks.active`/`harbor.task.duration`/`harbor.task.tokens{direction}`/`harbor.task.cost`），与 Prometheus 文本端点并存。**跨进程上下文**：安装 W3C `tracecontext` 传播器，HTTP 中间件从 `traceparent` 头、gRPC 拦截器从 metadata 提取，使 `harbor.task` span 成为调用方 trace 的子 span。
 
 ## 14. 目录结构
 
 ```
 harbor/
 ├── cmd/
-│   └── harbor/                 # 服务入口（单/多 agent 由配置决定）
+│   └── harbor/                 # service entrypoint (agents loaded from config)
 ├── internal/
 │   ├── agent/
-│   │   ├── launcher.go         # Launcher / Session 契约 + line-based 实现
-│   │   ├── adapter.go          # Adapter / Invocation / Info 接口
-│   │   ├── parser.go           # Parser 接口 + 注册表
-│   │   ├── event.go            # 统一事件模型
-│   │   ├── runner.go           # 进程执行 + 生命周期
-│   │   ├── registry.go         # agentID → (card, launcher, quota)
-│   │   └── session.go          # contextId ↔ cliSessionID；LiveSessions
+│   │   ├── launcher.go         # Launcher / Session contract + line-based impl
+│   │   ├── adapter.go          # Adapter / Invocation / Info interfaces
+│   │   ├── parser.go           # Parser interface + registry
+│   │   ├── event.go            # unified event model
+│   │   ├── runner.go           # process execution + lifecycle
+│   │   ├── registry.go         # agentID -> (card, launcher, quota)
+│   │   └── session.go          # contextId <-> cliSessionID; LiveSessions
 │   ├── adapters/
 │   │   ├── claude/             # stream-json
 │   │   ├── codebuddy/          # stream-json
 │   │   ├── opencode/           # exec / server / acp
 │   │   ├── codex/              # exec
-│   │   └── generic/            # 配置模板驱动
+│   │   └── generic/            # driven by config templates
 │   ├── parsers/
 │   │   ├── streamjson/
 │   │   ├── text/
 │   │   └── regex/
 │   ├── a2a/
-│   │   ├── executor.go         # a2asrv.AgentExecutor 实现
-│   │   ├── card.go             # AgentCard 构建
-│   │   ├── discovery.go        # 聚合发现端点（codebuddy 兼容，§6.1.1）
-│   │   └── server.go           # 路由 / transport 装配
-│   ├── config/                 # YAML 解析与校验
-│   ├── artifact/               # 代码变更采集 / diff → A2A artifact（§6.8）
-│   ├── sandbox/                # workdir / env / 容器
+│   │   ├── executor.go         # a2asrv.AgentExecutor implementation
+│   │   ├── card.go             # AgentCard construction
+│   │   ├── discovery.go        # aggregate discovery endpoint (codebuddy compat)
+│   │   └── server.go           # routing / transport assembly
+│   ├── config/                 # YAML parsing and validation
+│   ├── artifact/               # change capture / diff -> A2A artifact
+│   ├── sandbox/                # workdir / env / container
 │   └── store/                  # taskstore / sessionstore / live sessions
 ├── extensions/
-│   └── interaction.md          # 交互扩展 JSON schema（§7.3 URI）
+│   └── interaction.md          # interaction extension JSON schema
 ├── examples/
 │   ├── agents.yaml
-│   └── client/                 # a2a 客户端调用示例
-├── testdata/fake-cli/          # 假 CLI 脚本（确定性测试）
+│   └── client/                 # a2a client call examples
+├── testdata/fake-cli/          # fake CLI scripts (deterministic tests)
 ├── go.mod
 └── DESIGN.md
 ```
@@ -1205,8 +1215,8 @@ harbor/
 ```yaml
 version: 1
 server:
-  listen: "0.0.0.0:8080"      # 非 loopback 且 auth.mode=none 将拒绝启动（除非 allow_insecure: true，见 §9）
-  # allow_insecure: false     # 显式允许非 loopback 无鉴权（反代已鉴权时）
+  listen: "0.0.0.0:8080"      # a non-loopback bind with auth.mode=none refuses to start unless allow_insecure: true
+  # allow_insecure: false     # explicitly allow a non-loopback unauthenticated bind (behind an authenticated proxy)
   base_url: "https://harbor.example.com"
   auth:
     mode: bearer
@@ -1216,20 +1226,20 @@ server:
 sandbox:
   workdir_root: "/srv/workspaces"
   allow_outside: false
-  isolation: shared          # shared | worktree | copy（见 §6.7）
+  isolation: shared          # shared | worktree | copy
   inherit_env: true
-  cli_home: "/srv/harbor-cli-home"   # 可选：把 CLI config/home 重定向到此（见 §10.3）
-  state_dir: "/var/lib/harbor"       # 运行时状态（孤儿进程记录）；默认临时目录
+  cli_home: "/srv/harbor-cli-home"   # optional: redirect the CLI config/home here
+  state_dir: "/var/lib/harbor"       # runtime state (orphan records); defaults to the temp dir
   default_timeout: 30m
   max_concurrent: 8
-  # container: { image: "harbor/claude:latest", network: none }  # 可选强隔离（§9）
+  # container: { image: "harbor/claude:latest", network: none }  # optional strong isolation
 
 agents:
   - id: claude
     display_name: "Claude Code"
     binary: claude
     integration: stream-json
-    # prompt 经 stdin 的 stream-json user message 传入（非位置参数）
+    # the prompt is delivered via a stdin stream-json user message (not as an argument)
     args:
       - "-p"
       - "--input-format"; "stream-json"
@@ -1239,7 +1249,7 @@ agents:
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "--continue" }
     allow_dangerous: false
     env:
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"   # 凭据/网关变量见 §5.4
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"   # credential/gateway variables
     limits: { max_concurrent: 3, timeout: 30m, idle_timeout: 5m }
 
   - id: codebuddy
@@ -1247,64 +1257,64 @@ agents:
     integration: stream-json
     args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages"]
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
-    sdk_capabilities: true   # 允许 agent 通过 AskUserQuestion 提问（作为 input-required）
+    sdk_capabilities: true   # let the agent ask via AskUserQuestion (as input-required)
     env:
-      CODEBUDDY_API_KEY: "${CODEBUDDY_API_KEY}"   # 可选：CODEBUDDY_BASE_URL / CODEBUDDY_MODEL
+      CODEBUDDY_API_KEY: "${CODEBUDDY_API_KEY}"   # optional: CODEBUDDY_BASE_URL / CODEBUDDY_MODEL
 
   - id: opencode
     binary: opencode
     integration: exec
     parser: text
-    args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]   # opencode run 仅支持位置参数
+    args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]   # opencode run takes positional args only
     session: { id_flag: "--session", continue_flag: "--continue" }
     env:
-      OPENCODE_API_KEY: "${OPENCODE_API_KEY}"     # 或 provider key（ANTHROPIC_API_KEY 等）
+      OPENCODE_API_KEY: "${OPENCODE_API_KEY}"     # or a provider key (ANTHROPIC_API_KEY, ...)
 
   - id: codex
     binary: codex
     integration: exec
     parser: text
-    args: ["exec", "-"]        # prompt 经 stdin 传入（避免 argv 限制）
+    args: ["exec", "-"]        # prompt is passed via stdin (avoids argv limits)
     env:
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"         # 或 CODEX_API_KEY / CODEX_ACCESS_TOKEN
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"         # or CODEX_API_KEY / CODEX_ACCESS_TOKEN
 
-  # ACP 模式：内建 Launcher，经 stdio 驱动 CLI 的 ACP 模式（不做运行时协商）
-  # 同一 CLI 支持多模式时：静态二选一，或注册为两个 agent（两张卡，客户端自选）
+  # ACP mode: a built-in launcher drives the CLI's ACP mode over stdio (no runtime negotiation)
+  # When a CLI supports several modes, pick one statically or register two agents (two cards)
   - id: opencode-acp
     binary: opencode
     integration: acp
-    # opencode 的 ACP 子命令由内建 profile 默认提供 args: ["acp"]，可省略
+    # the built-in profile supplies the default args: ["acp"], so this may be omitted
     args: ["acp"]
   - id: codebuddy-acp
     binary: codebuddy
     integration: acp
     args: ["--acp"]
-  # …同时可保留上面的 codebuddy(stream-json)，两者互不影响
+  # ...the codebuddy(stream-json) agent above can coexist with this one
 
-  # server 模式（opencode）：Harbor 懒启动 `opencode serve` 并复用其 session
+  # server mode (opencode): Harbor lazily starts `opencode serve` and reuses its session
   - id: opencode-server
     binary: opencode
     integration: server
-    # server_url: "http://127.0.0.1:4096"   # 可选：连接既有实例而非自行启动
+    # server_url: "http://127.0.0.1:4096"   # optional: connect to an existing instance
 
-  # server 模式（codebuddy，HTTP API）：`codebuddy --serve` 的 runs API（回合级），conversation 复用
+  # server mode (codebuddy, HTTP API): the `codebuddy --serve` runs API (turn-level), reused by conversation
   - id: codebuddy-server
     binary: codebuddy
     integration: server
-    # server_protocol: http   # 默认
+    # server_protocol: http   # default
 
-  # server 模式（codebuddy，ACP over HTTP）：同一 `--serve` 的 /api/v1/acp，能力与 --acp 一致
+  # server mode (codebuddy, ACP over HTTP): the same `--serve` /api/v1/acp, same capabilities as --acp
   - id: codebuddy-server-acp
     binary: codebuddy
     integration: server
     server_protocol: acp
 
-  # server 模式（codex）：Harbor 启动 `codex app-server`（stdio JSON-RPC），thread 复用
+  # server mode (codex): Harbor starts `codex app-server` (stdio JSON-RPC), reuse by thread
   - id: codex-server
     binary: codex
     integration: server
 
-  # 零代码扩展：任意 CLI
+  # zero-code extension: any CLI
   - id: my-coder
     binary: my-coder
     integration: exec
@@ -1322,10 +1332,10 @@ agents:
 card, _ := agentcard.DefaultResolver.Resolve(ctx, "https://harbor.example.com/agents/codebuddy")
 client, _ := a2aclient.NewFromCard(ctx, card)
 
-msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("修复 pkg/foo 的失败测试"))
+msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("fix the failing test in pkg/foo"))
 stream, err := client.SendStreamingMessage(ctx, &a2a.SendMessageRequest{Message: msg})
 for event, err := range stream {
-    // 处理 TaskArtifactUpdateEvent / TaskStatusUpdateEvent
+    // handle TaskArtifactUpdateEvent / TaskStatusUpdateEvent
 }
 ```
 
@@ -1372,9 +1382,9 @@ codebuddy
 | **M1 骨架** | Go module、Adapter/Parser/Runner、Registry、A2A server 装配；**codebuddy（`stream-json`，证明完整架构）+ opencode（`exec`，能力受限）**；**Bearer 鉴权 + 安全联锁**；**CLI home 隔离 + `Probe` 认证探测**（§10）；逐 token 流式；工作目录校验绑定 context（§6.7）。 |
 | **M2 可靠性与测试** | 假 CLI 夹具 + golden 测试；并发配额 / 超时 / 取消；SSE 节流；崩溃恢复、孤儿清理、**熔断/健康**（§11.1/§11.2）。 |
 | **M3 多 Agent 宽度** | codex（独立 JSONL Parser）、generic 配置 Adapter、claude 顺带；多 agent 路由与多卡片。 |
-| **M4 产出与交互完善** | ~~代码变更 artifact（diff / 文件，见 §6.8）~~（已落地）、~~push notifications~~（已落地）、~~交互规范化（Canonical interaction + `input-required` DataPart + Card 扩展，见 §7.4）~~（已落地，ACP 路径）、完整交互降级矩阵（question / plan_approval / `--resume` 有损注入）、durable interaction。 |
-| **M5 安全与运维** | 容器 / worktree 沙箱、~~指标~~（已落地，Prometheus 文本）、~~审计日志~~（已落地，slog）、~~持久化 TaskStore~~（已落地，JSON 文件）。 |
-| **M6 进阶** | ~~ACP 集成模式~~（已落地，stdio）、~~server 集成模式（opencode `serve` / codebuddy `--serve` / codex `app-server`）~~（已落地）、~~服务级凭据（§10，模型 A）~~（已落地）、Go plugin 扩展。 |
+| **M4 产出与交互完善** | ~~代码变更 artifact（diff / 文件）~~、~~push notifications~~、~~交互规范化（Canonical interaction + `input-required` DataPart + Card 扩展）~~、~~完整交互降级矩阵（question / plan_approval / `--resume` 有损注入）~~、~~durable interaction~~（已落地）。 |
+| **M5 安全与运维** | ~~容器 / worktree 沙箱~~、~~指标~~（Prometheus 文本 + OTLP）、~~审计日志~~（slog）、~~持久化 TaskStore~~（JSON 文件）、~~限流~~、~~危险开关加固~~。 |
+| **M6 进阶** | ~~ACP 集成模式~~（已落地，stdio，含 codebuddy `streamable-http`）、~~server 集成模式（opencode `serve` / codebuddy `--serve` / codex `app-server`）~~（已落地）、~~服务级凭据（§10，模型 A）~~（已落地）、~~编译期 Adapter 注册表（§16 级别 3）~~（已落地）、~~Go plugin 扩展~~（已落地，实验性，§16）、~~REST/gRPC 传输、stdio ACP `session/load`、codex 附件参数、OTLP 指标/跨进程上下文~~（已落地，§7/§13）。 |
 
 ---
 
@@ -1437,26 +1447,26 @@ harbor/
 ├── cmd/harbor/main.go
 ├── internal/agent/
 │   ├── event.go          # Event / EventKind / Usage
-│   ├── launcher.go       # Launcher / Session 契约 + line-based 实现（用 Adapter/Parser/Runner）
-│   ├── adapter.go        # Adapter / Invocation / Info 接口 + 注册表
-│   ├── parser.go         # Parser 接口 + parser 注册表
-│   ├── runner.go         # 进程执行 / stdout 泵 / 进程组取消
-│   ├── session.go        # LiveSessions（taskID → Session）
-│   └── registry.go       # agentID → entry(card, launcher, sem)
+│   ├── launcher.go       # Launcher / Session contract + line-based impl
+│   ├── adapter.go        # Adapter / Invocation / Info interfaces + registry
+│   ├── parser.go         # Parser interface + parser registry
+│   ├── runner.go         # process execution / stdout pump / process-group cancel
+│   ├── session.go        # LiveSessions (taskID -> Session)
+│   └── registry.go       # agentID -> entry(card, launcher, sem)
 ├── internal/adapters/codebuddy/
-│   ├── adapter.go        # codebuddy Adapter（与 claude 同源；共用 stream-json Parser）
+│   ├── adapter.go        # codebuddy Adapter (same origin as claude; shared stream-json Parser)
 │   └── parser.go         # stream-json Parser
 ├── internal/adapters/opencode/
-│   └── adapter.go        # opencode Adapter（exec / text）
+│   └── adapter.go        # opencode Adapter (exec / text)
 ├── internal/a2a/
-│   ├── executor.go       # CLIExecutor（a2asrv.AgentExecutor）
-│   ├── card.go           # AgentCard 构建
-│   ├── discovery.go      # 聚合发现端点（codebuddy 兼容，§6.1.1）
-│   └── server.go         # 路由 / handler 装配
+│   ├── executor.go       # CLIExecutor (a2asrv.AgentExecutor)
+│   ├── card.go           # AgentCard construction
+│   ├── discovery.go      # aggregate discovery endpoint (codebuddy compat)
+│   └── server.go         # routing / handler assembly
 ├── internal/config/
-│   └── config.go         # agents.yaml 结构与校验
+│   └── config.go         # agents.yaml structure and validation
 ├── internal/session/
-│   └── store.go          # contextId ↔ cliSessionID（内存版）
+│   └── store.go          # contextId <-> cliSessionID (in-memory)
 ├── testdata/fake-cli/fake-codebuddy.sh
 ├── testdata/fake-cli/fake-opencode.sh
 ├── examples/agents.yaml
@@ -1491,7 +1501,7 @@ type Invocation struct {
     Args []string
     Env  []string
     Dir  string
-    Stdin io.Reader // claude/codebuddy：prompt 与后续答复写入此 stdin（duplex）
+    Stdin io.Reader // claude/codebuddy: the prompt and later answers are written here (duplex)
 }
 
 type Adapter interface {
@@ -1499,16 +1509,16 @@ type Adapter interface {
     Probe(ctx context.Context) Info
     Invocation(req *Request) (*Invocation, error)
     Parser() Parser
-    Capabilities() Capabilities // §7.2；M1 只填用到的字段
+    Capabilities() Capabilities
 }
 
 type Parser interface {
-    // Parse 处理一条 NDJSON/文本记录，回调产生 0..N 个事件。
+    // Parse handles one NDJSON/text record and emits 0..N events via out.
     Parse(rec []byte, out func(Event)) error
     Flush(out func(Event)) error
 }
 
-// 注册表：编译期注册，供配置按 id 取用。
+// Registry: compile-time registration, looked up by id from the config.
 func RegisterAdapter(id string, f func(cfg AdapterConfig) (Adapter, error))
 func NewAdapter(id string, cfg AdapterConfig) (Adapter, error)
 ```
@@ -1521,18 +1531,28 @@ func NewAdapter(id string, cfg AdapterConfig) (Adapter, error)
 package config
 
 type Config struct {
-    Version int            `yaml:"version"`
-    Server  ServerConfig   `yaml:"server"`
-    Sandbox SandboxConfig  `yaml:"sandbox"`
-    Agents  []AgentConfig  `yaml:"agents"`
+    Version   int            `yaml:"version"`
+    Server    ServerConfig   `yaml:"server"`
+    Sandbox   SandboxConfig  `yaml:"sandbox"`
+    Telemetry TelemetryConfig `yaml:"telemetry"` // OTLP traces/metrics
+    Plugins   []string       `yaml:"plugins"`     // Go plugin .so paths
+    Agents    []AgentConfig  `yaml:"agents"`
 }
 
 type ServerConfig struct {
-    Listen             string     `yaml:"listen"`
-    BaseURL            string     `yaml:"base_url"`
-    AllowInsecure      bool       `yaml:"allow_insecure"` // 允许非 loopback 无鉴权
-    Auth               AuthConfig `yaml:"auth"`
-    CORSAllowedOrigins []string   `yaml:"cors_allowed_origins"`
+    Listen             string          `yaml:"listen"`
+    BaseURL            string          `yaml:"base_url"`
+    AllowInsecure      bool            `yaml:"allow_insecure"` // allow a non-loopback unauthenticated bind
+    TaskStoreFile      string          `yaml:"task_store_file"`   // persist tasks (durable interaction)
+    SessionStoreDir    string          `yaml:"session_store_dir"` // persist CLI session ids per agent
+    Auth               AuthConfig      `yaml:"auth"`
+    CORSAllowedOrigins []string        `yaml:"cors_allowed_origins"`
+    RateLimit          *RateLimitConfig `yaml:"rate_limit"` // per-(caller, agent) token bucket
+}
+
+type RateLimitConfig struct {
+    PerMinute int `yaml:"per_minute"` // 0 disables
+    Burst     int `yaml:"burst"`      // default PerMinute
 }
 
 type AuthConfig struct {
@@ -1543,16 +1563,22 @@ type AuthConfig struct {
 type SandboxConfig struct {
     WorkdirRoot    string           `yaml:"workdir_root"`
     AllowOutside   bool             `yaml:"allow_outside"`
-    Isolation      string           `yaml:"isolation"` // shared | worktree | copy
-    InheritEnv     *bool            `yaml:"inherit_env"` // 默认 true（继承启动用户环境）
-    DefaultTimeout time.Duration    `yaml:"default_timeout"` // 总超时（空闲超时另见 §4.4）
-    MaxConcurrent  int              `yaml:"max_concurrent"`
-    Container      *ContainerConfig `yaml:"container"`       // 可选强隔离（§9）
+    Isolation      string           `yaml:"isolation"`       // shared | worktree | copy
+    IsolationRoot  string           `yaml:"isolation_root"`  // for worktree/copy
+    InheritEnv     *bool            `yaml:"inherit_env"`     // default true
+    CLIHome        string           `yaml:"cli_home"`        // redirect the CLI config/home
+    StateDir       string           `yaml:"state_dir"`       // orphan process records
+    Container      *ContainerConfig `yaml:"container"`       // optional strong isolation
+    RequireContainerForDangerous bool `yaml:"require_container_for_dangerous"` // dangerous-mode hardening
+    FileArtifacts                 bool   `yaml:"file_artifacts"`               // per-file artifacts
+    RawStreamDir                  string `yaml:"raw_stream_dir"`               // raw stream output dir
+    RawStreamCompress             bool   `yaml:"raw_stream_compress"`          // gzip raw stream files
 }
 
 type ContainerConfig struct {
     Image   string `yaml:"image"`
-    Network string `yaml:"network"` // none | bridge
+    Network string `yaml:"network"` // none (default) | bridge
+    Runtime string `yaml:"runtime"` // container runtime binary; default docker
 }
 
 type AgentConfig struct {
@@ -1560,13 +1586,18 @@ type AgentConfig struct {
     DisplayName    string            `yaml:"display_name"`
     Binary         string            `yaml:"binary"`
     Integration    string            `yaml:"integration"` // exec | stream-json | acp | server
-    Parser         string            `yaml:"parser"`      // exec 模式用：text | codex | regex
-    Args           []string          `yaml:"args"`        // acp 模式用其选定 ACP 子命令（opencode 由 profile 默认）
-    ServerURL      string            `yaml:"server_url"`       // server 模式：连接既有实例而非自行启动
-    ServerProtocol string            `yaml:"server_protocol"`  // server 模式协议：http（默认）| acp（codebuddy 的 serve 两种协议）
+    Parser         string            `yaml:"parser"`      // exec modes: text | codex | regex
+    Args           []string          `yaml:"args"`        // for acp, the ACP subcommand (opencode defaults from the profile)
+    ServerURL      string            `yaml:"server_url"`       // server: connect to an existing instance instead of spawning
+    ServerProtocol string            `yaml:"server_protocol"`  // server: http (default) | acp | acp-streamable-http
+    GRPCListen     string            `yaml:"grpc_listen"`      // optional: A2A gRPC listen address
     Env            map[string]string `yaml:"env"`
     AllowDangerous bool              `yaml:"allow_dangerous"`
-    SDKCaps        bool              `yaml:"sdk_capabilities"` // stream-json：首个 prompt 前声明 askUserQuestion，允许 agent 提问（§7.4）
+    SDKCaps        bool              `yaml:"sdk_capabilities"`  // stream-json: declare askUserQuestion before the first prompt
+    OutputSchemaArgs []string         `yaml:"output_schema_args"` // exec: structured output
+    FileArgs         []string         `yaml:"file_args"`          // exec: file attachments ({{.File}})
+    ImageArgs        []string         `yaml:"image_args"`         // exec: image attachments ({{.Image}}), e.g. codex ["-i","{{.Image}}"]
+    InputImage       []string         `yaml:"input_image"`        // accepted image MIME types (default from the profile)
     Session        SessionConfig     `yaml:"session"`
     Limits         LimitsConfig      `yaml:"limits"`
 }
@@ -1575,20 +1606,22 @@ type SessionConfig struct {
     IDFlag       string `yaml:"id_flag"`
     ResumeFlag   string `yaml:"resume_flag"`
     ContinueFlag string `yaml:"continue_flag"`
+    ForkFlag     string `yaml:"fork_flag"` // fork flag used when harbor.fork is set
 }
 
 type LimitsConfig struct {
     MaxConcurrent int            `yaml:"max_concurrent"`
     Timeout       time.Duration  `yaml:"timeout"`
-    MaxTurns      int            `yaml:"max_turns"`
-    Breaker       *BreakerConfig `yaml:"breaker"` // §11.2
+    IdleTimeout   time.Duration  `yaml:"idle_timeout"` // fail with no events for this long
+    MaxTurns      int            `yaml:"max_turns"`    // max turns (start + resume) per task
+    Breaker       *BreakerConfig `yaml:"breaker"`      // failure circuit breaker
 }
 
 type BreakerConfig struct {
-    Threshold   int           `yaml:"threshold"`    // 连续失败阈值
-    Window      time.Duration `yaml:"window"`       // 计数窗口
-    Cooldown    time.Duration `yaml:"cooldown"`     // open 初始时长
-    MaxCooldown time.Duration `yaml:"max_cooldown"` // 退避上限
+    Threshold   int           `yaml:"threshold"`    // consecutive failures to open
+    Window      time.Duration `yaml:"window"`       // counting window
+    Cooldown    time.Duration `yaml:"cooldown"`     // initial open duration
+    MaxCooldown time.Duration `yaml:"max_cooldown"` // backoff cap
 }
 ```
 
@@ -1601,73 +1634,75 @@ type Process struct {
     cmd      *exec.Cmd
     pgid     int
     stdin    io.WriteCloser
-    done     chan struct{}  // 进程退出后 close，供 Kill 判定
-    canceled atomic.Bool    // Kill 置位；抑制取消后产生的假错误
+    done     chan struct{}  // closed when the process exits; used by Kill
+    canceled atomic.Bool    // set by Kill; suppresses spurious post-cancel errors
 }
 
-// Start 运行 CLI 并把 stdout 逐行喂给 Parser；taskID 供 Cancel 精确定位。
+// Start runs the CLI and feeds stdout line by line to the Parser; taskID lets
+// Cancel target the exact process.
 func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Parser) (<-chan Event, error) {
     ctx, cancel := context.WithCancel(ctx)
-    cmd := exec.CommandContext(ctx, inv.Bin, inv.Args...) // 与 ctx 绑定
+    cmd := exec.CommandContext(ctx, inv.Bin, inv.Args...) // bound to ctx
     cmd.Dir = inv.Dir
-    cmd.Env = sandboxEnv(inv.Env) // 始终显式构造完整 env（含 PATH/HOME）；不隐式继承父环境
+    cmd.Env = sandboxEnv(inv.Env) // always build the full env explicitly; do not inherit the parent implicitly
 
-    setProcessGroup(cmd) // 平台相关：unix=Setpgid；windows=Job Object（build tag，见 §10.3）
+    setProcessGroup(cmd) // platform-specific: unix=Setpgid; windows=Job Object (build tag)
 
     stdout, _ := cmd.StdoutPipe()
     stdin, _ := cmd.StdinPipe()
     var stderr bytes.Buffer
     cmd.Stderr = &stderr
-    if err := cmd.Start(); err != nil { cancel(); return nil, classifyStartErr(err) } // ENOENT→cli_not_found 等
+    if err := cmd.Start(); err != nil { cancel(); return nil, classifyStartErr(err) } // ENOENT -> cli_not_found, etc.
 
-    // duplex 上行：先写首条消息，之后保持管道打开供 Session.Send 继续写
+    // duplex uplink: write the first message, then keep the pipe open for Session.Send
     if inv.Stdin != nil {
         go func() { _, _ = io.Copy(stdin, inv.Stdin) }()
     }
 
     out := make(chan Event, 64)
     proc := &Process{cmd: cmd, pgid: cmd.Process.Pid, stdin: stdin, done: make(chan struct{})}
-    r.procs.Store(taskID, proc) // 先登记，避免“进程已退出/Cancel 先到”找不到 key
+    r.procs.Store(taskID, proc) // register first, so an early exit/Cancel still finds the key
 
     go func() {
         defer close(out); defer close(proc.done); defer cancel()
         rd := bufio.NewReaderSize(stdout, 64*1024)
         for {
-            line, err := rd.ReadBytes('\n') // 不设行长上限，避免大记录被 Scanner 截断
+            line, err := rd.ReadBytes('\n') // no line-length cap, so large records are not truncated
             if len(line) > 0 {
-                rec := append([]byte(nil), line...) // 必须复制：Raw 会随事件送出，不能引用复用缓冲
+                rec := append([]byte(nil), line...) // copy: Raw is sent with the event, so the buffer must not be reused
                 if perr := p.Parse(rec, func(e Event) { out <- e }); perr != nil {
                     out <- Event{Kind: EventError, Err: fmt.Errorf("parse: %w", perr)}
                 }
             }
-            if err != nil { // io.EOF 或读错误
+            if err != nil { // io.EOF or a read error
                 if err != io.EOF { out <- Event{Kind: EventError, Err: err} }
                 break
             }
         }
         p.Flush(func(e Event) { out <- e })
-        if werr := cmd.Wait(); werr != nil && !proc.canceled.Load() { // 取消后的退出不报假错误
+        if werr := cmd.Wait(); werr != nil && !proc.canceled.Load() { // a post-cancel exit must not report a spurious error
             out <- Event{Kind: EventError, Err: fmt.Errorf("cli exit: %w; stderr=%s", werr, stderr.String())}
         }
     }()
     return out, nil
 }
 
-// Kill 先对进程组 SIGTERM，宽限期后 SIGKILL；进程已退出则不再补刀。
+// Kill sends SIGTERM to the process group, then SIGKILL after a grace period; a
+// process that already exited is left alone.
 func (r *Runner) Kill(taskID string) {
     v, ok := r.procs.LoadAndDelete(taskID)
     if !ok { return }
     p := v.(*Process)
-    p.canceled.Store(true)          // 抑制随后的退出错误
-    signalGroup(p, syscall.SIGTERM) // 平台相关
+    p.canceled.Store(true)          // suppress the subsequent exit error
+    signalGroup(p, syscall.SIGTERM) // platform-specific
     select {
-    case <-p.done: // 已退出
+    case <-p.done: // already exited
     case <-time.After(5 * time.Second):
         signalGroup(p, syscall.SIGKILL)
     }
 }
 
-// Stdin 返回进程的 stdin，供 lineSession.Send 写回（duplex）。
+// Stdin returns the process stdin, for lineSession.Send to write back (duplex).
 func (r *Runner) Stdin(taskID string) io.WriteCloser {
     if v, ok := r.procs.Load(taskID); ok { return v.(*Process).stdin }
     return nil
@@ -1681,21 +1716,21 @@ func (r *Runner) Stdin(taskID string) io.WriteCloser {
 ```go
 type lineSession struct {
     events <-chan Event
-    stdin  io.WriteCloser // 复用 Runner 的 Process.stdin
+    stdin  io.WriteCloser // reuses Runner's Process.stdin
     kill   func()         // Runner.Kill(taskID)
 }
 
 func (s *lineSession) Events() <-chan Event { return s.events }
 func (s *lineSession) Send(_ context.Context, in Input) error {
-    _, err := s.stdin.Write(encodeInput(in)) // 权限/澄清答复 → 同一 stdin（duplex）
+    _, err := s.stdin.Write(encodeInput(in)) // permission/clarification answers go to the same stdin (duplex)
     return err
 }
 func (s *lineSession) Cancel() error { s.kill(); return nil }
 func (s *lineSession) Wait() error   { return nil }
 
-// lineLauncher.Start：构造 Invocation → Runner.Start → 包装为 Session
+// lineLauncher.Start: build Invocation -> Runner.Start -> wrap as a Session.
 func (l *lineLauncher) Start(ctx context.Context, req *Request) (Session, error) {
-    taskID := agent.TaskIDFrom(ctx) // §6.3：Executor 经 ctx 传入
+    taskID := agent.TaskIDFrom(ctx) // passed by the Executor via ctx
     inv, err := l.adapter.Invocation(req)
     if err != nil { return nil, err }
     events, err := l.runner.Start(ctx, taskID, inv, l.adapter.Parser())
@@ -1713,8 +1748,9 @@ func (l *lineLauncher) Start(ctx context.Context, req *Request) (Session, error)
 ### A.7 codebuddy Adapter + stream-json Parser
 
 ```go
-// codebuddy（与 claude 同源）：prompt 经 stdin 的 stream-json user message 传入，非位置参数。
-// 这样 stdout/stderr 之外还保留 stdin 作为“上行”，Session 天然双向。
+// codebuddy (same origin as claude): the prompt is delivered via a stdin stream-json
+// user message, not as an argument. This keeps stdin as the uplink, so the Session
+// is naturally bidirectional.
 func (a *codebuddyAdapter) Invocation(req *Request) (*Invocation, error) {
     args := []string{
         "-p",
@@ -1731,7 +1767,7 @@ func (a *codebuddyAdapter) Invocation(req *Request) (*Invocation, error) {
     if req.Model != ""       { args = append(args, "--model", req.Model) }
     if req.SystemExtra != "" { args = append(args, "--append-system-prompt", req.SystemExtra) }
     if a.cfg.AllowDangerous  { args = append(args, "--dangerously-skip-permissions") }
-    // 首条消息（含多模态 Part）编码为 stream-json，写入 stdin
+    // the first message (including multimodal parts) is encoded as stream-json on stdin
     return &Invocation{
         Bin:   a.cfg.Binary,
         Args:  args,
@@ -1745,12 +1781,13 @@ func (a *codebuddyAdapter) Invocation(req *Request) (*Invocation, error) {
 > 对应 `Session.Send`：任务进行中把权限/澄清答复再编码为 stream-json 写入同一 stdin；`--input-format stream-json` 允许同一进程收发多轮。
 
 ```go
-// parser.go：识别 stream-json 事件（codebuddy/claude 共用）
-// 注意：parser 带内部状态 sawDelta；开启 partial 后，assistant 的 text 不再重复发出。
+// parser.go: recognizes stream-json events (shared by codebuddy/claude)
+// Note: the parser carries internal state (sawDelta); with partial messages enabled,
+// the assistant text is not emitted twice.
 func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
     var raw map[string]json.RawMessage
     if err := json.Unmarshal(rec, &raw); err != nil {
-        out(Event{Kind: EventTextDelta, Text: string(rec) + "\n", Raw: rec}) // 宽松兜底
+        out(Event{Kind: EventTextDelta, Text: string(rec) + "\n", Raw: rec}) // lenient fallback
         return nil
     }
     var typ string
@@ -1760,14 +1797,14 @@ func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
         var s struct{ SessionID string `json:"session_id"` }
         _ = json.Unmarshal(rec, &s)
         out(Event{Kind: EventSession, SessionID: s.SessionID, Raw: rec})
-    case "stream_event": // --include-partial-messages：逐 token
+    case "stream_event": // --include-partial-messages: per token
         p.sawDelta = true
         if t := extractDelta(rec); t != "" { out(Event{Kind: EventTextDelta, Text: t, Raw: rec}) }
-    case "assistant": // 完整助手消息（含 text / thinking / tool_use）
+    case "assistant": // a full assistant message (text / thinking / tool_use)
         for _, b := range extractBlocks(rec) {
             switch b.Type {
             case "text":
-                // 已开启 partial 时，文本已由 stream_event 发出，避免重复
+                // with partial enabled the text was already emitted by stream_event
                 if b.Text != "" && !p.sawDelta { out(Event{Kind: EventTextDelta, Text: b.Text, Raw: rec}) }
             case "thinking":
                 out(Event{Kind: EventThinking, Text: b.Text, Raw: rec})
@@ -1775,7 +1812,7 @@ func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
                 out(Event{Kind: EventToolCall, Tool: b.Name, ToolInput: b.Input, Raw: rec})
             }
         }
-    case "user": // tool_result 回传（可选观测）
+    case "user": // tool_result echoed back (optional observability)
         for _, b := range extractBlocks(rec) {
             if b.Type == "tool_result" { out(Event{Kind: EventToolResult, Raw: rec}) }
         }
@@ -1789,7 +1826,7 @@ func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
         }
         _ = json.Unmarshal(rec, &r)
         if r.IsError { out(Event{Kind: EventError, Err: errors.New(r.Result), Raw: rec}); return nil }
-        // result 的文本仅在未走 partial 时作为最终文本发出，避免与增量重复
+        // the result text is emitted only when partial was not used, to avoid duplication
         if !p.sawDelta { out(Event{Kind: EventTextFinal, Text: r.Result, SessionID: r.SessionID, Usage: r.Usage, Raw: rec}) }
         out(Event{Kind: EventDone, Raw: rec})
     }
@@ -1807,13 +1844,13 @@ func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
 func (e *CLIExecutor) toRequest(ctx context.Context, ec *a2asrv.ExecutorContext) (*agent.Request, error) {
     prompt := firstTextPart(ec.Message)
     if prompt == "" { return nil, errors.New("no text part in message") }
-    sid, _ := e.sessions.Get(ec.ContextID()) // 续跑
+    sid, _ := e.sessions.Get(ec.ContextID()) // resume
     return &agent.Request{
         Prompt:      prompt,
         SystemExtra: metaString(ec.Message, "harbor.systemPrompt"),
         Model:       metaString(ec.Message, "harbor.model"),
         Agent:       metaString(ec.Message, "harbor.agent"),
-        WorkDir:     e.workdirFor(ec), // 受 sandbox 约束（§6.7）
+        WorkDir:     e.workdirFor(ec), // constrained by the sandbox
         SessionID:   sid,
         Continue:    sid == "" && metaBool(ec.Message, "harbor.continue"),
         MaxTurns:    metaInt(ec.Message, "harbor.maxTurns"),
@@ -1836,16 +1873,16 @@ func main() {
     }
     mux := http.NewServeMux()
 
-    rpcAuth := func(h http.Handler) http.Handler { // 鉴权只包 RPC，不包卡片（§9）
+    rpcAuth := func(h http.Handler) http.Handler { // auth wraps only the RPC, not the card
         if cfg.Server.Auth.Mode == "bearer" { return auth.Middleware(cfg.Server.Auth, h) }
         return h
     }
-    // M1 要求配置 BaseURL；按请求 origin（X-Forwarded-*）解析为后续增强（§6.1.1）
-    endpoint := func(id string) string { return cfg.Server.BaseURL + "/agents/" + id + "/" } // 带尾斜杠
+    // BaseURL is required; resolving from the request origin (X-Forwarded-*) is a later enhancement
+    endpoint := func(id string) string { return cfg.Server.BaseURL + "/agents/" + id + "/" } // trailing slash
 
-    cards := make([]*a2a.AgentCard, 0, len(cfg.Agents)) // 一次构建，供 单卡/首卡/聚合 复用
+    cards := make([]*a2a.AgentCard, 0, len(cfg.Agents)) // built once, reused by single/first/aggregate
     for _, ac := range cfg.Agents {
-        // 构造 Launcher（line-based=exec/stream-json 或 acp）；内部使用 Adapter/Parser/Runner
+        // build the launcher (line-based=exec/stream-json or acp); uses Adapter/Parser/Runner
         ln, err := agent.NewLauncher(ac.Integration, ac)
         if err != nil { slog.Warn("agent disabled", "id", ac.ID, "err", err); continue }
         info := ln.Probe(context.Background())
@@ -1854,23 +1891,24 @@ func main() {
         exec := a2a.NewCLIExecutor(ln, session.NewMemStore(), a2a.NewLiveSessions())
         h := a2asrv.NewHandler(exec,
             a2asrv.WithLogger(slog.Default()),
-            // 注意：这是“无事件”空闲超时；总超时由 Runner/Session 按 ac.Limits.Timeout 强制（§4.4）
+            // note: this is the "no events" idle timeout; the total timeout is enforced
+            // by Runner/Session from ac.Limits.Timeout
             a2asrv.WithAgentInactivityTimeout(10*time.Minute),
         )
 
-        ep := endpoint(ac.ID)               // /agents/{id}/（带尾斜杠，与卡片 url 一致）
-        card := a2a.BuildCard(ln, info, ep) // 卡片 url = ep
+        ep := endpoint(ac.ID)               // /agents/{id}/ (trailing slash, matching the card url)
+        card := a2a.BuildCard(ln, info, ep) // card url = ep
         cards = append(cards, card)
 
-        mux.Handle(ep, rpcAuth(a2asrv.NewJSONRPCHandler(h)))                                 // RPC：需 Bearer
-        mux.Handle(ep+".well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(card)) // 单卡：公开
+        mux.Handle(ep, rpcAuth(a2asrv.NewJSONRPCHandler(h)))                                 // RPC: requires Bearer
+        mux.Handle(ep+".well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(card)) // single card: public
     }
 
-    // 标准首卡 + 兼容聚合发现（codebuddy，§6.1.1；始终提供）
+    // standard first card + compatibility aggregate discovery (codebuddy); always served
     if len(cards) > 0 {
         mux.Handle("/.well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(cards[0]))
     }
-    mux.Handle(a2a.DiscoveryPath, a2a.NewCardsHandler(cards)) // 聚合：公开，固定路径
+    mux.Handle(a2a.DiscoveryPath, a2a.NewCardsHandler(cards)) // aggregate: public, fixed path
 
     slog.Info("harbor listening", "addr", cfg.Server.Listen)
     _ = http.ListenAndServe(cfg.Server.Listen, corsMiddleware(cfg.Server.CORSAllowedOrigins, mux))
@@ -1885,7 +1923,7 @@ func main() {
 
 ```bash
 #!/usr/bin/env bash
-# 模拟 codebuddy（stream-json）：先 init，再两段文本，最后 result
+# simulates codebuddy (stream-json): init, two text chunks, then result
 echo '{"type":"system","subtype":"init","session_id":"sess-123"}'
 sleep 0.05
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Hello "}]},"session_id":"sess-123"}'
@@ -1894,7 +1932,7 @@ echo '{"type":"assistant","message":{"content":[{"type":"text","text":"world"}]}
 echo '{"type":"result","subtype":"success","result":"Hello world","session_id":"sess-123","is_error":false}'
 ```
 
-`testdata/fake-cli/fake-opencode.sh`（exec/text，模拟逐段 stdout 输出）。
+`testdata/fake-cli/fake-opencode.sh` (exec/text, simulating chunked stdout).
 
 测试用例（`e2e_test.go`，用 httptest + 上述脚本，通过配置 `binary` 指向脚本）：
 
@@ -1924,7 +1962,7 @@ a2a send http://localhost:8080/agents/opencode  "list files"
 2. **prompt 传递方式（已定，M1）**：claude/codebuddy **直接用 `--input-format stream-json` + stdin**，prompt 作为首条 stream-json user message 写入 stdin，**不用位置参数**。理由：① 这是唯一能原生支持 `input-required`（权限/澄清）双向应答的形态，与 §4.5 的 `Session.Send` 契约一致；② 规避 argv 长度/转义限制，天然承载 §7.5 的结构化/多模态输入；③ 用位置参数＝一次性 Session，`Send` 无法实现，等于把 §7.4 的降级路径焊死、后期必返工。故**不因“简单”而选位置参数**。（仅当 CLI 无结构化输入能力时才退回文本，如 codex `exec` 经 stdin 传 prompt。）
 3. **工作目录（已定）**：以 `Message.Metadata["harbor.workDir"]` 为主来源，realpath 校验必须落在 `workdir_root` 内，并**绑定到 `contextId`**（`--resume` 复用同一工作树）；未指定时按 context 分配 scratch 子目录；并发隔离用 `worktree`/目录锁策略（详见 §6.7）。
 4. **鉴权（已定）**：M1 即实现 **Bearer 静态 token 中间件**（注入 `CallContext.User`），并加**安全联锁**：`listen` 非 loopback 且 `auth.mode=none` 时拒绝启动，除非显式 `allow_insecure: true`（反代/网格已鉴权）。**OAuth2 / mTLS / 细粒度授权明确不支持**（YAGNI）。CLI 自身的 provider 登录见 §10。理由：可达的无鉴权端点＝远程 RCE，不能作为默认，且 M1 完成 AgentCard 的 `securitySchemes`。
-5. **危险开关（已定）**：`allow_dangerous` 是**纯配置项**（`agents[].allow_dangerous`，默认 `false`），由部署方显式设置；**不提供环境变量旁路**（隐藏开关会破坏“显式 opt-in + 可审计”）。本地调试请用独立的 debug config 文件。可选加固：`allow_dangerous: true` 要求同时开启容器沙箱，否则拒绝启动。
+5. **危险开关（已定）**：`allow_dangerous` 是**纯配置项**（`agents[].allow_dangerous`，默认 `false`），由部署方显式设置；**不提供环境变量旁路**（隐藏开关会破坏“显式 opt-in + 可审计”）。本地调试请用独立的 debug config 文件。加固（已落地）：`sandbox.require_container_for_dangerous: true` 时，`allow_dangerous: true` 要求同时开启容器沙箱，否则 `config.Load` 拒绝启动。
 6. **模块路径/命名（已定）**：`github.com/jiaweisky/harbor`（对应 repo `https://github.com/jiaweisky/harbor.git`）。
 7. **codex 适配（已定，M3）**：已确认非交互入口 `codex exec`、事件流 `--json`（JSONL）、结构化输出 `--output-schema`、常驻 `app-server`、续跑 `codex exec resume`。**为何需独立 Parser**：JSONL 只是分帧，codex 的 item/turn 事件 schema 与 claude 的 message/`content_block`  schema 不同，Parser 必须先归一化，配置/正则无法可靠映射嵌套事件（仅多注册一个 Parser，其余全部复用）。**为何不在 M1**：M1 追求“用最少的 adapter 打通链路”，codebuddy 的 stream-json 覆盖构造最全且与 claude 共用 Parser，投入即覆盖 2 个 agent；codex 只增宽度、不验证新架构点，故归 M3「多 Agent」。可按需提前到 M2。
 8. **能力模型落地范围（已定，M1）**：M1 即引入 `Capabilities` 类型与 `Adapter.Capabilities()`，由 AgentCard 投影读取；**只填 M1 用到的字段**（文本 in/out、逐 token 流式、会话续跑、权限模型），其余留默认零值。理由：能力从第一天就是单一事实来源（§7.2），避免 M2 返工；成本仅多一个结构体，非过度设计。

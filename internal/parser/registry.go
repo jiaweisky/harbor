@@ -1,7 +1,7 @@
 // Package parser normalizes raw coding-agent CLI output into agent.Events.
 //
 // Parsers register themselves by name, so a new output format is a new file
-// that calls RegisterParser from its init — no central switch to edit.
+// that calls RegisterParser from its init, so no central switch needs editing.
 package parser
 
 import (

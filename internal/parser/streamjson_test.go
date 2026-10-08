@@ -108,6 +108,47 @@ func TestStreamJSONPartialDedup(t *testing.T) {
 	}
 }
 
+func TestStreamJSONElicitationForm(t *testing.T) {
+	p := parser.NewStreamJSON()
+	rec := `{"type":"control_request","request_id":"el_1",` +
+		`"request":{"subtype":"elicitation_create","mode":"form","message":"Pick a color",` +
+		`"requestedSchema":{"type":"object","properties":{"color":{"type":"string","enum":["red","blue"]}},` +
+		`"required":["color"]}}}`
+
+	evs := collect(t, p, rec)
+	if len(evs) != 1 || evs[0].Kind != agent.EventPermissionRequest {
+		t.Fatalf("elicitation_create: %+v", evs)
+	}
+	itx := evs[0].Interaction
+	if itx == nil || itx.Kind != agent.InteractionQuestion || itx.Action != "form" || itx.ID != "el_1" {
+		t.Fatalf("interaction = %+v, want a form question", itx)
+	}
+	if itx.Schema == nil {
+		t.Fatal("form interaction should carry the requested schema")
+	}
+	if len(itx.Options) != 2 || itx.Options[0] != "red" || itx.Options[1] != "blue" {
+		t.Fatalf("options = %v, want [red blue]", itx.Options)
+	}
+}
+
+func TestStreamJSONExitPlanMode(t *testing.T) {
+	p := parser.NewStreamJSON()
+	rec := `{"type":"control_request","request_id":"plan_1",` +
+		`"request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"Create README"}}}`
+
+	evs := collect(t, p, rec)
+	if len(evs) != 1 || evs[0].Kind != agent.EventPermissionRequest {
+		t.Fatalf("ExitPlanMode: %+v", evs)
+	}
+	itx := evs[0].Interaction
+	if itx == nil || itx.Kind != agent.InteractionPlanApproval || itx.ID != "plan_1" {
+		t.Fatalf("interaction = %+v, want a plan approval", itx)
+	}
+	if len(itx.Options) == 0 {
+		t.Fatalf("plan approval should offer allow/deny: %+v", itx)
+	}
+}
+
 func TestStreamJSONStructuredOutput(t *testing.T) {
 	p := parser.NewStreamJSON()
 	rec := `{"type":"result","result":"done","is_error":false,` +
@@ -145,5 +186,31 @@ func TestStreamJSONAskUserQuestion(t *testing.T) {
 	}
 	if len(itx.Options) != 2 || itx.Options[0] != "Red" || itx.Options[1] != "Blue" {
 		t.Fatalf("options = %v, want [Red Blue]", itx.Options)
+	}
+}
+
+func TestStreamJSONAskUserQuestionMultiple(t *testing.T) {
+	p := parser.NewStreamJSON()
+	rec := `{"type":"control_request","request_id":"perm_qm",` +
+		`"request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion",` +
+		`"input":{"questions":[` +
+		`{"question":"Favorite color?","header":"Color","options":[{"label":"Red"},{"label":"Blue"}]},` +
+		`{"question":"Favorite animal?","header":"Animal","options":[{"label":"Cat"},{"label":"Dog"}]}]},` +
+		`"tool_use_id":"t1"}}`
+
+	evs := collect(t, p, rec)
+	if len(evs) != 1 || evs[0].Interaction == nil {
+		t.Fatalf("events = %+v", evs)
+	}
+	itx := evs[0].Interaction
+	if len(itx.Questions) != 2 {
+		t.Fatalf("questions = %+v, want 2", itx.Questions)
+	}
+	q := itx.Questions[1]
+	if q.Question != "Favorite animal?" || q.Header != "Animal" {
+		t.Fatalf("second question = %+v", q)
+	}
+	if len(q.Options) != 2 || q.Options[0] != "Cat" || q.Options[1] != "Dog" {
+		t.Fatalf("second options = %v, want [Cat Dog]", q.Options)
 	}
 }

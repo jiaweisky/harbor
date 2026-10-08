@@ -35,6 +35,7 @@ type Config struct {
 	MaxConcurrent   int
 	InheritEnv      bool
 	CLIHome         string
+	Container       *agent.ContainerSpec
 	VersionArgs     []string
 	VersionOverride string
 }
@@ -50,7 +51,7 @@ type Launcher struct {
 func NewLauncher(cfg Config) *Launcher {
 	return &Launcher{
 		cfg:    cfg,
-		runner: agent.NewRunner(cfg.MaxConcurrent, cfg.InheritEnv, cfg.CLIHome),
+		runner: agent.NewRunner(cfg.MaxConcurrent, cfg.InheritEnv, cfg.CLIHome, cfg.Container),
 	}
 }
 
@@ -115,11 +116,13 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	c.SetHandler(c)
 	d.setConn(c)
 
-	sessionID, err := handshake(ctx, c, cwd)
+	sessionID, err := handshake(ctx, c, cwd, req.SessionID)
 	if err != nil {
 		_ = s.Cancel()
 		return nil, err
 	}
+	// Report the session id so the executor can continue it in a later task.
+	c.emitEvent(agent.Event{Kind: agent.EventSession, SessionID: sessionID})
 	s.startPrompt(ctx, sessionID, req.Prompt)
 	return s, nil
 }
@@ -166,12 +169,30 @@ func openSession(ctx context.Context, c *conn, cwd string) (string, error) {
 }
 
 // handshake runs the ACP setup sequence for the stdio transport and returns the
-// new session id.
-func handshake(ctx context.Context, c *conn, cwd string) (string, error) {
+// session id: a load of resumeID when set (cross-task continuity), otherwise a
+// new session. If the CLI cannot load the session, a fresh one is created so the
+// task still runs (continuity is lost).
+func handshake(ctx context.Context, c *conn, cwd, resumeID string) (string, error) {
 	if err := initialize(ctx, c); err != nil {
 		return "", err
 	}
-	return openSession(ctx, c, cwd)
+	if resumeID == "" {
+		return openSession(ctx, c, cwd)
+	}
+	res, err := c.Conn.Request(ctx, "session/load", map[string]any{
+		"sessionId": resumeID, "cwd": cwd, "mcpServers": []any{},
+	})
+	if err != nil {
+		return openSession(ctx, c, cwd)
+	}
+	var ns newSessionResponse
+	if json.Unmarshal(res, &ns) == nil && ns.SessionID != "" {
+		c.setSessionID(ns.SessionID)
+		return ns.SessionID, nil
+	}
+	// session/load need not echo the id; keep the requested one.
+	c.setSessionID(resumeID)
+	return resumeID, nil
 }
 
 // session is one ACP prompt turn backed by a live CLI process.

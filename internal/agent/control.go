@@ -24,16 +24,27 @@ func EncodePermissionResponse(requestID, answer string) string {
 }
 
 // EncodeQuestionResponse encodes a stream-json control_response answering an
-// AskUserQuestion tool request (delivered as can_use_tool). The chosen answer is
-// injected through updatedInput.answers, keyed by the question text.
-func EncodeQuestionResponse(requestID, question, answer string) string {
+// AskUserQuestion tool request (delivered as can_use_tool). The chosen answers
+// are injected through updatedInput.answers, keyed by each question's text.
+func EncodeQuestionResponse(requestID string, answers map[string]string) string {
 	return controlResponse(requestID, map[string]any{
 		"allowed":  true,
 		"behavior": "allow",
 		"updatedInput": map[string]any{
-			"answers": map[string]any{question: answer},
+			"answers": answers,
 		},
 	})
+}
+
+// EncodeElicitationResponse encodes a stream-json control_response answering an
+// elicitation_create (form) request. action is "accept" (with content), or
+// "decline"/"cancel" (no content).
+func EncodeElicitationResponse(requestID, action string, content map[string]any) string {
+	inner := map[string]any{"action": action}
+	if len(content) > 0 {
+		inner["content"] = content
+	}
+	return controlResponse(requestID, inner)
 }
 
 // EncodeControlInitialize encodes the SDK capability handshake sent to a
@@ -45,8 +56,11 @@ func EncodeControlInitialize() string {
 		"type":       "control_request",
 		"request_id": "harbor-init",
 		"request": map[string]any{
-			"subtype":       "initialize",
-			"capabilities":  map[string]any{"askUserQuestion": true},
+			"subtype": "initialize",
+			"capabilities": map[string]any{
+				"askUserQuestion": true,
+				"elicitation":     map[string]any{"form": true},
+			},
 			"sdkMcpServers": []any{},
 			"hooks":         map[string]any{},
 		},

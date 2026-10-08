@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os/exec"
 	"sync/atomic"
@@ -38,6 +39,8 @@ type LauncherConfig struct {
 	InheritEnv bool
 	// CLIHome, when set, isolates the CLI's HOME and config roots under it.
 	CLIHome string
+	// Container, when set, runs the CLI inside a container.
+	Container *ContainerSpec
 	// VersionArgs is the flag(s) used to read the CLI version; nil skips probing.
 	VersionArgs []string
 	// VersionOverride, when set, is used verbatim instead of probing.
@@ -70,7 +73,7 @@ func NewHeadlessLauncher(cfg LauncherConfig) *HeadlessLauncher {
 		invoke:          cfg.Invoke,
 		env:             cfg.Env,
 		auth:            cfg.Auth,
-		runner:          NewRunner(cfg.MaxConcurrent, cfg.InheritEnv, cfg.CLIHome),
+		runner:          NewRunner(cfg.MaxConcurrent, cfg.InheritEnv, cfg.CLIHome, cfg.Container),
 		versionArgs:     cfg.VersionArgs,
 		versionOverride: cfg.VersionOverride,
 	}
@@ -138,18 +141,40 @@ func (s *lineSession) Send(_ context.Context, in Input) error {
 	if !s.duplex || s.stdin == nil {
 		return ErrUnsupported
 	}
-	// A permission or question interaction is answered with a control_response;
-	// any other input is a normal user turn written as a stream-json message.
-	switch in.Kind {
-	case string(InteractionPermission):
-		_, err := io.WriteString(s.stdin, EncodePermissionResponse(in.ID, in.Answer))
-		return err
-	case string(InteractionQuestion):
-		_, err := io.WriteString(s.stdin, EncodeQuestionResponse(in.ID, in.Target, in.Answer))
-		return err
+	// An interaction is answered with a control_response; any other input is a
+	// normal user turn written as a stream-json message.
+	var frame string
+	switch {
+	case in.Kind == string(InteractionPermission), in.Kind == string(InteractionPlanApproval):
+		frame = EncodePermissionResponse(in.ID, in.Answer)
+	case in.Kind == string(InteractionQuestion) && in.Action == "form":
+		action := "accept"
+		if in.Content == nil {
+			action = "decline"
+		}
+		frame = EncodeElicitationResponse(in.ID, action, in.Content)
+	case in.Kind == string(InteractionQuestion):
+		frame = EncodeQuestionResponse(in.ID, questionAnswers(in))
+	default:
+		frame = EncodeStreamJSONUserMessage(in.Answer)
 	}
-	_, err := io.WriteString(s.stdin, EncodeStreamJSONUserMessage(in.Answer))
+	_, err := io.WriteString(s.stdin, frame)
 	return err
+}
+
+// questionAnswers builds the question-to-answer map for a single- or multi-question
+// AskUserQuestion reply. A structured content map (keyed by question text) is
+// used when present; otherwise the single answer is keyed by the interaction's
+// target (the first question's text).
+func questionAnswers(in Input) map[string]string {
+	if len(in.Content) > 0 {
+		answers := make(map[string]string, len(in.Content))
+		for k, v := range in.Content {
+			answers[k] = fmt.Sprint(v)
+		}
+		return answers
+	}
+	return map[string]string{in.Target: in.Answer}
 }
 
 func (s *lineSession) Cancel() error {
@@ -180,13 +205,24 @@ func (lineParser) Flush(func(Event)) error { return nil }
 // EncodeStreamJSONUserMessage encodes a text-only stream-json user message.
 func EncodeStreamJSONUserMessage(text string) string { return EncodeStreamJSONInput(text, nil) }
 
-// EncodeStreamJSONInput encodes a stream-json user message with optional native
-// image content blocks (base64-encoded). It is used for the initial turn and,
-// with no images, for a lossy resume's injected text.
+// EncodeStreamJSONInput encodes a stream-json user message with a single text
+// block and optional native images. Used for a lossy resume's injected text.
 func EncodeStreamJSONInput(text string, images []Image) string {
-	content := make([]map[string]any, 0, len(images)+1)
+	var blocks []string
 	if text != "" {
-		content = append(content, map[string]any{"type": "text", "text": text})
+		blocks = []string{text}
+	}
+	return EncodeStreamJSONBlocks(blocks, images)
+}
+
+// EncodeStreamJSONBlocks encodes a stream-json user message from ordered text
+// blocks (one per message part) plus optional native image content blocks.
+func EncodeStreamJSONBlocks(blocks []string, images []Image) string {
+	content := make([]map[string]any, 0, len(blocks)+len(images))
+	for _, b := range blocks {
+		if b != "" {
+			content = append(content, map[string]any{"type": "text", "text": b})
+		}
 	}
 	for _, img := range images {
 		content = append(content, map[string]any{

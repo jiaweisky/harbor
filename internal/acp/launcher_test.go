@@ -2,6 +2,7 @@ package acp_test
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -80,6 +81,48 @@ loop:
 	}
 	if !answered {
 		t.Fatal("permission request was never answered")
+	}
+}
+
+// TestLauncherResumesSession verifies a request carrying a session id loads that
+// session (session/load) instead of creating a new one, and the id is reported.
+func TestLauncherResumesSession(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "acp.log")
+	ln := acp.NewLauncher(acp.Config{
+		Name: "acp", Binary: fakeACP(t), InheritEnv: true,
+		Env: []string{"FAKE_ACP_LOG=" + logPath},
+	})
+	ctx, cancel := context.WithTimeout(agent.WithTaskID(context.Background(), "t3"), 10*time.Second)
+	defer cancel()
+
+	sess, err := ln.Start(ctx, &agent.Request{Prompt: "hi", WorkDir: t.TempDir(), SessionID: "ses_prev"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sess.Cancel()
+
+	var sessionID string
+	for ev := range sess.Events() {
+		switch ev.Kind {
+		case agent.EventSession:
+			sessionID = ev.SessionID
+		case agent.EventPermissionRequest:
+			if err := sess.Send(ctx, agent.Input{Answer: "allow_once"}); err != nil {
+				t.Fatalf("send answer: %v", err)
+			}
+		case agent.EventError:
+			t.Fatalf("event error: %v", ev.Err)
+		}
+	}
+	if sessionID != "ses_fake" {
+		t.Fatalf("session id = %q, want ses_fake", sessionID)
+	}
+	rec, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if !strings.Contains(string(rec), "session/load") || !strings.Contains(string(rec), "ses_prev") {
+		t.Fatalf("expected a session/load for ses_prev, got:\n%s", rec)
 	}
 }
 

@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/jiaweisky/harbor/internal/telemetry"
 )
 
 // ErrCLINotFound indicates the CLI binary is missing or not executable.
@@ -28,6 +34,9 @@ type Process struct {
 	stopped  chan struct{}
 	stopOnce sync.Once
 	canceled atomic.Bool
+	span     trace.Span
+	rawOut   io.WriteCloser // raw stdout log (optional)
+	rawErr   io.WriteCloser // raw stderr log (optional)
 }
 
 // stop marks the process stopped and closes stopped so blocked event sends
@@ -37,24 +46,60 @@ func (p *Process) stop() {
 	p.stopOnce.Do(func() { close(p.stopped) })
 }
 
+// ContainerSpec runs a CLI inside a container for filesystem and network
+// isolation. Mounts lists host directories bind-mounted at identical paths
+// inside the container (the sandbox roots the CLI may touch), so paths inside
+// the container match the host and env vars such as PWD stay valid.
+type ContainerSpec struct {
+	Runtime string // container runtime binary (e.g. docker, podman)
+	Image   string
+	Network string   // none | bridge
+	Mounts  []string // host directories bind-mounted at their identical paths
+}
+
+// Raw stream logging is a process-wide, best-effort setting: when a directory
+// is configured, each CLI process's stdout and stderr are written there for
+// replay/debugging.
+var (
+	rawMu   sync.Mutex
+	rawDir  string
+	rawGzip bool
+)
+
+// SetRawStream configures raw stream logging (empty dir disables it). It is
+// process-global and should be set once at startup.
+func SetRawStream(dir string, compress bool) {
+	rawMu.Lock()
+	defer rawMu.Unlock()
+	rawDir, rawGzip = dir, compress
+}
+
+func rawStreamConfig() (string, bool) {
+	rawMu.Lock()
+	defer rawMu.Unlock()
+	return rawDir, rawGzip
+}
+
 // Runner spawns and supervises CLI subprocesses.
 type Runner struct {
 	sem        chan struct{}
 	inheritEnv bool
 	cliHome    string
+	container  *ContainerSpec
 	procs      sync.Map // taskID -> *Process
 }
 
 // NewRunner creates a Runner limiting concurrency to maxConcurrent (<=0 =
 // unbounded). When inheritEnv is false the child receives only an allowlisted
 // base environment plus the adapter-provided variables. When cliHome is set the
-// child's HOME (and XDG dirs) are redirected under it.
-func NewRunner(maxConcurrent int, inheritEnv bool, cliHome string) *Runner {
+// child's HOME (and XDG dirs) are redirected under it. When container is set the
+// CLI runs inside a container instead of directly on the host.
+func NewRunner(maxConcurrent int, inheritEnv bool, cliHome string, container *ContainerSpec) *Runner {
 	var sem chan struct{}
 	if maxConcurrent > 0 {
 		sem = make(chan struct{}, maxConcurrent)
 	}
-	return &Runner{sem: sem, inheritEnv: inheritEnv, cliHome: cliHome}
+	return &Runner{sem: sem, inheritEnv: inheritEnv, cliHome: cliHome, container: container}
 }
 
 // Start runs the CLI and streams normalized events parsed from its stdout.
@@ -63,17 +108,20 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 		return nil, err
 	}
 
-	// exec.Command (not CommandContext): cancellation is handled here so the
-	// whole process group is terminated, not just the direct child.
-	cmd := exec.Command(inv.Bin, inv.Args...)
-	cmd.Dir = inv.Dir
-	cmd.Env = buildEnv(r.inheritEnv, r.cliHome, inv.Env)
+	env := buildEnv(r.inheritEnv, r.cliHome, inv.Env)
 	// exec sets the child's working directory but leaves the inherited PWD
 	// pointing at the parent's; a CLI that reads PWD (not getcwd) would then run
 	// in the wrong directory. Keep PWD consistent with Dir.
 	if inv.Dir != "" {
-		cmd.Env = setEnv(cmd.Env, "PWD", inv.Dir)
+		env = setEnv(env, "PWD", inv.Dir)
 	}
+	bin, args := r.command(inv, env)
+
+	// exec.Command (not CommandContext): cancellation is handled here so the
+	// whole process group is terminated, not just the direct child.
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = inv.Dir
+	cmd.Env = env
 	setProcessGroup(cmd)
 
 	stdout, err := cmd.StdoutPipe()
@@ -86,10 +134,25 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 		r.release()
 		return nil, err
 	}
-	stderr := newLimitedBuffer(64 << 10)
-	cmd.Stderr = stderr
+	stderr, sink := stderrSink(inv)
+	cmd.Stderr = sink
+
+	// Optional raw stream logging (best effort; failures are ignored).
+	rawOut, rawErr := openRawStreams(taskID)
+	if rawErr != nil {
+		cmd.Stderr = io.MultiWriter(sink, rawErr)
+	}
+
+	// One span per CLI subprocess, linked to the requesting task's span via ctx.
+	// It ends when the process exits (see readLoop).
+	ctx, span := telemetry.Start(ctx, "harbor.cli",
+		attribute.String("process.executable.name", filepath.Base(inv.Bin)),
+		attribute.String("harbor.workdir", inv.Dir))
 
 	if err := cmd.Start(); err != nil {
+		span.End()
+		closeRaw(rawOut)
+		closeRaw(rawErr)
 		r.release()
 		return nil, classifyStartErr(err)
 	}
@@ -102,6 +165,9 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 		stdin:   stdin,
 		done:    make(chan struct{}),
 		stopped: make(chan struct{}),
+		span:    span,
+		rawOut:  rawOut,
+		rawErr:  rawErr,
 	}
 	r.procs.Store(taskID, proc)
 	if reg := activeProcs(); reg != nil {
@@ -111,6 +177,47 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 	go r.readLoop(stdout, p, out, stderr, proc, taskID)
 
 	return out, nil
+}
+
+// stderrSink returns the writer for cmd.Stderr and the value used to report
+// stderr in errors. When inv.StderrLine is set, lines are also forwarded (so a
+// spawner can read a server's listening address from stderr); otherwise stderr
+// is only retained, bounded, for diagnostics.
+func stderrSink(inv *Invocation) (fmt.Stringer, io.Writer) {
+	if inv.StderrLine != nil {
+		sw := newStderrWriter(inv.StderrLine)
+		return sw, sw
+	}
+	buf := newLimitedBuffer(64 << 10)
+	return buf, buf
+}
+
+// command returns the binary and args to execute, wrapping the invocation in a
+// container runtime when a container sandbox is configured.
+func (r *Runner) command(inv *Invocation, env []string) (string, []string) {
+	if r.container == nil {
+		return inv.Bin, inv.Args
+	}
+	return r.container.command(inv, env)
+}
+
+// command builds the container runtime invocation: bind-mount the sandbox roots
+// at their host paths, set the working directory, forward the environment, then
+// run the CLI.
+func (c *ContainerSpec) command(inv *Invocation, env []string) (string, []string) {
+	args := []string{"run", "--rm", "-i", "--network", c.Network}
+	for _, m := range c.Mounts {
+		args = append(args, "-v", m+":"+m)
+	}
+	if inv.Dir != "" {
+		args = append(args, "-w", inv.Dir)
+	}
+	for _, kv := range env {
+		args = append(args, "--env", kv)
+	}
+	args = append(args, c.Image, inv.Bin)
+	args = append(args, inv.Args...)
+	return c.Runtime, args
 }
 
 // feedStdin copies an optional initial payload and, unless the invocation wants
@@ -145,6 +252,9 @@ func (r *Runner) readLoop(
 	defer close(out)
 	defer close(proc.done)
 	defer r.release()
+	defer proc.span.End()
+	defer closeRaw(proc.rawOut)
+	defer closeRaw(proc.rawErr)
 	defer r.procs.CompareAndDelete(taskID, proc)
 	defer func() {
 		if reg := activeProcs(); reg != nil {
@@ -167,6 +277,9 @@ func (r *Runner) readLoop(
 	rd := bufio.NewReaderSize(stdout, 64*1024)
 	for alive {
 		line, readErr := rd.ReadBytes('\n')
+		if proc.rawOut != nil {
+			_, _ = proc.rawOut.Write(line)
+		}
 		if rec := trimLine(line); len(rec) > 0 {
 			if perr := p.Parse(rec, emit); perr != nil {
 				emit(Event{Kind: EventError, Err: perr})
@@ -352,7 +465,92 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…(truncated)"
+	return s[:n] + "...(truncated)"
+}
+
+// stderrWriter retains a bounded copy of stderr (for error reporting) and
+// forwards complete lines to onLine, so a spawner can read a server's listening
+// address even when the CLI prints it to stderr.
+type stderrWriter struct {
+	onLine func(string)
+	kept   limitedBuffer
+	buf    []byte
+}
+
+func newStderrWriter(onLine func(string)) *stderrWriter {
+	return &stderrWriter{onLine: onLine, kept: limitedBuffer{max: 64 << 10}}
+}
+
+func (w *stderrWriter) Write(p []byte) (int, error) {
+	_, _ = w.kept.Write(p)
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		if w.onLine != nil {
+			w.onLine(string(w.buf[:i]))
+		}
+		w.buf = w.buf[i+1:]
+	}
+	if len(w.buf) > 64<<10 {
+		w.buf = w.buf[len(w.buf)-(64<<10):]
+	}
+	return len(p), nil
+}
+
+func (w *stderrWriter) String() string { return w.kept.String() }
+
+// openRawStreams opens the raw stdout/stderr logs for a task when raw stream
+// logging is configured; either may be nil on failure.
+func openRawStreams(taskID string) (io.WriteCloser, io.WriteCloser) {
+	dir, compress := rawStreamConfig()
+	if dir == "" {
+		return nil, nil
+	}
+	return openRawFile(filepath.Join(dir, taskID+".out"), compress),
+		openRawFile(filepath.Join(dir, taskID+".err"), compress)
+}
+
+func openRawFile(path string, compress bool) io.WriteCloser {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil
+	}
+	if compress {
+		path += ".gz"
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return nil
+	}
+	if !compress {
+		return f
+	}
+	return &gzipFile{gz: gzip.NewWriter(f), f: f}
+}
+
+// closeRaw closes a raw stream writer if set.
+func closeRaw(w io.WriteCloser) {
+	if w != nil {
+		_ = w.Close()
+	}
+}
+
+// gzipFile gzips writes and closes the underlying file with the gzip writer.
+type gzipFile struct {
+	gz *gzip.Writer
+	f  *os.File
+}
+
+func (g *gzipFile) Write(p []byte) (int, error) { return g.gz.Write(p) }
+
+func (g *gzipFile) Close() error {
+	err := g.gz.Close()
+	if e := g.f.Close(); err == nil {
+		err = e
+	}
+	return err
 }
 
 // limitedBuffer keeps at most max bytes; extra writes are dropped.

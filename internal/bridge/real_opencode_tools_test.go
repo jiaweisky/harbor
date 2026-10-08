@@ -112,6 +112,29 @@ func TestRealOpencodeACPToolFile(t *testing.T) {
 	}
 }
 
+// TestRealOpencodeFileAttachment verifies a raw file part reaches opencode via
+// its -f attachment flag (its content is available to the model).
+func TestRealOpencodeFileAttachment(t *testing.T) {
+	requireOpencode(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ac := opencodeExecConfig()
+	ac.FileArgs = []string{"-f", "{{.File}}"}
+	h := opencodeWorkspaceHandler(t, ctx, t.TempDir(), ac)
+
+	file := a2a.NewRawPart([]byte("the codeword is ORANGE"))
+	file.Filename = "secret.txt"
+	file.MediaType = "text/plain"
+	m := a2a.NewMessage(a2a.MessageRoleUser,
+		a2a.NewTextPart("Reply with only the codeword found in the attached file."), file)
+	m.Metadata = map[string]any{"harbor.workDir": "."}
+
+	task, _ := sendTask(t, h, m)
+	if got := strings.ToLower(artifactText(task)); !strings.Contains(got, "orange") {
+		t.Errorf("artifact = %q, want it to mention the codeword", got)
+	}
+}
+
 func TestRealOpencodeServerTool(t *testing.T) {
 	requireOpencode(t)
 	ctx, cancel := context.WithCancel(context.Background())

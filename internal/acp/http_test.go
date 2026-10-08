@@ -91,6 +91,36 @@ func TestHTTPLauncherTurn(t *testing.T) {
 	}
 }
 
+// TestHTTPLauncherStreamableHTTPEndpoint verifies a configured endpoint that
+// already includes the /api/v1/acp path (codebuddy --acp-transport
+// streamable-http reports it) is normalized to the server base, so the client
+// composes /api/v1/acp/connect and /api/v1/acp correctly.
+func TestHTTPLauncherStreamableHTTPEndpoint(t *testing.T) {
+	srv := fakeACPServer(t)
+	defer srv.Close()
+
+	ln := acp.NewHTTPLauncher(acp.HTTPConfig{Name: "fake", BaseURL: srv.URL + "/api/v1/acp"})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sess, err := ln.Start(ctx, &agent.Request{Prompt: "hi"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	var text string
+	for ev := range sess.Events() {
+		switch ev.Kind {
+		case agent.EventTextDelta:
+			text += ev.Text
+		case agent.EventError:
+			t.Fatalf("event error: %v", ev.Err)
+		}
+	}
+	if text != "pong" {
+		t.Fatalf("text = %q, want pong", text)
+	}
+}
+
 // TestHTTPLauncherCapabilities mirrors the stdio ACP capability set.
 func TestHTTPLauncherCapabilities(t *testing.T) {
 	ln := acp.NewHTTPLauncher(acp.HTTPConfig{Name: "fake", BaseURL: "http://127.0.0.1:1"})

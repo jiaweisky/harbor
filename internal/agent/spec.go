@@ -17,20 +17,31 @@ type Info struct {
 
 // Request is a normalized invocation request (A2A -> adapter).
 type Request struct {
-	Prompt      string
+	Prompt string
+	// Blocks is the ordered list of text blocks (one per message part) for a
+	// structured-input CLI; Prompt is their newline-joined form for templates.
+	Blocks      []string
 	SystemExtra string
 	Model       string
 	Agent       string
 	WorkDir     string
 	SessionID   string
 	Continue    bool
-	MaxTurns    int
+	// Fork, with SessionID, forks the session instead of continuing it in place
+	// (the CLI starts a new session seeded from the resumed one).
+	Fork     bool
+	MaxTurns int
 	// OutputSchema, when set, asks the CLI to produce a schema-validated JSON
 	// result, surfaced as a structured DataPart artifact.
 	OutputSchema map[string]any
 	// Images are native image inputs for structured (stream-json) CLIs.
 	Images []Image
-	Meta   map[string]any
+	// Files are materialized file paths the CLI attaches via its file args.
+	Files []string
+	// ImageFiles are materialized image paths the CLI attaches via its image
+	// args (for CLIs that take images as arguments, not native content blocks).
+	ImageFiles []string
+	Meta       map[string]any
 }
 
 // Invocation is a concrete CLI invocation.
@@ -45,6 +56,11 @@ type Invocation struct {
 	// closed after any initial Stdin payload, or immediately when there is none,
 	// so a one-shot CLI sees EOF instead of blocking on an open pipe.
 	KeepStdinOpen bool
+	// StderrLine, when set, receives each complete line the CLI writes to
+	// stderr. Some servers print their listening address there (for example
+	// codebuddy's streamable-http endpoint), so a spawner can read it alongside
+	// stdout.
+	StderrLine func(string)
 }
 
 // Parser converts raw CLI output records into normalized events.
@@ -80,10 +96,22 @@ type Capabilities struct {
 	InputData   bool
 	InputPrompt bool
 
-	OutputText bool
-	OutputFile bool
-	OutputData bool
-	ToolTrace  bool
+	OutputText  bool
+	OutputFile  bool
+	OutputData  bool
+	OutputImage []string
+	ToolTrace   bool
+
+	// AttachFiles attaches file parts via CLI args (materialized to disk and
+	// named on the command line) rather than only mentioning the path.
+	AttachFiles bool
+	// InlineImages sends accepted image parts as native content blocks (for a
+	// structured stream transport). It is false for CLIs that take images as
+	// command-line arguments instead.
+	InlineImages bool
+	// AttachImages materializes accepted image parts and passes them via CLI
+	// args (see the agent's image_args) rather than as native content blocks.
+	AttachImages bool
 
 	Permission          PermissionModel
 	AskQuestion         bool
@@ -126,6 +154,7 @@ func (c Capabilities) OutputModes() []string {
 	if c.OutputFile {
 		modes = append(modes, "text/x-diff")
 	}
+	modes = append(modes, c.OutputImage...)
 	return modes
 }
 
@@ -153,10 +182,12 @@ type Session interface {
 
 // Input is an out-of-band answer to a session (permission / clarification).
 type Input struct {
-	Kind   string // interaction kind (e.g. "permission", "question")
-	ID     string // interaction id the client answered
-	Target string // interaction target (e.g. the question text)
-	Answer string
+	Kind    string         // interaction kind (e.g. "permission", "question")
+	ID      string         // interaction id the client answered
+	Action  string         // interaction action (e.g. "form")
+	Target  string         // interaction target (e.g. the question text)
+	Answer  string         // text answer
+	Content map[string]any // form answer, keyed by field
 }
 
 type taskIDKey struct{}

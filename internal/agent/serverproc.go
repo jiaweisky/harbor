@@ -44,35 +44,45 @@ func (e *ServerEndpoint) URL(
 func SpawnServer(
 	ctx, lifecycle context.Context, runner *Runner, taskID string, inv *Invocation, timeout time.Duration,
 ) (string, error) {
+	// The listening address may be printed to stdout (most servers) or stderr
+	// (for example codebuddy's streamable-http endpoint); capture both. The
+	// channel is buffered so either source can report without blocking.
+	urlCh := make(chan string, 1)
+	offer := func(line string) {
+		if url, ok := ListenURL(line); ok {
+			select {
+			case urlCh <- url:
+			default:
+			}
+		}
+	}
+	inv.StderrLine = offer
+
 	events, err := runner.Start(lifecycle, taskID, inv, NewLineParser())
 	if err != nil {
 		return "", err
 	}
-	urlCh := make(chan string, 1)
+	exited := make(chan struct{})
 	go func() {
-		// Drain the server's output for its lifetime, capturing the first URL.
-		sent := false
+		defer close(exited)
 		for ev := range events {
-			if sent || ev.Kind != EventTextDelta {
-				continue
+			if ev.Kind == EventTextDelta {
+				offer(ev.Text)
 			}
-			if url, ok := ListenURL(ev.Text); ok {
-				sent = true
-				urlCh <- url
-			}
-		}
-		if !sent {
-			close(urlCh)
 		}
 	}()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case url, ok := <-urlCh:
-		if !ok {
-			return "", fmt.Errorf("%s exited before listening", inv.Bin)
-		}
+	case url := <-urlCh:
 		return url, nil
+	case <-exited:
+		select {
+		case url := <-urlCh:
+			return url, nil
+		default:
+		}
+		return "", fmt.Errorf("%s exited before listening", inv.Bin)
 	case <-timer.C:
 		runner.Kill(taskID)
 		return "", fmt.Errorf("%s did not listen within %s", inv.Bin, timeout)

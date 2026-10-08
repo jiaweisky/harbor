@@ -48,6 +48,44 @@ agents:
 	}
 }
 
+func TestCodexProfileDefaultOutputSchemaArgs(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cx
+    binary: codex
+    integration: exec
+    args: ["exec", "--json", "{{.Prompt}}"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := cfg.Agents[0].OutputSchemaArgs
+	if len(got) != 2 || got[0] != "--output-schema" || got[1] != "{{.SchemaFile}}" {
+		t.Fatalf("OutputSchemaArgs = %v, want --output-schema {{.SchemaFile}}", got)
+	}
+}
+
+func TestOpencodeProfileDefaultFileArgs(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := cfg.Agents[0].FileArgs
+	if len(got) != 2 || got[0] != "-f" || got[1] != "{{.File}}" {
+		t.Fatalf("FileArgs = %v, want -f {{.File}}", got)
+	}
+}
+
 func TestServerProtocolValidation(t *testing.T) {
 	valid := writeConfig(t, `
 version: 1
@@ -59,6 +97,18 @@ agents:
 `)
 	if _, err := config.Load(valid); err != nil {
 		t.Fatalf("unexpected error for acp protocol: %v", err)
+	}
+
+	streamable := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: server
+    server_protocol: acp-streamable-http
+`)
+	if _, err := config.Load(streamable); err != nil {
+		t.Fatalf("unexpected error for acp-streamable-http protocol: %v", err)
 	}
 
 	bad := writeConfig(t, `
@@ -263,5 +313,172 @@ agents:
 	}
 	if cfg.Sandbox.InheritEnvEnabled() {
 		t.Fatal("inherit_env: false should disable inheritance")
+	}
+}
+
+func TestContainerDefaults(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  container:
+    image: harbor/claude:latest
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ct := cfg.Sandbox.Container
+	if ct == nil {
+		t.Fatal("container config was dropped")
+	}
+	if ct.Network != "none" {
+		t.Errorf("network = %q, want none", ct.Network)
+	}
+	if ct.Runtime != "docker" {
+		t.Errorf("runtime = %q, want docker", ct.Runtime)
+	}
+}
+
+func TestContainerRequiresImage(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  container:
+    network: none
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "sandbox.container.image is required") {
+		t.Fatalf("expected a container image error, got %v", err)
+	}
+}
+
+func TestContainerRejectsUnknownNetwork(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  container:
+    image: harbor/claude:latest
+    network: host
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "sandbox.container.network") {
+		t.Fatalf("expected a container network error, got %v", err)
+	}
+}
+
+func TestCodexProfileDefaultImageArgs(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: codex
+    binary: codex
+    integration: exec
+    args: ["exec", "{{.Prompt}}"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	a := cfg.Agents[0]
+	if len(a.ImageArgs) != 2 || a.ImageArgs[0] != "-i" {
+		t.Fatalf("image_args = %v, want [-i {{.Image}}]", a.ImageArgs)
+	}
+	if len(a.InputImage) == 0 {
+		t.Fatal("input_image should default from the codex profile")
+	}
+}
+
+func TestCodebuddyProfileOutputImage(t *testing.T) {
+	p, ok := config.LookupProfile("codebuddy")
+	if !ok || len(p.OutputImage) == 0 {
+		t.Fatalf("codebuddy profile OutputImage = %v, want image types", p.OutputImage)
+	}
+}
+
+func TestRequireContainerForDangerous(t *testing.T) {
+	bad := writeConfig(t, `
+version: 1
+sandbox:
+  require_container_for_dangerous: true
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    allow_dangerous: true
+`)
+	if _, err := config.Load(bad); err == nil || !strings.Contains(err.Error(), "require_container_for_dangerous") {
+		t.Fatalf("expected a container-required error, got %v", err)
+	}
+
+	good := writeConfig(t, `
+version: 1
+sandbox:
+  require_container_for_dangerous: true
+  container: { image: "harbor/cb:latest" }
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    allow_dangerous: true
+`)
+	if _, err := config.Load(good); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestForkFlagDefaultsFromProfile(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    args: ["-p"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Agents[0].Session.ForkFlag != "--fork-session" {
+		t.Fatalf("fork_flag = %q, want --fork-session", cfg.Agents[0].Session.ForkFlag)
+	}
+}
+
+func TestTelemetryConfig(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+telemetry:
+  endpoint: "localhost:4317"
+  insecure: true
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Telemetry.Endpoint != "localhost:4317" || !cfg.Telemetry.Insecure {
+		t.Fatalf("telemetry = %+v", cfg.Telemetry)
+	}
+	if cfg.Telemetry.ServiceName != "harbor" {
+		t.Errorf("service_name = %q, want default harbor", cfg.Telemetry.ServiceName)
 	}
 }

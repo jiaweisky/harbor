@@ -35,6 +35,7 @@ type HTTPConfig struct {
 	Auth            agent.Authenticator
 	InheritEnv      bool
 	CLIHome         string
+	Container       *agent.ContainerSpec
 	VersionArgs     []string
 	VersionOverride string
 	Lifecycle       context.Context
@@ -57,7 +58,7 @@ func NewHTTPLauncher(cfg HTTPConfig) *HTTPLauncher {
 	}
 	return &HTTPLauncher{
 		cfg:    cfg,
-		runner: agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome),
+		runner: agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container),
 		client: &http.Client{},
 	}
 }
@@ -80,16 +81,28 @@ func (l *HTTPLauncher) Probe(ctx context.Context) agent.Info {
 // Start opens an ACP connection and runs one turn against it. The connection
 // lives for the turn; the server process is reused across tasks.
 func (l *HTTPLauncher) Start(ctx context.Context, req *agent.Request) (agent.Session, error) {
-	base, err := l.endpoint.URL(ctx, l.cfg.BaseURL, l.spawn)
+	raw, err := l.endpoint.URL(ctx, l.cfg.BaseURL, l.spawn)
 	if err != nil {
 		return nil, err
 	}
+	base := acpBase(raw)
 	connID, err := l.connect(ctx, base)
 	if err != nil {
 		return nil, err
 	}
 	return l.establish(ctx, base, connID, req)
 }
+
+// acpBase returns the server base URL from a reported or configured ACP
+// endpoint. codebuddy's --serve reports the server root, while --acp-transport
+// streamable-http reports the endpoint including the /api/v1/acp path; both
+// reduce to the same base.
+func acpBase(raw string) string {
+	return strings.TrimSuffix(strings.TrimRight(raw, "/"), acpPath)
+}
+
+// acpPath is the ACP endpoint path under the server base URL.
+const acpPath = "/api/v1/acp"
 
 // establish builds the ACP link for one turn: it starts the notification
 // subscription, runs the handshake, and dispatches the prompt. On any failure
@@ -107,7 +120,7 @@ func (l *HTTPLauncher) establish(ctx context.Context, base, connID string, req *
 	}
 
 	s := &session{events: ch, kill: stop}
-	w := &postWriter{ctx: linkCtx, client: l.client, url: base + "/api/v1/acp", connID: connID, headers: l.cfg.Headers}
+	w := &postWriter{ctx: linkCtx, client: l.client, url: base + acpPath, connID: connID, headers: l.cfg.Headers}
 	c := &conn{Conn: jsonrpc.New(w), s: s}
 	w.handle = c.Handle
 	s.conn = c
@@ -156,7 +169,8 @@ func (l *HTTPLauncher) connect(ctx context.Context, base string) (string, error)
 	var out struct {
 		ConnectionID string `json:"connectionId"`
 	}
-	if err := agent.PostJSON(ctx, l.client, base+"/api/v1/acp/connect", "acp connect", l.cfg.Headers, map[string]any{}, &out); err != nil {
+	url := base + acpPath + "/connect"
+	if err := agent.PostJSON(ctx, l.client, url, "acp connect", l.cfg.Headers, map[string]any{}, &out); err != nil {
 		return "", err
 	}
 	if out.ConnectionID == "" {
@@ -169,7 +183,7 @@ func (l *HTTPLauncher) connect(ctx context.Context, base string) (string, error)
 func (l *HTTPLauncher) disconnect(base, connID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, base+"/api/v1/acp", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, base+acpPath, nil)
 	if err != nil {
 		return
 	}
@@ -188,7 +202,7 @@ func (l *HTTPLauncher) disconnect(base, connID string) {
 // the connection until the link is stopped.
 func (l *HTTPLauncher) readInbound(ctx context.Context, base, connID string, c *conn, stop func(), ready chan<- error) {
 	defer stop()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/v1/acp", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+acpPath, nil)
 	if err != nil {
 		ready <- err
 		return

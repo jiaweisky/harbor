@@ -4,8 +4,9 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -13,10 +14,7 @@ import (
 	"github.com/jiaweisky/harbor/internal/acp"
 	"github.com/jiaweisky/harbor/internal/adapters"
 	"github.com/jiaweisky/harbor/internal/agent"
-	"github.com/jiaweisky/harbor/internal/codebuddy"
-	"github.com/jiaweisky/harbor/internal/codex"
 	"github.com/jiaweisky/harbor/internal/config"
-	"github.com/jiaweisky/harbor/internal/opencode"
 	"github.com/jiaweisky/harbor/internal/parser"
 	versionutil "github.com/jiaweisky/harbor/internal/version"
 )
@@ -27,6 +25,8 @@ type Options struct {
 	InheritEnv bool
 	// CLIHome, when set, redirects the CLI's HOME and config roots under it.
 	CLIHome string
+	// Container, when set, runs each CLI inside a container for isolation.
+	Container *agent.ContainerSpec
 	// Ctx bounds a long-running server process (integration "server"); nil uses
 	// a background context.
 	Ctx context.Context
@@ -84,84 +84,111 @@ func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 				ac.Binary, integ, config.IntegrationNames(profile.Supported))
 		}
 	}
+	ac.Integration = integ // a dedicated adapter reads the resolved integration
 
 	var versionArgs []string
 	if known {
 		versionArgs = profile.VersionArgs
 	}
-
+	// The agent's input images default to the CLI profile's list, so a launcher
+	// built without config defaults still advertises the CLI's capabilities.
+	inputImage := ac.InputImage
+	if len(inputImage) == 0 {
+		inputImage = profile.InputImage
+	}
 	auth := authenticator(ac)
+
+	// A dedicated adapter registered for this CLI (see adapters.go, or any
+	// package's init) takes precedence for the integrations it handles.
+	if build, ok := agent.LookupAdapter(filepath.Base(ac.Binary)); ok {
+		ln, err := build(ac, agent.AdapterOptions{
+			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
+			Container: opts.Container, Lifecycle: opts.Ctx,
+		})
+		if !errors.Is(err, agent.ErrUnhandled) {
+			return ln, err
+		}
+	}
 
 	switch integ {
 	case config.IntegrationStreamJSON:
-		return agent.NewHeadlessLauncher(agent.LauncherConfig{
-			Name: ac.ID, Binary: ac.Binary, Capabilities: streamJSONCaps(profile.InputImage),
-			NewParser: func() agent.Parser { return parser.NewStreamJSON() }, Invoke: streamJSONInvoke(ac),
-			Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
-			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
-			VersionArgs: versionArgs, VersionOverride: ac.Version,
+		caps := streamJSONCaps(inputImage, profile.OutputImage)
+		caps.SessionFork = ac.Session.ForkFlag != ""
+		return headlessLauncher(ac, opts, auth, versionArgs, caps, headlessSpec{
+			newParser: func() agent.Parser { return parser.NewStreamJSON() },
+			invoke:    streamJSONInvoke(ac),
 		}), nil
 	case config.IntegrationExec:
 		p, err := buildExecParser(ac)
 		if err != nil {
 			return nil, err
 		}
-		return agent.NewHeadlessLauncher(agent.LauncherConfig{
-			Name: ac.ID, Binary: ac.Binary, Capabilities: textCaps(),
-			Parser: p, Invoke: textInvoke(ac),
-			Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
-			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
-			VersionArgs: versionArgs, VersionOverride: ac.Version,
-		}), nil
+		return headlessLauncher(ac, opts, auth, versionArgs, execCaps(ac, inputImage, profile.OutputImage),
+			headlessSpec{parser: p, invoke: textInvoke(ac)}), nil
 	case config.IntegrationACP:
-		return acp.NewLauncher(acp.Config{
-			Name: ac.ID, Binary: ac.Binary, Args: ac.Args, Env: envSlice(ac.Env),
-			Auth:          auth,
-			MaxConcurrent: ac.Limits.MaxConcurrent, InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
-			VersionArgs: versionArgs, VersionOverride: ac.Version,
-		}), nil
+		return acpLauncher(ac, opts, auth, versionArgs), nil
 	case config.IntegrationServer:
-		switch filepath.Base(ac.Binary) {
-		case "opencode":
-			return opencode.NewServerLauncher(opts.Ctx, opencode.Config{
-				Name: ac.ID, Binary: ac.Binary, BaseURL: ac.ServerURL,
-				Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
-				Auth: auth, VersionArgs: versionArgs, VersionOverride: ac.Version,
-			}), nil
-		case "codebuddy":
-			if ac.ServerProtocol == config.ServerProtocolACP {
-				return acp.NewHTTPLauncher(acp.HTTPConfig{
-					Name: ac.ID, Binary: ac.Binary,
-					Args:    []string{"--serve", "--host", "127.0.0.1", "--auth", "none"},
-					BaseURL: ac.ServerURL, Env: envSlice(ac.Env),
-					Headers: http.Header{"X-CodeBuddy-Request": {"1"}},
-					Auth:    auth, InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
-					VersionArgs: versionArgs, VersionOverride: ac.Version, Lifecycle: opts.Ctx,
-				}), nil
-			}
-			return codebuddy.NewServerLauncher(opts.Ctx, codebuddy.Config{
-				Name: ac.ID, Binary: ac.Binary, BaseURL: ac.ServerURL,
-				Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
-				Auth: auth, VersionArgs: versionArgs, VersionOverride: ac.Version,
-			}), nil
-		case "codex":
-			return codex.NewServerLauncher(opts.Ctx, codex.Config{
-				Name: ac.ID, Binary: ac.Binary,
-				Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
-				Auth: auth, VersionArgs: versionArgs, VersionOverride: ac.Version,
-			}), nil
-		default:
-			return nil, fmt.Errorf(
-				"integration %q is implemented for opencode, codebuddy and codex; got %q",
-				integ, filepath.Base(ac.Binary),
-			)
-		}
+		// The dedicated opencode/codebuddy/codex adapters are registered by
+		// binary name and handle these before this switch; reaching here means an
+		// unsupported binary.
+		return nil, fmt.Errorf(
+			"integration %q is implemented for opencode, codebuddy and codex; got %q",
+			integ, filepath.Base(ac.Binary),
+		)
 	default:
 		if known {
 			return nil, fmt.Errorf("binary %q supports %s", ac.Binary, config.IntegrationNames(profile.Supported))
 		}
 		return nil, fmt.Errorf("unknown integration %q; set one of %s", integ, config.IntegrationList())
 	}
+}
+
+// headlessSpec carries the per-integration pieces of a headless launcher. At
+// most one of parser and newParser is set.
+type headlessSpec struct {
+	caps      agent.Capabilities
+	invoke    agent.InvokeFunc
+	parser    agent.Parser
+	newParser func() agent.Parser
+}
+
+// headlessLauncher builds a headless (stdin/stdout) launcher with the shared
+// runner settings and the given per-integration pieces.
+func headlessLauncher(
+	ac config.AgentConfig, opts Options, auth agent.Authenticator, versionArgs []string,
+	caps agent.Capabilities, spec headlessSpec,
+) agent.Launcher {
+	return agent.NewHeadlessLauncher(agent.LauncherConfig{
+		Name: ac.ID, Binary: ac.Binary, Capabilities: caps,
+		Parser: spec.parser, NewParser: spec.newParser, Invoke: spec.invoke,
+		Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
+		InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container,
+		VersionArgs: versionArgs, VersionOverride: ac.Version,
+	})
+}
+
+// execCaps derives a one-shot CLI's capabilities from its configured attachment
+// and structured-output support.
+func execCaps(ac config.AgentConfig, inputImage, outputImage []string) agent.Capabilities {
+	caps := textCaps(outputImage)
+	caps.OutputData = len(ac.OutputSchemaArgs) > 0 // structured output configured
+	caps.AttachFiles = len(ac.FileArgs) > 0        // files attached via CLI args
+	caps.InputImage = inputImage                   // images accepted (advertised)
+	caps.AttachImages = len(ac.ImageArgs) > 0      // images attached via CLI args
+	caps.SessionFork = ac.Session.ForkFlag != ""   // session fork flag configured
+	return caps
+}
+
+// acpLauncher builds an ACP-over-stdio launcher.
+func acpLauncher(
+	ac config.AgentConfig, opts Options, auth agent.Authenticator, versionArgs []string,
+) agent.Launcher {
+	return acp.NewLauncher(acp.Config{
+		Name: ac.ID, Binary: ac.Binary, Args: ac.Args, Env: envSlice(ac.Env),
+		Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
+		InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container,
+		VersionArgs: versionArgs, VersionOverride: ac.Version,
+	})
 }
 
 // authenticator returns the CLI's authenticator: a built-in adapter for a known
@@ -176,16 +203,20 @@ func authenticator(ac config.AgentConfig) agent.Authenticator {
 
 // streamJSONCaps describes a CLI driven over its structured, duplex stream mode.
 // inputImage lists the image MIME types the CLI accepts in an image content
-// block (empty when it does not accept images on this channel).
-func streamJSONCaps(inputImage []string) agent.Capabilities {
+// block (empty when it does not accept images on this channel); outputImage
+// lists the image MIME types it can produce.
+func streamJSONCaps(inputImage, outputImage []string) agent.Capabilities {
 	return agent.Capabilities{
 		InputText:           true,
 		InputImage:          inputImage,
+		InlineImages:        len(inputImage) > 0,
+		OutputImage:         outputImage,
 		InputFile:           true,
 		InputPrompt:         true,
 		OutputText:          true,
 		OutputData:          true, // --json-schema structured output
 		Permission:          agent.PermInteractive,
+		PlanApproval:        true, // ExitPlanMode -> plan approval
 		InputRequiredResume: true,
 		SessionResume:       true,
 		Streaming:           agent.StreamToken,
@@ -193,10 +224,12 @@ func streamJSONCaps(inputImage []string) agent.Capabilities {
 }
 
 // textCaps describes a CLI driven by one-shot invocation with plain output.
-func textCaps() agent.Capabilities {
+// outputImage lists the image MIME types the CLI can produce.
+func textCaps(outputImage []string) agent.Capabilities {
 	return agent.Capabilities{
 		InputText:     true,
 		InputFile:     true,
+		OutputImage:   outputImage,
 		InputPrompt:   true,
 		OutputText:    true,
 		Permission:    agent.PermFlagOnly,
@@ -226,7 +259,7 @@ func streamJSONInvoke(ac config.AgentConfig) agent.InvokeFunc {
 		args := append([]string{}, ac.Args...)
 		args = append(args, sessionArgs(ac, req)...)
 		args = appendCommonFlags(args, ac, req)
-		stdin := agent.EncodeStreamJSONInput(req.Prompt, req.Images)
+		stdin := agent.EncodeStreamJSONBlocks(req.Blocks, req.Images)
 		if ac.SDKCaps {
 			// Declare SDK capabilities first so the CLI routes AskUserQuestion
 			// through can_use_tool.
@@ -244,14 +277,25 @@ func streamJSONInvoke(ac config.AgentConfig) agent.InvokeFunc {
 }
 
 // textInvoke builds a one-shot invocation: the prompt is substituted into the
-// configured argument template.
+// configured argument template. When the request carries an output schema and
+// the agent configures output_schema_args, the schema is written to a file and
+// the args (with {{.SchemaFile}}/{{.Schema}}) are appended.
 func textInvoke(ac config.AgentConfig) agent.InvokeFunc {
 	return func(req *agent.Request) (*agent.Invocation, error) {
-		args := make([]string, 0, len(ac.Args))
+		args := make([]string, 0, len(ac.Args)+len(ac.OutputSchemaArgs))
 		for _, a := range ac.Args {
 			args = append(args, substitute(a, req))
 		}
 		args = append(args, sessionArgs(ac, req)...)
+		if req.OutputSchema != nil && len(ac.OutputSchemaArgs) > 0 {
+			schemaArgs, err := schemaArgs(ac.OutputSchemaArgs, req.OutputSchema)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, schemaArgs...)
+		}
+		args = append(args, fileArgs(ac.FileArgs, req.Files)...)
+		args = append(args, imageArgs(ac.ImageArgs, req.ImageFiles)...)
 		return &agent.Invocation{
 			Bin:  ac.Binary,
 			Args: args,
@@ -261,13 +305,66 @@ func textInvoke(ac config.AgentConfig) agent.InvokeFunc {
 	}
 }
 
-// sessionArgs returns the flags that continue or resume a CLI session.
+// fileArgs expands the file-attachment args once per file path.
+func fileArgs(tmpl, files []string) []string {
+	return expandArgs(tmpl, "{{.File}}", files)
+}
+
+// imageArgs expands the image-attachment args once per image path.
+func imageArgs(tmpl, images []string) []string {
+	return expandArgs(tmpl, "{{.Image}}", images)
+}
+
+// expandArgs expands an argument template once per value, replacing placeholder
+// with the value. It returns nil when the template or values are empty.
+func expandArgs(tmpl []string, placeholder string, values []string) []string {
+	if len(tmpl) == 0 || len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(tmpl)*len(values))
+	for _, v := range values {
+		for _, a := range tmpl {
+			out = append(out, strings.ReplaceAll(a, placeholder, v))
+		}
+	}
+	return out
+}
+
+// schemaArgs writes the schema to a temp file and expands the configured args,
+// substituting {{.SchemaFile}} with the file path and {{.Schema}} with the
+// compact schema JSON.
+func schemaArgs(tmpl []string, schema map[string]any) ([]string, error) {
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		return nil, fmt.Errorf("marshal output schema: %w", err)
+	}
+	f, err := os.CreateTemp("", "harbor-schema-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("write output schema: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(raw); err != nil {
+		return nil, fmt.Errorf("write output schema: %w", err)
+	}
+	out := make([]string, len(tmpl))
+	for i, a := range tmpl {
+		a = strings.ReplaceAll(a, "{{.SchemaFile}}", f.Name())
+		out[i] = strings.ReplaceAll(a, "{{.Schema}}", string(raw))
+	}
+	return out, nil
+}
+
+// sessionArgs returns the flags that continue, resume, or fork a CLI session.
 func sessionArgs(ac config.AgentConfig, req *agent.Request) []string {
 	if req.SessionID != "" {
+		var args []string
 		if flag := agent.FirstNonEmpty(ac.Session.ResumeFlag, ac.Session.IDFlag); flag != "" {
-			return []string{flag, req.SessionID}
+			args = append(args, flag, req.SessionID)
 		}
-		return nil
+		if req.Fork && ac.Session.ForkFlag != "" {
+			args = append(args, ac.Session.ForkFlag)
+		}
+		return args
 	}
 	if req.Continue && ac.Session.ContinueFlag != "" {
 		return []string{ac.Session.ContinueFlag}

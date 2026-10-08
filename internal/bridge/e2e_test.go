@@ -17,6 +17,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/bridge"
@@ -407,6 +408,110 @@ func TestStreamJSONQuestionResume(t *testing.T) {
 	}
 }
 
+// TestStreamJSONQuestionMultiAnswer verifies a multi-question AskUserQuestion
+// surfaces every question and a content-keyed answer writes all answers back.
+func TestStreamJSONQuestionMultiAnswer(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "qa.log")
+	t.Setenv("FAKE_QA_LOG", logPath)
+	h, ctx, cancel := newStreamJSONHandler(t, "fake-question-multi.sh")
+	defer cancel()
+
+	task := sendPaused(t, h, ctx, "ask me")
+	itx := interactionFromMessage(t, task.Status.Message)
+	if len(itx.Questions) != 2 || itx.Questions[1].Question != "Favorite animal?" {
+		t.Fatalf("questions = %+v, want two with the second being Favorite animal?", itx.Questions)
+	}
+
+	m := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{
+		"id": itx.ID,
+		"content": map[string]any{
+			"Favorite color?":  "Red",
+			"Favorite animal?": "Dog",
+		},
+	}))
+	done := resumeTask(t, h, ctx, task, m)
+	if done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", done.Status.State)
+	}
+	rec, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read control_response log: %v", err)
+	}
+	for _, want := range []string{`"Favorite color?":"Red"`, `"Favorite animal?":"Dog"`} {
+		if !strings.Contains(string(rec), want) {
+			t.Errorf("control_response missing %q; got %s", want, rec)
+		}
+	}
+}
+
+// TestStreamJSONElicitationForm verifies an elicitation_create form surfaces as
+// a question interaction and the client's content is written back as an accept
+// control_response.
+func TestStreamJSONElicitationForm(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "stdin.log")
+	ln := newLauncher(t, scriptPath(t, "fake-form.sh"), "stream-json", []string{"-p"},
+		map[string]string{"HARBOR_STDIN_LOG": logPath})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{Timeout: 10 * time.Second})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	task := sendPaused(t, h, ctx, "ask me")
+	itx := interactionFromMessage(t, task.Status.Message)
+	if itx.Kind != agent.InteractionQuestion || itx.Action != "form" || itx.Schema == nil {
+		t.Fatalf("interaction = %+v, want a form question with a schema", itx)
+	}
+
+	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{
+		"id": itx.ID, "content": map[string]any{"color": "blue"},
+	}))
+	done := resumeTask(t, h, ctx, task, answer)
+	if done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", done.Status.State)
+	}
+	sent, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read stdin log: %v", err)
+	}
+	if !strings.Contains(string(sent), `"action":"accept"`) || !strings.Contains(string(sent), `"color":"blue"`) {
+		t.Fatalf("control_response = %q, want an accept with the form content", sent)
+	}
+}
+
+// TestStreamJSONPlanApproval verifies an ExitPlanMode can_use_tool surfaces as a
+// plan-approval interaction answered like a permission.
+func TestStreamJSONPlanApproval(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "stdin.log")
+	ln := newLauncher(t, scriptPath(t, "fake-plan.sh"), "stream-json", []string{"-p"},
+		map[string]string{"HARBOR_STDIN_LOG": logPath})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{Timeout: 10 * time.Second})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	task := sendPaused(t, h, ctx, "plan this")
+	itx := interactionFromMessage(t, task.Status.Message)
+	if itx.Kind != agent.InteractionPlanApproval {
+		t.Fatalf("interaction = %+v, want a plan approval", itx)
+	}
+
+	done := answerEvent(t, h, ctx, task, itx, "allow")
+	if done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", done.Status.State)
+	}
+	sent, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read stdin log: %v", err)
+	}
+	if !strings.Contains(string(sent), `"allowed":true`) {
+		t.Fatalf("control_response = %q, want an allow", sent)
+	}
+}
+
 // TestStreamJSONStructuredOutput verifies a harbor.outputSchema request produces
 // a schema-validated JSON DataPart artifact.
 func TestStreamJSONStructuredOutput(t *testing.T) {
@@ -425,12 +530,14 @@ func TestStreamJSONStructuredOutput(t *testing.T) {
 
 // TestStreamJSONImageInput verifies a raw image part reaches the CLI as a native
 // image content block on stdin (stream-json), not a file path.
-func TestStreamJSONImageInput(t *testing.T) {
-	logPath := filepath.Join(t.TempDir(), "stdin.log")
+// stdinLoggerHandler builds a stream-json handler over a fake "codebuddy" that
+// appends its first stdin line (the initial user message) to logPath. Naming the
+// fake "codebuddy" gives it the profile's input capabilities.
+func stdinLoggerHandler(t *testing.T, logPath string) a2asrv.RequestHandler {
+	t.Helper()
 	script := "#!/bin/sh\nread -r line\n" +
 		`echo "$line" >> "$HARBOR_STDIN_LOG"` + "\n" +
 		`echo '{"type":"result","result":"ok","is_error":false}'` + "\n"
-	// Name the fake "codebuddy" so it picks up the profile's image capability.
 	ln, err := integration.New(config.AgentConfig{
 		ID: "cb", Binary: fakeBin(t, "codebuddy", script), Integration: config.IntegrationStreamJSON,
 		Args: []string{"-p"}, Env: map[string]string{"HARBOR_STDIN_LOG": logPath},
@@ -440,7 +547,31 @@ func TestStreamJSONImageInput(t *testing.T) {
 	}
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
 		config.LimitsConfig{Timeout: 30 * time.Second})
-	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+	return a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+}
+
+// streamJSONContent decodes the initial user message's content array from the
+// logged stdin line.
+func streamJSONContent(t *testing.T, logPath string) []map[string]any {
+	t.Helper()
+	sent, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read stdin log: %v", err)
+	}
+	var msg struct {
+		Message struct {
+			Content []map[string]any `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(sent))), &msg); err != nil {
+		t.Fatalf("unmarshal stdin %q: %v", sent, err)
+	}
+	return msg.Message.Content
+}
+
+func TestStreamJSONImageInput(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "stdin.log")
+	h := stdinLoggerHandler(t, logPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
@@ -453,13 +584,110 @@ func TestStreamJSONImageInput(t *testing.T) {
 		t.Fatalf("SendMessage: %v", err)
 	}
 
-	sent, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("read stdin log: %v", err)
+	content := streamJSONContent(t, logPath)
+	if len(content) != 2 || content[1]["type"] != "image" {
+		t.Fatalf("content = %v, want a text block then an image block", content)
 	}
-	got := string(sent)
-	if !strings.Contains(got, `"type":"image"`) || !strings.Contains(got, `"media_type":"image/png"`) {
-		t.Fatalf("stdin = %s, want a native image content block", got)
+	if src, _ := content[1]["source"].(map[string]any); src["media_type"] != "image/png" {
+		t.Fatalf("image source = %v", content[1]["source"])
+	}
+}
+
+// TestStreamJSONDataBlocks verifies text and data parts travel as separate
+// content blocks (a DataPart is its own JSON block), not one concatenated text.
+func TestStreamJSONDataBlocks(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "stdin.log")
+	h := stdinLoggerHandler(t, logPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	m := a2a.NewMessage(a2a.MessageRoleUser,
+		a2a.NewTextPart("first"), a2a.NewDataPart(map[string]any{"k": "v"}), a2a.NewTextPart("second"))
+	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+
+	content := streamJSONContent(t, logPath)
+	if len(content) != 3 {
+		t.Fatalf("content = %v, want three blocks", content)
+	}
+	if content[0]["text"] != "first" || content[2]["text"] != "second" {
+		t.Fatalf("text blocks = %v / %v", content[0], content[2])
+	}
+	if content[1]["text"] != `{"k":"v"}` {
+		t.Fatalf("data block = %v, want its own JSON block", content[1])
+	}
+}
+
+// TestExecStructuredOutput verifies an exec agent configured with
+// output_schema_args receives the schema flag and its JSON-only final text is
+// surfaced as a DataPart artifact.
+func TestExecStructuredOutput(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "args.log")
+	script := "#!/bin/sh\n" +
+		`echo "$@" >> "$HARBOR_ARG_LOG"` + "\n" +
+		`printf '%s' '{"city":"Paris"}'` + "\n"
+	ac := config.AgentConfig{
+		ID: "mc", Binary: fakeBin(t, "mycoder", script),
+		Env:              map[string]string{"HARBOR_ARG_LOG": logPath},
+		OutputSchemaArgs: []string{"--output-schema", "{{.SchemaFile}}"},
+	}
+	ln := newExecLauncher(t, ac, integration.Options{InheritEnv: true})
+	h := newHandler(t, ln)
+
+	m := message("capital of France")
+	m.Metadata = map[string]any{"harbor.outputSchema": map[string]any{"type": "object"}}
+	task, _ := sendTask(t, h, m)
+
+	if data := firstDataPart(task); data == nil || data["city"] != "Paris" {
+		t.Fatalf("structured artifact = %v, want city Paris", data)
+	}
+	args, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read arg log: %v", err)
+	}
+	if !strings.Contains(string(args), "--output-schema") {
+		t.Fatalf("args = %q, want --output-schema", args)
+	}
+}
+
+// TestExecFileAttachment verifies a raw file part is attached via the CLI's
+// configured file args (its path on the command line) rather than only named in
+// the prompt.
+func TestExecFileAttachment(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "args.log")
+	script := "#!/bin/sh\n" +
+		`echo "$@" >> "$HARBOR_ARG_LOG"` + "\n" +
+		`echo ok` + "\n"
+	ac := config.AgentConfig{
+		ID: "mc", Binary: fakeBin(t, "mycoder", script),
+		Env:      map[string]string{"HARBOR_ARG_LOG": logPath},
+		FileArgs: []string{"-f", "{{.File}}"},
+	}
+	ln := newExecLauncher(t, ac, integration.Options{InheritEnv: true})
+	h := newHandler(t, ln)
+
+	file := a2a.NewRawPart([]byte("attachment body"))
+	file.Filename = "notes.txt"
+	file.MediaType = "text/plain"
+	m := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("summarize"), file)
+	task, _ := sendTask(t, h, m)
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+
+	args, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read arg log: %v", err)
+	}
+	if !strings.Contains(string(args), "-f ") || !strings.Contains(string(args), ".harbor/uploads") {
+		t.Fatalf("args = %q, want -f <uploaded file>", args)
+	}
+	if strings.Contains(string(args), "saved to") {
+		t.Errorf("an attached file should not also be named with a path line: %q", args)
 	}
 }
 
@@ -882,11 +1110,15 @@ func TestCardVersion(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
 	info := ln.Probe(context.Background())
 	card := bridge.BuildCard(ln, info, "http://example/agents/x/", false)
-	if len(card.SupportedInterfaces) != 1 {
-		t.Fatalf("interfaces = %d", len(card.SupportedInterfaces))
+	if len(card.SupportedInterfaces) != 2 {
+		t.Fatalf("interfaces = %d, want JSON-RPC and HTTP+JSON", len(card.SupportedInterfaces))
 	}
-	if card.SupportedInterfaces[0].ProtocolVersion != a2a.Version {
-		t.Fatalf("protocol version = %s", card.SupportedInterfaces[0].ProtocolVersion)
+	if card.SupportedInterfaces[0].ProtocolBinding != a2a.TransportProtocolJSONRPC ||
+		card.SupportedInterfaces[0].ProtocolVersion != a2a.Version {
+		t.Fatalf("first interface = %+v, want JSON-RPC at %s", card.SupportedInterfaces[0], a2a.Version)
+	}
+	if card.SupportedInterfaces[1].ProtocolBinding != a2a.TransportProtocolHTTPJSON {
+		t.Fatalf("second interface = %+v, want HTTP+JSON", card.SupportedInterfaces[1])
 	}
 }
 
@@ -973,6 +1205,46 @@ func TestSendMessage_codex(t *testing.T) {
 	}
 	if got := artifactText(task); !strings.Contains(got, "Hello from codex") {
 		t.Fatalf("artifact text = %q", got)
+	}
+}
+
+// TestExecImageAttachment verifies an image part for an exec CLI with image_args
+// is materialized to disk and passed on the command line (codex -i).
+func TestExecImageAttachment(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "args.log")
+	ln, err := integration.New(config.AgentConfig{
+		ID: "codex", Binary: scriptPath(t, "fake-codex.sh"), Integration: config.IntegrationExec,
+		Parser: "codex", Args: []string{"exec", "{{.Prompt}}"},
+		ImageArgs:  []string{"-i", "{{.Image}}"},
+		InputImage: []string{"image/png"},
+		Env:        map[string]string{"HARBOR_ARG_LOG": logPath},
+	}, integration.Options{InheritEnv: true})
+	if err != nil {
+		t.Fatalf("integration.New: %v", err)
+	}
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
+	h := a2asrv.NewHandler(exec)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	img := a2a.NewRawPart([]byte("PNGDATA"))
+	img.MediaType = "image/png"
+	img.Filename = "pic.png"
+	m := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("describe this"), img)
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if task := resp.(*a2a.Task); task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", task.Status.State)
+	}
+	rec, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read arg log: %v", err)
+	}
+	args := string(rec)
+	if !strings.Contains(args, "-i ") || !strings.Contains(args, "1-pic.png") {
+		t.Fatalf("args missing the image attachment:\n%s", args)
 	}
 }
 
@@ -1118,6 +1390,155 @@ func TestChangesArtifact(t *testing.T) {
 	}
 	if !strings.Contains(diff, "tracked.txt") || !strings.Contains(diff, "+appended line") {
 		t.Fatalf("changes artifact missing diff:\n%s", diff)
+	}
+}
+
+// TestImageOutputArtifact verifies a task that writes an image file into its
+// working directory surfaces it as a raw image artifact.
+func TestImageOutputArtifact(t *testing.T) {
+	root := t.TempDir()
+	ln := newLauncher(t, scriptPath(t, "fake-image.sh"), "exec", []string{"{{.Prompt}}"}, nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
+		workspace.NewResolver(root, false), config.LimitsConfig{})
+	h := a2asrv.NewHandler(exec)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m := message("draw a picture")
+	m.Metadata = map[string]any{"harbor.workDir": "."}
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", task.Status.State)
+	}
+
+	var found bool
+	for _, a := range task.Artifacts {
+		if a.Name != "image" {
+			continue
+		}
+		for _, p := range a.Parts {
+			if p.MediaType != "image/png" || p.Filename != "generated.png" {
+				t.Fatalf("part = media %q file %q, want image/png generated.png", p.MediaType, p.Filename)
+			}
+			if len(p.Raw()) == 0 {
+				t.Fatal("image artifact has no raw bytes")
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no image artifact; artifacts = %+v", task.Artifacts)
+	}
+}
+
+// TestMaxTurnsExceeded verifies a resume past the per-task turn limit fails.
+func TestMaxTurnsExceeded(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-question.sh"), "stream-json", []string{"-p"}, nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{Timeout: 10 * time.Second, MaxTurns: 1})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	task := sendPaused(t, h, ctx, "ask me")
+	itx := interactionFromMessage(t, task.Status.Message)
+	done := answerEvent(t, h, ctx, task, itx, "Blue")
+	if done.Status.State != a2a.TaskStateFailed {
+		t.Fatalf("state = %s, want failed", done.Status.State)
+	}
+	if code, _ := done.Status.Message.Metadata["harbor.errorCode"].(string); code != "max_turns" {
+		t.Fatalf("errorCode = %q, want max_turns", code)
+	}
+}
+
+// TestFileArtifacts verifies the opt-in per-file artifact for a changed file.
+func TestFileArtifacts(t *testing.T) {
+	repo := gitRepo(t)
+	ln := newLauncher(t, scriptPath(t, "fake-mutate.sh"), "exec", nil, nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
+		workspace.NewResolver(repo, false), config.LimitsConfig{})
+	exec.SetFileArtifacts(true)
+	h := a2asrv.NewHandler(exec)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m := message("hi")
+	m.Metadata = map[string]any{"harbor.workDir": "."}
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s", task.Status.State)
+	}
+	var found bool
+	for _, a := range task.Artifacts {
+		if a.Name != "file" {
+			continue
+		}
+		for _, p := range a.Parts {
+			if p.Filename == "tracked.txt" && strings.Contains(string(p.Raw()), "appended line") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no per-file artifact for tracked.txt; artifacts = %+v", task.Artifacts)
+	}
+}
+
+// TestDuplicateMessageIdempotent verifies a repeated send (same messageId) does
+// not start a second execution and returns the original task.
+func TestDuplicateMessageIdempotent(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "args.log")
+	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil,
+		map[string]string{"HARBOR_ARG_LOG": logPath})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{Timeout: 10 * time.Second})
+	ts := taskstore.NewInMemory(nil)
+	exec.SetTaskLookup(func(ctx context.Context, id a2a.TaskID) (*a2a.Task, bool) {
+		st, err := ts.Get(ctx, id)
+		if err != nil || st == nil {
+			return nil, false
+		}
+		return st.Task, true
+	})
+	h := a2asrv.NewHandler(exec, a2asrv.WithTaskStore(ts),
+		a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	send := func() *a2a.Task {
+		m := message("hi")
+		m.ID = "dup-id-1"
+		resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+		if err != nil {
+			t.Fatalf("SendMessage: %v", err)
+		}
+		return resp.(*a2a.Task)
+	}
+	first := send()
+	second := send()
+	if second.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("duplicate task state = %s, want completed", second.Status.State)
+	}
+	if artifactText(first) != artifactText(second) {
+		t.Fatalf("duplicate result %q != original %q", artifactText(second), artifactText(first))
+	}
+	if got, _ := second.Metadata["harbor.duplicateOf"].(string); got != string(first.ID) {
+		t.Fatalf("duplicateOf = %q, want %q", got, first.ID)
+	}
+	rec, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read arg log: %v", err)
+	}
+	if n := len(strings.Split(strings.TrimSpace(string(rec)), "\n")); n != 1 {
+		t.Fatalf("CLI ran %d times, want 1", n)
 	}
 }
 

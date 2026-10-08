@@ -41,7 +41,7 @@ func isLoopback(listen string) bool {
 // BearerMiddleware enforces "Authorization: Bearer <token>" against a token set.
 func BearerMiddleware(tokens []string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, ok := bearerToken(r.Header.Get("Authorization"))
+		got, ok := BearerToken(r.Header.Get("Authorization"))
 		if !ok || !matchToken(got, tokens) {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -84,7 +84,9 @@ func matchToken(got string, tokens []string) bool {
 	return false
 }
 
-func bearerToken(header string) (string, bool) {
+// BearerToken extracts the token from an "Authorization: Bearer <token>"
+// header value. It reports false when the scheme is missing or the token empty.
+func BearerToken(header string) (string, bool) {
 	const prefix = "bearer "
 	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
 		return "", false
