@@ -284,6 +284,40 @@ func resumeTask(
 	return resp.(*a2a.Task)
 }
 
+// newStreamJSONHandler builds a stream-json handler over the given fake CLI.
+func newStreamJSONHandler(t *testing.T, script string) (a2asrv.RequestHandler, context.Context, context.CancelFunc) {
+	t.Helper()
+	ln := newLauncher(t, scriptPath(t, script), "stream-json", []string{"-p"}, nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{Timeout: 10 * time.Second})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	return h, ctx, cancel
+}
+
+// sendPaused sends a prompt and returns the task once it is input-required.
+func sendPaused(t *testing.T, h a2asrv.RequestHandler, ctx context.Context, prompt string) *a2a.Task {
+	t.Helper()
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message(prompt)})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateInputRequired {
+		t.Fatalf("state = %s, want input-required", task.Status.State)
+	}
+	return task
+}
+
+// answerEvent resumes a paused task with a structured {id, answer} DataPart.
+func answerEvent(
+	t *testing.T, h a2asrv.RequestHandler, ctx context.Context, task *a2a.Task, itx agent.Interaction, answer string,
+) *a2a.Task {
+	t.Helper()
+	m := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{"id": itx.ID, "answer": answer}))
+	return resumeTask(t, h, ctx, task, m)
+}
+
 // TestInputRequiredResume verifies that a task paused on input-required keeps
 // its CLI process alive across the completing RPC and resumes to completion.
 func TestInputRequiredResume(t *testing.T) {
@@ -317,22 +351,10 @@ func TestInputRequiredResume(t *testing.T) {
 // (can_use_tool) surfaces as input-required and the answer is written back as a
 // control_response, letting the CLI finish.
 func TestStreamJSONPermissionResume(t *testing.T) {
-	ln := newLauncher(t, scriptPath(t, "fake-permission.sh"), "stream-json", []string{"-p"}, nil)
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 10 * time.Second})
-	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	h, ctx, cancel := newStreamJSONHandler(t, "fake-permission.sh")
 	defer cancel()
 
-	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("run echo")})
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-	task := resp.(*a2a.Task)
-	if task.Status.State != a2a.TaskStateInputRequired {
-		t.Fatalf("state = %s, want input-required", task.Status.State)
-	}
+	task := sendPaused(t, h, ctx, "run echo")
 	itx := interactionFromMessage(t, task.Status.Message)
 	if itx.Kind != agent.InteractionPermission || itx.ID == "" {
 		t.Fatalf("interaction = %+v, want a permission with an id", itx)
@@ -341,15 +363,34 @@ func TestStreamJSONPermissionResume(t *testing.T) {
 		t.Fatalf("interaction = %+v, want action Bash and options", itx)
 	}
 
-	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{
-		"id": itx.ID, "answer": "allow",
-	}))
-	done := resumeTask(t, h, ctx, task, answer)
+	done := answerEvent(t, h, ctx, task, itx, "allow")
 	if done.Status.State != a2a.TaskStateCompleted {
 		t.Fatalf("state = %s, want completed", done.Status.State)
 	}
 	if got := artifactText(done); !strings.Contains(got, "allowed") {
 		t.Errorf("artifact text = %q, want it to contain allowed", got)
+	}
+}
+
+// TestStreamJSONQuestionResume verifies an AskUserQuestion can_use_tool surfaces
+// as a question interaction and the chosen answer is written back through the
+// control_response's updatedInput.
+func TestStreamJSONQuestionResume(t *testing.T) {
+	h, ctx, cancel := newStreamJSONHandler(t, "fake-question.sh")
+	defer cancel()
+
+	task := sendPaused(t, h, ctx, "ask me")
+	itx := interactionFromMessage(t, task.Status.Message)
+	if itx.Kind != agent.InteractionQuestion || itx.Target != "Favorite color?" {
+		t.Fatalf("interaction = %+v, want a question targeted at the prompt", itx)
+	}
+
+	done := answerEvent(t, h, ctx, task, itx, "Blue")
+	if done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", done.Status.State)
+	}
+	if got := artifactText(done); !strings.Contains(got, "chose Blue") {
+		t.Errorf("artifact text = %q, want it to contain chose Blue", got)
 	}
 }
 

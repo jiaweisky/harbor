@@ -128,10 +128,14 @@ func (s *lineSession) Send(_ context.Context, in Input) error {
 	if !s.duplex || s.stdin == nil {
 		return ErrUnsupported
 	}
-	// A permission interaction is answered with a control_response; any other
-	// input is a normal user turn written as a stream-json message.
-	if in.Kind == string(InteractionPermission) {
+	// A permission or question interaction is answered with a control_response;
+	// any other input is a normal user turn written as a stream-json message.
+	switch in.Kind {
+	case string(InteractionPermission):
 		_, err := io.WriteString(s.stdin, EncodePermissionResponse(in.ID, in.Answer))
+		return err
+	case string(InteractionQuestion):
+		_, err := io.WriteString(s.stdin, EncodeQuestionResponse(in.ID, in.Target, in.Answer))
 		return err
 	}
 	_, err := io.WriteString(s.stdin, EncodeStreamJSONUserMessage(in.Answer))

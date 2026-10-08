@@ -7,6 +7,30 @@ import (
 	"github.com/jiaweisky/harbor/internal/agent"
 )
 
+func TestEncodeQuestionResponse(t *testing.T) {
+	var frame struct {
+		Type     string `json:"type"`
+		Response struct {
+			RequestID string `json:"request_id"`
+			Response  struct {
+				Allowed      bool `json:"allowed"`
+				UpdatedInput struct {
+					Answers map[string]string `json:"answers"`
+				} `json:"updatedInput"`
+			} `json:"response"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(agent.EncodeQuestionResponse("perm_q1", "Favorite color?", "Blue")), &frame); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if frame.Type != "control_response" || frame.Response.RequestID != "perm_q1" || !frame.Response.Response.Allowed {
+		t.Fatalf("frame = %+v", frame)
+	}
+	if got := frame.Response.Response.UpdatedInput.Answers["Favorite color?"]; got != "Blue" {
+		t.Fatalf("answers = %v, want the question keyed to Blue", frame.Response.Response.UpdatedInput.Answers)
+	}
+}
+
 func TestEncodePermissionResponse(t *testing.T) {
 	cases := []struct {
 		answer string

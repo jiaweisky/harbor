@@ -221,12 +221,18 @@ func streamJSONInvoke(ac config.AgentConfig) agent.InvokeFunc {
 		args := append([]string{}, ac.Args...)
 		args = append(args, sessionArgs(ac, req)...)
 		args = appendModelAndSystem(args, ac, req)
+		stdin := agent.EncodeStreamJSONUserMessage(req.Prompt)
+		if ac.SDKCaps {
+			// Declare SDK capabilities first so the CLI routes AskUserQuestion
+			// through can_use_tool.
+			stdin = agent.EncodeControlInitialize() + stdin
+		}
 		return &agent.Invocation{
 			Bin:           ac.Binary,
 			Args:          args,
 			Dir:           req.WorkDir,
 			Env:           envSlice(ac.Env),
-			Stdin:         strings.NewReader(agent.EncodeStreamJSONUserMessage(req.Prompt)),
+			Stdin:         strings.NewReader(stdin),
 			KeepStdinOpen: true,
 		}, nil
 	}

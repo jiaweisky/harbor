@@ -126,9 +126,13 @@ type AgentConfig struct {
 	Args           []string          `yaml:"args"`
 	Env            map[string]string `yaml:"env"`
 	AllowDangerous bool              `yaml:"allow_dangerous"`
-	Version        string            `yaml:"version"` // optional card version override; skips probing
-	Session        SessionConfig     `yaml:"session"`
-	Limits         LimitsConfig      `yaml:"limits"`
+	// SDKCaps declares stream-json SDK capabilities (currently askUserQuestion)
+	// before the first prompt, so the CLI routes AskUserQuestion through
+	// can_use_tool and Harbor can surface it as an input-required question.
+	SDKCaps bool          `yaml:"sdk_capabilities"`
+	Version string        `yaml:"version"` // optional card version override; skips probing
+	Session SessionConfig `yaml:"session"`
+	Limits  LimitsConfig  `yaml:"limits"`
 }
 
 // RegexConfig configures the regex parser.

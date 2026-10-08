@@ -3,6 +3,7 @@ package parser
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 )
@@ -93,9 +94,10 @@ func (p *StreamJSON) parseUser(rec []byte, out func(agent.Event)) {
 	}
 }
 
-// parseControlRequest handles a CLI control_request. Harbor answers a
-// can_use_tool (tool permission) request by surfacing it as a permission
-// interaction; other subtypes have no Harbor-side handler and are ignored.
+// parseControlRequest handles a CLI control_request. A can_use_tool request is
+// surfaced as an input-required interaction — a question for AskUserQuestion, a
+// permission otherwise; other subtypes have no Harbor-side handler and are
+// ignored.
 func (p *StreamJSON) parseControlRequest(rec []byte, out func(agent.Event)) {
 	var m struct {
 		RequestID string `json:"request_id"`
@@ -108,21 +110,115 @@ func (p *StreamJSON) parseControlRequest(rec []byte, out func(agent.Event)) {
 	if json.Unmarshal(rec, &m) != nil || m.Request.Subtype != "can_use_tool" || m.RequestID == "" {
 		return
 	}
-	out(agent.Event{
+	if m.Request.ToolName == "AskUserQuestion" {
+		out(questionEvent(m.RequestID, m.Request.Input, rec))
+		return
+	}
+	out(permissionEvent(m.RequestID, m.Request.ToolName, m.Request.Input, rec))
+}
+
+// permissionEvent builds the input-required event for a tool permission request.
+func permissionEvent(id, tool string, input map[string]any, raw []byte) agent.Event {
+	return agent.Event{
 		Kind:      agent.EventPermissionRequest,
-		Text:      permissionText(m.Request.ToolName, m.Request.Input),
-		Tool:      m.Request.ToolName,
-		ToolInput: m.Request.Input,
+		Text:      permissionText(tool, input),
+		Tool:      tool,
+		ToolInput: input,
 		Interaction: &agent.Interaction{
 			Kind:    agent.InteractionPermission,
-			ID:      m.RequestID,
-			Action:  m.Request.ToolName,
-			Target:  permissionTarget(m.Request.Input),
+			ID:      id,
+			Action:  tool,
+			Target:  permissionTarget(input),
 			Options: []string{"allow", "deny"},
 			Resume:  true,
 		},
-		Raw: rec,
-	})
+		Raw: raw,
+	}
+}
+
+// questionEvent builds the input-required event for an AskUserQuestion request.
+func questionEvent(id string, input map[string]any, raw []byte) agent.Event {
+	qs := askUserQuestions(input)
+	return agent.Event{
+		Kind:      agent.EventPermissionRequest,
+		Text:      questionText(qs),
+		Tool:      "AskUserQuestion",
+		ToolInput: input,
+		Interaction: &agent.Interaction{
+			Kind:    agent.InteractionQuestion,
+			ID:      id,
+			Action:  "question",
+			Target:  firstQuestionText(qs),
+			Options: firstQuestionOptions(qs),
+			Resume:  true,
+		},
+		Raw: raw,
+	}
+}
+
+// askUserQuestion is one question of an AskUserQuestion tool input
+// ({questions:[{question, header, options:[{label, ...}], multiSelect}]}).
+type askUserQuestion struct {
+	Question string `json:"question"`
+	Options  []struct {
+		Label string `json:"label"`
+	} `json:"options"`
+}
+
+// askUserQuestions parses the "questions" array of an AskUserQuestion input.
+func askUserQuestions(input map[string]any) []askUserQuestion {
+	b, err := json.Marshal(input["questions"])
+	if err != nil {
+		return nil
+	}
+	var qs []askUserQuestion
+	_ = json.Unmarshal(b, &qs)
+	return qs
+}
+
+// firstQuestionText returns the first question's text (the answer key).
+func firstQuestionText(qs []askUserQuestion) string {
+	if len(qs) == 0 {
+		return ""
+	}
+	return qs[0].Question
+}
+
+// firstQuestionOptions returns the first question's option labels.
+func firstQuestionOptions(qs []askUserQuestion) []string {
+	if len(qs) == 0 {
+		return nil
+	}
+	return questionLabels(qs[0])
+}
+
+// questionLabels returns a question's non-empty option labels.
+func questionLabels(q askUserQuestion) []string {
+	labels := make([]string, 0, len(q.Options))
+	for _, o := range q.Options {
+		if o.Label != "" {
+			labels = append(labels, o.Label)
+		}
+	}
+	return labels
+}
+
+// questionText renders the questions and their options as a prompt.
+func questionText(qs []askUserQuestion) string {
+	if len(qs) == 0 {
+		return "the agent is asking a question"
+	}
+	var b strings.Builder
+	for i, q := range qs {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(q.Question)
+		if labels := questionLabels(q); len(labels) > 0 {
+			b.WriteString(" [" + strings.Join(labels, ", ") + "]")
+		}
+	}
+	return b.String()
 }
 
 // permissionText renders a human-readable prompt for a tool permission request.

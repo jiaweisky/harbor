@@ -725,16 +725,16 @@ func interactionPayload(itx *agent.Interaction) map[string]any {
 // as a text fallback for clients that do not use the extension.
 func (e *CLIExecutor) answerFromMessage(taskID string, m *a2a.Message) (agent.Input, error) {
 	id, answer := parseAnswer(m)
-	kind := "answer"
+	kind, target := "answer", ""
 	if cur, ok := e.pendingInteraction(taskID); ok {
 		if id != "" && id != cur.ID {
 			return agent.Input{}, fmt.Errorf("interaction id mismatch: got %q, want %q", id, cur.ID)
 		}
-		// Use the interaction's own id and kind so the session can build the
-		// right response even when the client answered with plain text.
-		id, kind = cur.ID, string(cur.Kind)
+		// Use the interaction's own id, kind, and target so the session can build
+		// the right response even when the client answered with plain text.
+		id, kind, target = cur.ID, string(cur.Kind), cur.Target
 	}
-	return agent.Input{Kind: kind, ID: id, Answer: answer}, nil
+	return agent.Input{Kind: kind, ID: id, Target: target, Answer: answer}, nil
 }
 
 // parseAnswer extracts the interaction id and answer text from a client reply.

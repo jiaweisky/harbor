@@ -54,3 +54,27 @@ func TestStreamJSONControlRequest(t *testing.T) {
 		t.Fatalf("non-permission control_request should be ignored, got %+v", evs)
 	}
 }
+
+func TestStreamJSONAskUserQuestion(t *testing.T) {
+	p := parser.NewStreamJSON()
+	rec := `{"type":"control_request","request_id":"perm_q1",` +
+		`"request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion",` +
+		`"input":{"questions":[{"question":"Favorite color?","header":"Color","multiSelect":false,` +
+		`"options":[{"label":"Red","description":""},{"label":"Blue","description":""}]}]},` +
+		`"tool_use_id":"t1"}}`
+
+	evs := collect(t, p, rec)
+	if len(evs) != 1 || evs[0].Kind != agent.EventPermissionRequest {
+		t.Fatalf("ask-user control_request: %+v", evs)
+	}
+	itx := evs[0].Interaction
+	if itx == nil || itx.Kind != agent.InteractionQuestion {
+		t.Fatalf("interaction = %+v, want a question", itx)
+	}
+	if itx.ID != "perm_q1" || itx.Target != "Favorite color?" {
+		t.Fatalf("interaction = %+v, want id/target from the question", itx)
+	}
+	if len(itx.Options) != 2 || itx.Options[0] != "Red" || itx.Options[1] != "Blue" {
+		t.Fatalf("options = %v, want [Red Blue]", itx.Options)
+	}
+}

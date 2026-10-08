@@ -159,30 +159,52 @@ func TestRealCodebuddyPermission(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{
-		Message: message("Use the Bash tool to run the command: echo perm42"),
-	})
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-	task := resp.(*a2a.Task)
-	if task.Status.State != a2a.TaskStateInputRequired {
-		t.Fatalf("state = %s, want input-required", task.Status.State)
-	}
+	task := sendPaused(t, h, ctx, "Use the Bash tool to run the command: echo perm42")
 	itx := interactionFromMessage(t, task.Status.Message)
 	if itx.Kind != agent.InteractionPermission || itx.ID == "" {
 		t.Fatalf("interaction = %+v, want a permission with an id", itx)
 	}
 
-	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{
-		"id": itx.ID, "answer": "allow",
-	}))
-	done := resumeTask(t, h, ctx, task, answer)
+	done := answerEvent(t, h, ctx, task, itx, "allow")
 	if done.Status.State != a2a.TaskStateCompleted {
 		t.Fatalf("state = %s, want completed (text=%q)", done.Status.State, artifactText(done))
 	}
 	if got := artifactText(done); !strings.Contains(strings.ToLower(got), "perm42") {
 		t.Errorf("artifact = %q, want it to contain perm42", got)
+	}
+}
+
+// TestRealCodebuddyQuestion verifies the AskUserQuestion tool (enabled by the
+// SDK capability handshake) surfaces as an input-required question and the
+// chosen answer is injected back through the control_response.
+func TestRealCodebuddyQuestion(t *testing.T) {
+	requireCodebuddy(t)
+	h := codebuddyHandler(t, config.AgentConfig{
+		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		SDKCaps: true,
+		Args: []string{
+			"-p", "--input-format", "stream-json",
+			"--output-format", "stream-json", "--include-partial-messages",
+		},
+		Session: config.SessionConfig{IDFlag: "--session-id", ResumeFlag: "--resume", ContinueFlag: "-c"},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+
+	prompt := "Use the AskUserQuestion tool to ask my favorite color, offering exactly Red and Blue. " +
+		"Then reply with only my choice."
+	task := sendPaused(t, h, ctx, prompt)
+	itx := interactionFromMessage(t, task.Status.Message)
+	if itx.Kind != agent.InteractionQuestion || itx.Target == "" {
+		t.Fatalf("interaction = %+v, want a question with a target", itx)
+	}
+
+	done := answerEvent(t, h, ctx, task, itx, "Blue")
+	if done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed (text=%q)", done.Status.State, artifactText(done))
+	}
+	if got := artifactText(done); !strings.Contains(strings.ToLower(got), "blue") {
+		t.Errorf("artifact = %q, want it to mention the chosen answer (blue)", got)
 	}
 }
 

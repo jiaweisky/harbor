@@ -148,8 +148,9 @@ type Session interface {
 
 // Input is an out-of-band answer to a session (permission / clarification).
 type Input struct {
-	Kind   string
-	ID     string
+	Kind   string // interaction kind (e.g. "permission", "question")
+	ID     string // interaction id the client answered
+	Target string // interaction target (e.g. the question text)
 	Answer string
 }
 

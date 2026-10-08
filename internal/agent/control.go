@@ -7,8 +7,8 @@ import (
 
 // EncodePermissionResponse encodes a stream-json control_response answering a
 // can_use_tool request. answer is the client's chosen option ("allow"/"deny") or
-// free text. The frame carries both the codebuddy "allowed" field and the claude
-// "behavior" field so the same response works for either CLI.
+// free text. The inner response carries both the codebuddy "allowed" field and
+// the claude "behavior" field so the same frame works for either CLI.
 func EncodePermissionResponse(requestID, answer string) string {
 	allow := permissionAllowed(answer)
 	behavior := "deny"
@@ -20,14 +20,55 @@ func EncodePermissionResponse(requestID, answer string) string {
 		inner["reason"] = reason
 		inner["message"] = reason
 	}
-	frame := map[string]any{
+	return controlResponse(requestID, inner)
+}
+
+// EncodeQuestionResponse encodes a stream-json control_response answering an
+// AskUserQuestion tool request (delivered as can_use_tool). The chosen answer is
+// injected through updatedInput.answers, keyed by the question text.
+func EncodeQuestionResponse(requestID, question, answer string) string {
+	return controlResponse(requestID, map[string]any{
+		"allowed":  true,
+		"behavior": "allow",
+		"updatedInput": map[string]any{
+			"answers": map[string]any{question: answer},
+		},
+	})
+}
+
+// EncodeControlInitialize encodes the SDK capability handshake sent to a
+// stream-json CLI before its first prompt. Declaring askUserQuestion lets the
+// CLI route the AskUserQuestion tool through can_use_tool, which Harbor answers
+// as an InteractionQuestion.
+func EncodeControlInitialize() string {
+	return encodeFrame(map[string]any{
+		"type":       "control_request",
+		"request_id": "harbor-init",
+		"request": map[string]any{
+			"subtype":       "initialize",
+			"capabilities":  map[string]any{"askUserQuestion": true},
+			"sdkMcpServers": []any{},
+			"hooks":         map[string]any{},
+		},
+	})
+}
+
+// controlResponse wraps a command's inner response in the stream-json
+// control_response envelope.
+func controlResponse(requestID string, inner map[string]any) string {
+	return encodeFrame(map[string]any{
 		"type": "control_response",
 		"response": map[string]any{
 			"subtype":    "success",
 			"request_id": requestID,
 			"response":   inner,
 		},
-	}
+	})
+}
+
+// encodeFrame marshals one stream-json record and appends the newline that
+// delimits records.
+func encodeFrame(frame map[string]any) string {
 	b, _ := json.Marshal(frame)
 	return string(b) + "\n"
 }

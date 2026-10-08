@@ -404,6 +404,7 @@ Harbor **只以非交互模式**驱动 CLI：**凭据一律经环境变量注入
 - **server 模式**（`--serve`，含两种协议，`server_protocol` 选择）：Harbor spawn `codebuddy --serve --host 127.0.0.1 --auth none`，从 stdout 的 `Endpoint` 行解析监听 URL（或用 `server_url`）；所有请求带 `X-CodeBuddy-Request: 1`。
   - `http`（默认）：`POST /api/v1/runs`（Gateway 消息体）+ `GET /api/v1/runs/:runId/stream`（SSE，回合级 `message` + `done`），`source.conversation.id` 维持多轮连续。
   - `acp`：`/api/v1/acp`（ACP over HTTP/SSE，与 `--acp` 同一协议）——`connect` → 命令走 `POST`（响应/相关通知在该 POST 的 SSE 回复里流回）→ `GET` 收主动通知；复用 stdio ACP 的 `session/new`/`session/load`/`session/prompt`/`session/update`/`session/request_permission` 映射，能力与 `--acp` 一致（逐 token、工具轨迹、权限交互）。
+- **交互**（无头 `stream-json`）：权限经 `control_request`/`can_use_tool` 桥接到 `input-required`；提问（`AskUserQuestion`）同样经 `can_use_tool`，需 `sdk_capabilities: true` 在首个 prompt 前声明 `askUserQuestion` 能力，退化为 `InteractionQuestion`（见 §7.4）。
 - **会话续跑**：`--resume` / `--session-id` / `-c`（无头）；`server`+`http` 用 `source.conversation.id`；`server`+`acp` 用 ACP `session/load`（`session/new` 返回的 id 作为 `EventSession` 复用）。
 - **凭据变量**：`CODEBUDDY_API_KEY`（官方文档：非交互 `-p` 模式**始终使用**）、`CODEBUDDY_AUTH_TOKEN`、`ANTHROPIC_API_KEY`（走 Anthropic 协议的自建网关）。
 - **配置根 / 模型 / 网关**：`CODEBUDDY_CONFIG_DIR`（默认 `~/.codebuddy`）、`CODEBUDDY_MODEL`、`CODEBUDDY_BASE_URL`。
@@ -817,9 +818,12 @@ type Capabilities struct {
 **已落地**：交互规范化在 **ACP** 与 **stream-json** 两条路径实现——`input-required` 消息同时携带人可读 `TextPart` 与结构化 `DataPart`（`{kind,id,action,target,risk,options,resume}`）；答复可用同构 `DataPart`（Harbor 校验 `id`，不匹配则拒绝）或纯文本兜底；Card 在存在交互能力时声明扩展 `https://github.com/jiaweisky/harbor/extensions/interaction/v1`（schema 见 `extensions/interaction.md`）。
 
 - **ACP**：`session/request_permission` → `input-required`（optionId 作答）。
-- **stream-json**：`control_request` 且 `request.subtype="can_use_tool"`（claude/codebuddy 无头模式的实际权限通道）→ `InteractionPermission`（`id` = `request_id`，选项 `allow`/`deny`）；答复经 `Session.Send` 编码为 `control_response`（`response.response` 同时带 codebuddy 的 `allowed` 与 claude 的 `behavior`，两种 CLI 通用）；**原进程挂起**等待 stdin，无需重启。实测 codebuddy：暂停于 `input-required` → 答复 `allow` → Bash 执行 → 完成。
+- **stream-json**：`control_request` 且 `request.subtype="can_use_tool"`（claude/codebuddy 无头模式的实际权限/提问通道），按 `tool_name` 分流：
+  - 默认 → `InteractionPermission`（`id`=`request_id`，选项 `allow`/`deny`）；答复编码为 `control_response`（`response.response` 同时带 codebuddy 的 `allowed` 与 claude 的 `behavior`，两种 CLI 通用）。
+  - `AskUserQuestion` → `InteractionQuestion`（`id`=`request_id`，`target`=问题文本，`options`=选项 label）；答复编码为 `control_response` 的 `updatedInput.answers{问题: 选择}` 注入。因该工具需客户端先声明能力，`agents[].sdk_capabilities: true` 会在首个 prompt 前发送 `initialize` 声明 `askUserQuestion`（见 §5.4）；未开启时 CLI 不暴露该工具。
+  - 两种情形**原进程挂起**等待 stdin，无需重启。实测 codebuddy：权限（暂停→`allow`→Bash 执行→完成）与提问（暂停→选择 `Blue`→完成）均通过。
 
-尚未接入：`elicitation_create` / `question`（codebuddy `AskUserForStructuredInput` 的响应形状为 `{action,content}`，与权限不同）、`plan_approval`，以及“不支持挂起续答”时的 `--resume` 有损注入。
+尚未接入：`elicitation_create`（表单式，入口同样经 SDK 能力声明，但响应形状为 `{action,content}`，与 `can_use_tool` 不同）、`plan_approval`，以及“不支持挂起续答”时的 `--resume` 有损注入。
 
 ### 7.5 媒体类型对齐
 
@@ -1233,6 +1237,7 @@ agents:
     integration: stream-json
     args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages"]
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
+    sdk_capabilities: true   # 允许 agent 通过 AskUserQuestion 提问（作为 input-required）
     env:
       CODEBUDDY_API_KEY: "${CODEBUDDY_API_KEY}"   # 可选：CODEBUDDY_BASE_URL / CODEBUDDY_MODEL
 
@@ -1551,6 +1556,7 @@ type AgentConfig struct {
     ServerProtocol string            `yaml:"server_protocol"`  // server 模式协议：http（默认）| acp（codebuddy 的 serve 两种协议）
     Env            map[string]string `yaml:"env"`
     AllowDangerous bool              `yaml:"allow_dangerous"`
+    SDKCaps        bool              `yaml:"sdk_capabilities"` // stream-json：首个 prompt 前声明 askUserQuestion，允许 agent 提问（§7.4）
     Session        SessionConfig     `yaml:"session"`
     Limits         LimitsConfig      `yaml:"limits"`
 }
