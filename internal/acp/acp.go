@@ -13,16 +13,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/jsonrpc"
 )
 
 // protocolVersion is the ACP protocol version Harbor speaks.
@@ -61,23 +58,18 @@ func (l *Launcher) Name() string { return l.cfg.Name }
 
 func (l *Launcher) Auth() agent.Authenticator { return l.cfg.Auth }
 
-// authEnv is the environment a CLI's auth commands run with.
-func (l *Launcher) authEnv() []string { return l.runner.Env(&agent.Invocation{Env: l.cfg.Env}) }
-
-// AuthReady reports whether the CLI currently holds a usable ticket.
+// AuthReady reports the CLI's best-effort authentication status.
 func (l *Launcher) AuthReady(ctx context.Context) bool {
-	return agent.Authenticated(ctx, l.cfg.Binary, l.runner.AuthBase(), l.authEnv(), l.cfg.Auth)
-}
-
-// EnsureLogin verifies the CLI holds a ticket, attempting its login once when
-// none is present.
-func (l *Launcher) EnsureLogin(ctx context.Context) error {
-	return agent.EnsureLogin(ctx, l.cfg.Name, l.cfg.Binary, l.runner.AuthBase(), l.authEnv(), l.cfg.Auth)
+	return agent.AuthReadyFor(ctx, l.cfg.Binary, l.runner, l.cfg.Env, l.cfg.Auth)
 }
 
 // Capabilities describes an ACP agent: token streaming, tool traces, and native
 // interaction through permission requests, which resume within the turn.
-func (l *Launcher) Capabilities() agent.Capabilities {
+func (l *Launcher) Capabilities() agent.Capabilities { return acpCapabilities() }
+
+// acpCapabilities is the capability set shared by the stdio and HTTP ACP
+// transports.
+func acpCapabilities() agent.Capabilities {
 	return agent.Capabilities{
 		InputText:           true,
 		InputFile:           true,
@@ -90,18 +82,9 @@ func (l *Launcher) Capabilities() agent.Capabilities {
 	}
 }
 
-// Probe reports the binary path and version. Version probing is skipped when no
-// version arguments are configured; an override is reported verbatim.
+// Probe reports the binary path and version.
 func (l *Launcher) Probe(ctx context.Context) agent.Info {
-	path, err := exec.LookPath(l.cfg.Binary)
-	if err != nil {
-		return agent.Info{Name: l.cfg.Name, Enabled: false, Err: err}
-	}
-	version := l.cfg.VersionOverride
-	if version == "" {
-		version = agent.DetectVersion(ctx, path, l.cfg.VersionArgs)
-	}
-	return agent.Info{Name: l.cfg.Name, Path: path, Enabled: true, Version: version}
+	return agent.ProbeBinary(ctx, l.cfg.Name, l.cfg.Binary, l.cfg.VersionArgs, l.cfg.VersionOverride)
 }
 
 // Start launches the CLI and completes the ACP handshake. The first prompt is
@@ -110,9 +93,6 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	cwd, err := absWorkDir(req.WorkDir)
 	if err != nil {
 		return nil, err
-	}
-	if req.Login {
-		return l.startLogin(ctx, cwd)
 	}
 
 	taskID := agent.TaskIDFrom(ctx)
@@ -130,8 +110,9 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	}
 
 	s := &session{events: events, kill: func() { l.runner.Kill(taskID) }}
-	c := &conn{stdin: l.runner.Stdin(taskID), pending: map[int64]chan rpcMessage{}, s: s}
+	c := &conn{Conn: jsonrpc.New(l.runner.Stdin(taskID)), s: s}
 	s.conn = c
+	c.SetHandler(c)
 	d.setConn(c)
 
 	sessionID, err := handshake(ctx, c, cwd)
@@ -142,49 +123,6 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	s.startPrompt(ctx, sessionID, req.Prompt)
 	return s, nil
 }
-
-// startLogin runs the CLI's login command and streams its output so a client
-// can read a device-code URL and complete the login out of band. It does not
-// speak ACP: the login command is a plain subprocess.
-func (l *Launcher) startLogin(ctx context.Context, cwd string) (agent.Session, error) {
-	if l.cfg.Auth == nil || len(l.cfg.Auth.LoginArgs()) == 0 {
-		return nil, agent.ErrNoLogin
-	}
-	inv := &agent.Invocation{
-		Bin:  l.cfg.Binary,
-		Args: append([]string(nil), l.cfg.Auth.LoginArgs()...),
-		Dir:  cwd,
-		Env:  append([]string(nil), l.cfg.Env...),
-	}
-	taskID := agent.TaskIDFrom(ctx)
-	events, err := l.runner.Start(ctx, taskID, inv, agent.NewLineParser())
-	if err != nil {
-		return nil, err
-	}
-	return &loginSession{events: events, kill: func() { l.runner.Kill(taskID) }}, nil
-}
-
-// loginSession streams a login command's output; it accepts no out-of-band
-// input.
-type loginSession struct {
-	events   <-chan agent.Event
-	kill     func()
-	canceled atomic.Bool
-}
-
-func (s *loginSession) Events() <-chan agent.Event { return s.events }
-
-func (s *loginSession) Send(context.Context, agent.Input) error { return agent.ErrUnsupported }
-
-func (s *loginSession) Cancel() error {
-	s.canceled.Store(true)
-	if s.kill != nil {
-		s.kill()
-	}
-	return nil
-}
-
-func (s *loginSession) Canceled() bool { return s.canceled.Load() }
 
 // absWorkDir returns an absolute working directory, falling back to the process
 // working directory when the request carries none.
@@ -202,24 +140,38 @@ func absWorkDir(dir string) (string, error) {
 	return dir, nil
 }
 
-// handshake runs the ACP setup sequence and returns the new session id.
-func handshake(ctx context.Context, c *conn, cwd string) (string, error) {
-	if _, err := c.send(ctx, "initialize", map[string]any{
+// initialize performs the ACP initialize handshake.
+func initialize(ctx context.Context, c *conn) error {
+	if _, err := c.Conn.Request(ctx, "initialize", map[string]any{
 		"protocolVersion":    protocolVersion,
 		"clientCapabilities": map[string]any{},
 	}); err != nil {
-		return "", fmt.Errorf("acp initialize: %w", err)
+		return fmt.Errorf("acp initialize: %w", err)
 	}
-	res, err := c.send(ctx, "session/new", map[string]any{"cwd": cwd, "mcpServers": []any{}})
+	return nil
+}
+
+// openSession creates a new ACP session and returns its id.
+func openSession(ctx context.Context, c *conn, cwd string) (string, error) {
+	res, err := c.Conn.Request(ctx, "session/new", map[string]any{"cwd": cwd, "mcpServers": []any{}})
 	if err != nil {
 		return "", fmt.Errorf("acp session/new: %w", err)
 	}
 	var ns newSessionResponse
-	if err := json.Unmarshal(res, &ns); err != nil || ns.SessionID == "" {
+	if json.Unmarshal(res, &ns) != nil || ns.SessionID == "" {
 		return "", fmt.Errorf("acp session/new: missing session id")
 	}
 	c.setSessionID(ns.SessionID)
 	return ns.SessionID, nil
+}
+
+// handshake runs the ACP setup sequence for the stdio transport and returns the
+// new session id.
+func handshake(ctx context.Context, c *conn, cwd string) (string, error) {
+	if err := initialize(ctx, c); err != nil {
+		return "", err
+	}
+	return openSession(ctx, c, cwd)
 }
 
 // session is one ACP prompt turn backed by a live CLI process.
@@ -251,7 +203,7 @@ func (s *session) Send(_ context.Context, in agent.Input) error {
 	if in.Answer != "" {
 		outcome = map[string]any{"outcome": "selected", "optionId": in.Answer}
 	}
-	return s.conn.respond(id, map[string]any{"outcome": outcome})
+	return s.conn.Conn.Respond(id, map[string]any{"outcome": outcome})
 }
 
 func (s *session) Cancel() error {
@@ -263,7 +215,7 @@ func (s *session) Cancel() error {
 		cancel()
 	}
 	if sid := s.conn.sessionID(); sid != "" {
-		_ = s.conn.notify("session/cancel", map[string]any{"sessionId": sid})
+		_ = s.conn.Conn.Notify("session/cancel", map[string]any{"sessionId": sid})
 	}
 	if s.kill != nil {
 		s.kill()
@@ -291,7 +243,7 @@ func (s *session) startPrompt(ctx context.Context, sessionID, prompt string) {
 
 	go func() {
 		defer cancel()
-		res, err := s.conn.send(promptCtx, "session/prompt", params)
+		res, err := s.conn.Conn.Request(promptCtx, "session/prompt", params)
 		if err != nil {
 			if s.Canceled() || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
@@ -348,23 +300,30 @@ func (d *dispatcher) Parse(rec []byte, out func(agent.Event)) error {
 	c := d.c
 	d.mu.Unlock()
 	if c != nil {
-		c.handle(rec, out)
+		c.setEmit(out)
+		c.Handle(rec)
 	}
 	return nil
 }
 
 func (d *dispatcher) Flush(func(agent.Event)) error { return nil }
 
-// conn is the JSON-RPC peer over the CLI's stdin/stdout.
+// conn is the JSON-RPC peer over the CLI's stdin/stdout. The transport is
+// shared; this type owns the session state and event forwarding.
 type conn struct {
-	writeMu sync.Mutex
-	mu      sync.Mutex
-	stdin   io.Writer
-	nextID  int64
-	pending map[int64]chan rpcMessage
-	emit    func(agent.Event)
-	s       *session
-	sessID  string
+	*jsonrpc.Conn
+	mu     sync.Mutex
+	emit   func(agent.Event)
+	s      *session
+	sessID string
+}
+
+// setEmit installs the event sink. It may be swapped mid-session (for example to
+// discard a resume's replayed history until the handshake completes).
+func (c *conn) setEmit(emit func(agent.Event)) {
+	c.mu.Lock()
+	c.emit = emit
+	c.mu.Unlock()
 }
 
 func (c *conn) setSessionID(id string) {
@@ -389,101 +348,13 @@ func (c *conn) emitEvent(ev agent.Event) {
 	}
 }
 
-// send writes a request and waits for its response or context cancellation.
-func (c *conn) send(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	c.mu.Lock()
-	c.nextID++
-	id := c.nextID
-	ch := make(chan rpcMessage, 1)
-	c.pending[id] = ch
-	c.mu.Unlock()
-
-	if err := c.write(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
-		c.forget(id)
-		return nil, err
-	}
-	select {
-	case m := <-ch:
-		if m.Error != nil {
-			return nil, m.Error
-		}
-		return m.Result, nil
-	case <-ctx.Done():
-		c.forget(id)
-		return nil, ctx.Err()
-	}
-}
-
-// forget drops the pending slot for a request that will not receive a response.
-func (c *conn) forget(id int64) {
-	c.mu.Lock()
-	delete(c.pending, id)
-	c.mu.Unlock()
-}
-
-// notify writes a notification (a request without an id).
-func (c *conn) notify(method string, params any) error {
-	return c.write(rpcRequest{JSONRPC: "2.0", Method: method, Params: params})
-}
-
-// respond answers an inbound request from the agent.
-func (c *conn) respond(id json.RawMessage, result any) error {
-	return c.write(rpcResponse{JSONRPC: "2.0", ID: id, Result: result})
-}
-
-func (c *conn) respondError(id json.RawMessage, code int, msg string) error {
-	return c.write(rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg}})
-}
-
-func (c *conn) write(v any) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	b = append(b, '\n')
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.stdin == nil {
-		return errors.New("acp: connection closed")
-	}
-	_, err = c.stdin.Write(b)
-	return err
-}
-
-// handle consumes one stdout record.
-func (c *conn) handle(line []byte, emit func(agent.Event)) {
-	c.mu.Lock()
-	if c.emit == nil {
-		c.emit = emit
-	}
-	c.mu.Unlock()
-
-	var m rpcMessage
-	if err := json.Unmarshal(line, &m); err != nil {
-		return
-	}
-	switch {
-	case m.Method != "" && len(m.ID) == 0:
-		c.handleNotification(m)
-	case m.Method != "":
-		c.handleRequest(m)
-	default:
-		c.resolveResponse(m)
-	}
-}
-
-// chunkEvent maps streaming text updates to their normalized event kind.
-var chunkEvent = map[string]agent.EventKind{
-	"agent_message_chunk": agent.EventTextDelta,
-	"agent_thought_chunk": agent.EventThinking,
-}
-
-func (c *conn) handleNotification(m rpcMessage) {
-	if m.Method != "session/update" {
+// Notification routes a server notification (a streaming session update).
+func (c *conn) Notification(method string, params json.RawMessage) {
+	if method != "session/update" {
 		return
 	}
 	var p sessionUpdateParams
-	if json.Unmarshal(m.Params, &p) != nil {
+	if json.Unmarshal(params, &p) != nil {
 		return
 	}
 	if kind, ok := chunkEvent[p.Update.SessionUpdate]; ok {
@@ -505,68 +376,28 @@ func (c *conn) handleNotification(m rpcMessage) {
 	}
 }
 
-func (c *conn) handleRequest(m rpcMessage) {
-	switch m.Method {
+// Request answers a server-initiated request.
+func (c *conn) Request(id json.RawMessage, method string, params json.RawMessage) {
+	switch method {
 	case "session/request_permission":
 		var p permissionParams
-		if json.Unmarshal(m.Params, &p) != nil {
-			_ = c.respondError(m.ID, codeInvalidParams, "invalid params")
+		if json.Unmarshal(params, &p) != nil {
+			_ = c.Conn.RespondError(id, codeInvalidParams, "invalid params")
 			return
 		}
-		c.s.onPermission(m.ID, p)
+		c.s.onPermission(id, p)
 	default:
 		// fs/* and terminal/* are not advertised, so the agent must not call
 		// them; answer with a method-not-found error for a clean failure.
-		_ = c.respondError(m.ID, codeMethodNotFound, "method not found: "+m.Method)
+		_ = c.Conn.RespondError(id, codeMethodNotFound, "method not found: "+method)
 	}
 }
 
-// resolveResponse delivers a response to the goroutine waiting in send.
-func (c *conn) resolveResponse(m rpcMessage) {
-	id, err := parseID(m.ID)
-	if err != nil {
-		return
-	}
-	c.mu.Lock()
-	ch := c.pending[id]
-	delete(c.pending, id)
-	c.mu.Unlock()
-	if ch != nil {
-		ch <- m
-	}
+// chunkEvent maps streaming text updates to their normalized event kind.
+var chunkEvent = map[string]agent.EventKind{
+	"agent_message_chunk": agent.EventTextDelta,
+	"agent_thought_chunk": agent.EventThinking,
 }
-
-// --- wire types ---
-
-type rpcMessage struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
-}
-
-type rpcRequest struct {
-	JSONRPC string `json:"jsonrpc"`
-	ID      int64  `json:"id,omitempty"`
-	Method  string `json:"method"`
-	Params  any    `json:"params,omitempty"`
-}
-
-type rpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"`
-	Result  any             `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-func (e *rpcError) Error() string { return fmt.Sprintf("acp: %s (%d)", e.Message, e.Code) }
 
 // JSON-RPC error codes used in responses to the agent.
 const (
@@ -690,8 +521,4 @@ func optionLabels(options []permissionOption) []string {
 		}
 	}
 	return labels
-}
-
-func parseID(raw json.RawMessage) (int64, error) {
-	return strconv.ParseInt(strings.Trim(string(raw), `"`), 10, 64)
 }

@@ -37,7 +37,7 @@ func TestIsolationWorktree(t *testing.T) {
 	runGit(t, repo, "add", ".")
 	runGit(t, repo, "commit", "-m", "init")
 
-	r := workspace.NewResolverWithIsolation(root, false, workspace.IsolationWorktree, iso)
+	r := workspace.NewResolverWithIsolation(root, false, workspace.IsolationWorktree, iso, "")
 	a, err := r.Resolve("ctx-a", "repo")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -63,7 +63,7 @@ func TestIsolationCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := workspace.NewResolverWithIsolation(root, false, workspace.IsolationCopy, iso)
+	r := workspace.NewResolverWithIsolation(root, false, workspace.IsolationCopy, iso, "")
 	a, err := r.Resolve("ctx-a", "repo")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -214,5 +214,38 @@ func TestResolveBindsToContext(t *testing.T) {
 	}
 	if again != first {
 		t.Fatalf("context binding not reused: %q != %q", again, first)
+	}
+}
+
+func TestDefaultWorkdir(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"myproj", "other"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := workspace.NewResolverWithIsolation(root, false, workspace.IsolationShared, "", "myproj")
+
+	got, err := r.Resolve("ctx-default", "")
+	if err != nil {
+		t.Fatalf("resolve default: %v", err)
+	}
+	want, _ := filepath.EvalSymlinks(filepath.Join(root, "myproj"))
+	if got != want {
+		t.Fatalf("default resolve = %q, want %q", got, want)
+	}
+
+	gotOther, err := r.Resolve("ctx-other", "other")
+	if err != nil {
+		t.Fatalf("resolve explicit: %v", err)
+	}
+	wantOther, _ := filepath.EvalSymlinks(filepath.Join(root, "other"))
+	if gotOther != wantOther {
+		t.Fatalf("explicit resolve = %q, want %q", gotOther, wantOther)
+	}
+
+	outside := workspace.NewResolverWithIsolation(root, false, workspace.IsolationShared, "", filepath.Dir(root))
+	if _, err := outside.Resolve("ctx-out", ""); !errors.Is(err, workspace.ErrDenied) {
+		t.Fatalf("expected denial for a default outside the root, got %v", err)
 	}
 }

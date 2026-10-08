@@ -45,6 +45,7 @@ type SandboxConfig struct {
 	IsolationRoot string `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
 	InheritEnv    *bool  `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
 	CLIHome       string `yaml:"cli_home"`       // optional root for the CLI's config/home
+	StateDir      string `yaml:"state_dir"`      // runtime state (orphan tracking); default under the temp dir
 }
 
 // InheritEnvEnabled reports whether child processes inherit the parent
@@ -67,12 +68,21 @@ const (
 	// Use it when the CLI only offers one-shot execution (no structured stream).
 	// Streaming is line-level only and there is no native interaction.
 	IntegrationExec Integration = "exec"
-	// IntegrationServer proxies a CLI's own HTTP/app-server. Recognized but not
-	// implemented yet.
+	// IntegrationServer proxies a CLI's own HTTP server or app-server, keeping
+	// one long-lived process and reusing server-side sessions across turns.
 	IntegrationServer Integration = "server"
-	// IntegrationACP speaks the Agent Client Protocol to a CLI. Recognized but
-	// not implemented yet.
+	// IntegrationACP speaks the Agent Client Protocol to a CLI.
 	IntegrationACP Integration = "acp"
+)
+
+// Server protocols for IntegrationServer. A CLI's HTTP server may expose a REST
+// API, ACP over SSE, or both (for example `codebuddy --serve`); the protocol
+// selects which one Harbor drives.
+const (
+	// ServerProtocolHTTP proxies the CLI's REST/HTTP API (default).
+	ServerProtocolHTTP = "http"
+	// ServerProtocolACP speaks ACP over the CLI's HTTP/SSE endpoint.
+	ServerProtocolACP = "acp"
 )
 
 // knownIntegrations lists every recognized integration value.
@@ -108,8 +118,11 @@ type AgentConfig struct {
 	DisplayName    string            `yaml:"display_name"`
 	Binary         string            `yaml:"binary"`
 	Integration    Integration       `yaml:"integration"`
-	Parser         string            `yaml:"parser"` // exec framing: text | codex | regex; default text
-	Regex          *RegexConfig      `yaml:"regex"`  // parser: regex
+	Parser         string            `yaml:"parser"`          // exec framing: text | codex | regex; default text
+	Regex          *RegexConfig      `yaml:"regex"`           // parser: regex
+	ServerURL      string            `yaml:"server_url"`      // integration: server; connect instead of spawning
+	ServerProtocol string            `yaml:"server_protocol"` // integration: server; "http" (default) or "acp"
+	Workdir        string            `yaml:"workdir"`         // default working dir (under workdir_root)
 	Args           []string          `yaml:"args"`
 	Env            map[string]string `yaml:"env"`
 	AllowDangerous bool              `yaml:"allow_dangerous"`
@@ -152,14 +165,14 @@ func (p Profile) Supports(i Integration) bool {
 // through to explicit configuration.
 var knownProfiles = []Profile{
 	{Binary: "codebuddy", Integration: IntegrationStreamJSON, MinVersion: "2.161.4", VersionArgs: []string{"--version"},
-		Supported: []Integration{IntegrationStreamJSON, IntegrationExec, IntegrationACP}},
+		Supported: []Integration{IntegrationStreamJSON, IntegrationExec, IntegrationACP, IntegrationServer}},
 	{Binary: "claude", Integration: IntegrationStreamJSON, MinVersion: "2.1.292", VersionArgs: []string{"--version"},
 		Supported: []Integration{IntegrationStreamJSON}},
 	{Binary: "opencode", Integration: IntegrationExec, MinVersion: "1.18.35", VersionArgs: []string{"--version"},
-		Supported: []Integration{IntegrationExec, IntegrationACP}, ACPArgs: []string{"acp"}},
+		Supported: []Integration{IntegrationExec, IntegrationACP, IntegrationServer}, ACPArgs: []string{"acp"}},
 	{Binary: "codex", Integration: IntegrationExec, Parser: "codex",
 		MinVersion: "0.160.1", VersionArgs: []string{"--version"},
-		Supported: []Integration{IntegrationExec}},
+		Supported: []Integration{IntegrationExec, IntegrationServer}},
 }
 
 // LookupProfile returns the profile for a binary path or name.
@@ -183,8 +196,9 @@ type SessionConfig struct {
 // LimitsConfig bounds concurrent execution for an agent.
 type LimitsConfig struct {
 	MaxConcurrent int            `yaml:"max_concurrent"`
-	Timeout       time.Duration  `yaml:"timeout"` // total task timeout; 0 disables
-	Breaker       *BreakerConfig `yaml:"breaker"` // optional failure circuit breaker
+	Timeout       time.Duration  `yaml:"timeout"`      // total task timeout; 0 disables
+	IdleTimeout   time.Duration  `yaml:"idle_timeout"` // fail if the CLI produces no output for this long; 0 disables
+	Breaker       *BreakerConfig `yaml:"breaker"`      // optional failure circuit breaker
 }
 
 // BreakerConfig configures the per-agent failure circuit breaker.
@@ -231,6 +245,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Sandbox.Isolation == "" {
 		c.Sandbox.Isolation = "shared"
+	}
+	if c.Sandbox.StateDir == "" {
+		c.Sandbox.StateDir = filepath.Join(os.TempDir(), "harbor")
 	}
 	for i := range c.Agents {
 		a := &c.Agents[i]
@@ -308,6 +325,14 @@ func (c *Config) validate() error {
 				"agent %q: integration %q requires args selecting the CLI's ACP mode "+
 					"(for example [\"acp\"]); without them the CLI would start its interactive UI",
 				a.ID, IntegrationACP,
+			)
+		}
+		switch a.ServerProtocol {
+		case "", ServerProtocolHTTP, ServerProtocolACP:
+		default:
+			return fmt.Errorf(
+				"agent %q: server_protocol must be %q or %q; got %q",
+				a.ID, ServerProtocolHTTP, ServerProtocolACP, a.ServerProtocol,
 			)
 		}
 	}

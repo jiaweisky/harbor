@@ -25,7 +25,6 @@ type Request struct {
 	SessionID   string
 	Continue    bool
 	MaxTurns    int
-	Login       bool // run the CLI's login command instead of a prompt
 	Meta        map[string]any
 }
 
@@ -36,8 +35,10 @@ type Invocation struct {
 	Env   []string
 	Dir   string
 	Stdin io.Reader // optional; headless structured input (duplex)
-	// KeepStdinOpen keeps the stdin pipe open after Stdin is copied, for duplex
-	// sessions that later receive Session.Send. When false, stdin is closed at EOF.
+	// KeepStdinOpen keeps the stdin pipe open for a duplex transport that reads
+	// requests from it (stream-json, ACP, app-server). When false, stdin is
+	// closed after any initial Stdin payload, or immediately when there is none,
+	// so a one-shot CLI sees EOF instead of blocking on an open pipe.
 	KeepStdinOpen bool
 }
 
@@ -131,13 +132,9 @@ type Launcher interface {
 	// Auth describes how the CLI authenticates (may be nil for CLIs Harbor
 	// cannot verify).
 	Auth() Authenticator
-	// AuthReady reports whether the CLI is authenticated for service-level
-	// (shared) use. It is always true when credentials are per caller.
+	// AuthReady reports the CLI's best-effort authentication status, for
+	// readiness reporting. It never gates task execution.
 	AuthReady(ctx context.Context) bool
-	// EnsureLogin verifies the CLI holds a ticket, attempting its login command
-	// once when none is present. It is used at startup: a failure disables the
-	// agent.
-	EnsureLogin(ctx context.Context) error
 	Start(ctx context.Context, req *Request) (Session, error)
 }
 

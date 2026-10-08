@@ -4,6 +4,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,10 @@ import (
 	"github.com/jiaweisky/harbor/internal/acp"
 	"github.com/jiaweisky/harbor/internal/adapters"
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/codebuddy"
+	"github.com/jiaweisky/harbor/internal/codex"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/opencode"
 	"github.com/jiaweisky/harbor/internal/parser"
 	versionutil "github.com/jiaweisky/harbor/internal/version"
 )
@@ -22,6 +26,9 @@ type Options struct {
 	InheritEnv bool
 	// CLIHome, when set, redirects the CLI's HOME and config roots under it.
 	CLIHome string
+	// Ctx bounds a long-running server process (integration "server"); nil uses
+	// a background context.
+	Ctx context.Context
 }
 
 // Build probes the CLI and constructs a launcher. A missing binary yields a
@@ -51,15 +58,13 @@ func Build(ctx context.Context, ac config.AgentConfig, opts Options) (agent.Laun
 	}
 
 	ac.Version = ver // reuse the probed version; avoids re-probing in the launcher
+	opts.Ctx = ctx
 	ln, err := New(ac, opts)
 	if err != nil {
 		return nil, agent.Info{}, err
 	}
-	// Login is a startup prerequisite: probe for a ticket and, if absent, run
-	// the CLI's login once. A failure disables the agent.
-	if err := ln.EnsureLogin(ctx); err != nil {
-		return nil, agent.Info{}, fmt.Errorf("login: %w", err)
-	}
+	// Harbor does not gate on its own credential guess: the CLI decides whether
+	// it can run, so a CLI that starts standalone is served as-is.
 	return ln, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Path: path, Enabled: true, Version: ver}, nil
 }
 
@@ -85,13 +90,12 @@ func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 	}
 
 	auth := authenticator(ac)
-	login := loginInvoke(ac, auth)
 
 	switch integ {
 	case config.IntegrationStreamJSON:
 		return agent.NewHeadlessLauncher(agent.LauncherConfig{
 			Name: ac.ID, Binary: ac.Binary, Capabilities: streamJSONCaps(),
-			Parser: parser.NewStreamJSON(), Invoke: streamJSONInvoke(ac), LoginInvoke: login,
+			Parser: parser.NewStreamJSON(), Invoke: streamJSONInvoke(ac),
 			Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
 			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
@@ -103,7 +107,7 @@ func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 		}
 		return agent.NewHeadlessLauncher(agent.LauncherConfig{
 			Name: ac.ID, Binary: ac.Binary, Capabilities: textCaps(),
-			Parser: p, Invoke: textInvoke(ac), LoginInvoke: login,
+			Parser: p, Invoke: textInvoke(ac),
 			Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
 			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
@@ -116,11 +120,41 @@ func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 			VersionArgs: versionArgs, VersionOverride: ac.Version,
 		}), nil
 	case config.IntegrationServer:
-		return nil, fmt.Errorf(
-			"integration %q is recognized but not implemented yet; use %q for a CLI with "+
-				"a structured stream, or %q for one-shot text output",
-			integ, config.IntegrationStreamJSON, config.IntegrationExec,
-		)
+		switch filepath.Base(ac.Binary) {
+		case "opencode":
+			return opencode.NewServerLauncher(opts.Ctx, opencode.Config{
+				Name: ac.ID, Binary: ac.Binary, BaseURL: ac.ServerURL,
+				Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
+				Auth: auth, VersionArgs: versionArgs, VersionOverride: ac.Version,
+			}), nil
+		case "codebuddy":
+			if ac.ServerProtocol == config.ServerProtocolACP {
+				return acp.NewHTTPLauncher(acp.HTTPConfig{
+					Name: ac.ID, Binary: ac.Binary,
+					Args:    []string{"--serve", "--host", "127.0.0.1", "--auth", "none"},
+					BaseURL: ac.ServerURL, Env: envSlice(ac.Env),
+					Headers: http.Header{"X-CodeBuddy-Request": {"1"}},
+					Auth:    auth, InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
+					VersionArgs: versionArgs, VersionOverride: ac.Version, Lifecycle: opts.Ctx,
+				}), nil
+			}
+			return codebuddy.NewServerLauncher(opts.Ctx, codebuddy.Config{
+				Name: ac.ID, Binary: ac.Binary, BaseURL: ac.ServerURL,
+				Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
+				Auth: auth, VersionArgs: versionArgs, VersionOverride: ac.Version,
+			}), nil
+		case "codex":
+			return codex.NewServerLauncher(opts.Ctx, codex.Config{
+				Name: ac.ID, Binary: ac.Binary,
+				Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
+				Auth: auth, VersionArgs: versionArgs, VersionOverride: ac.Version,
+			}), nil
+		default:
+			return nil, fmt.Errorf(
+				"integration %q is implemented for opencode, codebuddy and codex; got %q",
+				integ, filepath.Base(ac.Binary),
+			)
+		}
 	default:
 		if known {
 			return nil, fmt.Errorf("binary %q supports %s", ac.Binary, config.IntegrationNames(profile.Supported))
@@ -137,23 +171,6 @@ func authenticator(ac config.AgentConfig) agent.Authenticator {
 		return a
 	}
 	return adapters.Unverified()
-}
-
-// loginInvoke builds the invocation that runs the CLI's login command, or nil
-// when the CLI has no headless login.
-func loginInvoke(ac config.AgentConfig, auth agent.Authenticator) agent.InvokeFunc {
-	args := auth.LoginArgs()
-	if len(args) == 0 {
-		return nil
-	}
-	return func(req *agent.Request) (*agent.Invocation, error) {
-		return &agent.Invocation{
-			Bin:  ac.Binary,
-			Args: append([]string(nil), args...),
-			Dir:  req.WorkDir,
-			Env:  envSlice(ac.Env),
-		}, nil
-	}
 }
 
 // streamJSONCaps describes a CLI driven over its structured, duplex stream mode.

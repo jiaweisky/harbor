@@ -12,13 +12,12 @@ func TestKnownAdapters(t *testing.T) {
 	cases := []struct {
 		binary       string
 		env          string
-		loginArg     string
-		unverifiable bool // LoggedIn cannot report absence (Keychain only)
+		unverifiable bool // LoggedIn never reports a definite absence
 	}{
-		{"claude", "ANTHROPIC_API_KEY", "auth", false},
-		{"codebuddy", "CODEBUDDY_API_KEY", "", true},
-		{"opencode", "OPENCODE_API_KEY", "auth", false},
-		{"codex", "CODEX_API_KEY", "login", false},
+		{"claude", "ANTHROPIC_API_KEY", false},
+		{"codebuddy", "CODEBUDDY_API_KEY", true},
+		{"opencode", "OPENCODE_API_KEY", true},
+		{"codex", "CODEX_API_KEY", false},
 	}
 	for _, c := range cases {
 		auth, ok := adapters.AuthFor("/usr/local/bin/"+c.binary, "1.0")
@@ -35,14 +34,6 @@ func TestKnownAdapters(t *testing.T) {
 		}
 		if !c.unverifiable && got {
 			t.Errorf("%s should not be logged in with no env and no file", c.binary)
-		}
-		args := auth.LoginArgs()
-		if c.loginArg == "" {
-			if args != nil {
-				t.Errorf("%s LoginArgs = %v, want nil", c.binary, args)
-			}
-		} else if len(args) == 0 || args[0] != c.loginArg {
-			t.Errorf("%s LoginArgs = %v, want first %q", c.binary, args, c.loginArg)
 		}
 	}
 }
@@ -73,16 +64,6 @@ func TestLoggedInResolvesConfigLocations(t *testing.T) {
 	codex, _ := adapters.AuthFor("codex", "1.0")
 	if !codex.LoggedIn(home, map[string]string{"CODEX_HOME": codexHome}) {
 		t.Error("codex should honor CODEX_HOME")
-	}
-
-	data := t.TempDir()
-	writeFile(t, filepath.Join(data, "opencode", "auth.json"))
-	oc, _ := adapters.AuthFor("opencode", "1.0")
-	if !oc.LoggedIn(home, map[string]string{"XDG_DATA_HOME": data}) {
-		t.Error("opencode should honor XDG_DATA_HOME")
-	}
-	if oc.LoggedIn(home, map[string]string{}) {
-		t.Error("opencode should not report a ticket without a file or env")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,6 +89,95 @@ func artifactText(task *a2a.Task) string {
 		}
 	}
 	return b.String()
+}
+
+// sendTask runs one prompt and returns the completed task and its elapsed time,
+// failing on error or a non-completed state. Shared by the tagged real-CLI tests.
+func sendTask(t *testing.T, h a2asrv.RequestHandler, m *a2a.Message) (*a2a.Task, time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	start := time.Now()
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	elapsed := time.Since(start)
+	t.Logf("state=%s elapsed=%s text=%q", task.Status.State, elapsed, artifactText(task))
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", task.Status.State)
+	}
+	return task, elapsed
+}
+
+// sendAndExpect runs one prompt and asserts the task completes quickly with want
+// text (a fast completion proves the CLI result ends the task, not a timeout).
+func sendAndExpect(t *testing.T, h a2asrv.RequestHandler, m *a2a.Message, want string) {
+	t.Helper()
+	task, elapsed := sendTask(t, h, m)
+	if text := artifactText(task); !strings.Contains(strings.ToLower(text), want) {
+		t.Errorf("expected %q, got %q", want, text)
+	}
+	if elapsed > 40*time.Second {
+		t.Errorf("took %s; should complete on the CLI result, not the timeout", elapsed)
+	}
+}
+
+// cancelRunningTask starts a task, waits for the CLI to actually run, cancels it
+// through the A2A CancelTask path, and asserts it ends canceled. It skips if the
+// task completes before the cancel. Shared by the tagged real-CLI tests.
+func cancelRunningTask(t *testing.T, h a2asrv.RequestHandler, prompt string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	seq := h.SendStreamingMessage(ctx, &a2a.SendMessageRequest{Message: message(prompt)})
+	taskCh := make(chan a2a.TaskID, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ev, err := range seq {
+			if err != nil {
+				return
+			}
+			if tk, ok := ev.(*a2a.Task); ok {
+				select {
+				case taskCh <- tk.ID:
+				default:
+				}
+			}
+		}
+	}()
+
+	var taskID a2a.TaskID
+	select {
+	case taskID = <-taskCh:
+	case <-time.After(15 * time.Second):
+		t.Fatal("no task id received")
+	}
+	// A task is marked working at submission, before the CLI runs; give the CLI
+	// time to start before canceling.
+	time.Sleep(10 * time.Second)
+	if got, err := h.GetTask(ctx, &a2a.GetTaskRequest{ID: taskID}); err == nil &&
+		got.Status.State == a2a.TaskStateCompleted {
+		t.Skip("task completed before it could be canceled")
+	}
+	if _, err := h.CancelTask(ctx, &a2a.CancelTaskRequest{ID: taskID}); err != nil {
+		t.Fatalf("CancelTask: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("stream did not finish after cancel")
+	}
+	got, err := h.GetTask(ctx, &a2a.GetTaskRequest{ID: taskID})
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.Status.State != a2a.TaskStateCanceled {
+		t.Fatalf("state = %s, want canceled", got.Status.State)
+	}
 }
 
 // interactionFromMessage extracts the structured interaction from the DataPart
@@ -223,6 +313,46 @@ func TestInputRequiredResume(t *testing.T) {
 	}
 }
 
+// TestStreamJSONPermissionResume verifies a stream-json control_request
+// (can_use_tool) surfaces as input-required and the answer is written back as a
+// control_response, letting the CLI finish.
+func TestStreamJSONPermissionResume(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-permission.sh"), "stream-json", []string{"-p"}, nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{Timeout: 10 * time.Second})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("run echo")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateInputRequired {
+		t.Fatalf("state = %s, want input-required", task.Status.State)
+	}
+	itx := interactionFromMessage(t, task.Status.Message)
+	if itx.Kind != agent.InteractionPermission || itx.ID == "" {
+		t.Fatalf("interaction = %+v, want a permission with an id", itx)
+	}
+	if itx.Action != "Bash" || len(itx.Options) == 0 {
+		t.Fatalf("interaction = %+v, want action Bash and options", itx)
+	}
+
+	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{
+		"id": itx.ID, "answer": "allow",
+	}))
+	done := resumeTask(t, h, ctx, task, answer)
+	if done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("state = %s, want completed", done.Status.State)
+	}
+	if got := artifactText(done); !strings.Contains(got, "allowed") {
+		t.Errorf("artifact text = %q, want it to contain allowed", got)
+	}
+}
+
 func TestInputRequiredAcceptsTextWithMetadataID(t *testing.T) {
 	h, ctx, cancel, task := newPausedACPTask(t)
 	defer cancel()
@@ -327,6 +457,55 @@ func TestSessionScopedByUser(t *testing.T) {
 	}
 }
 
+// TestServerModeEndToEnd drives the opencode "server" integration through the
+// A2A handler against a fake HTTP server, checking session reuse by context.
+func TestServerModeEndToEnd(t *testing.T) {
+	var creates, prompts int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/session", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&creates, 1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "ses_srv"})
+	})
+	mux.HandleFunc("/session/ses_srv/message", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&prompts, 1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"parts": []map[string]any{{"type": "text", "text": "from server"}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ln, err := integration.New(config.AgentConfig{
+		ID: "oc", Binary: fakeBin(t, "opencode", "#!/bin/sh\n"),
+		Integration: config.IntegrationServer, ServerURL: srv.URL,
+	}, integration.Options{Ctx: context.Background()})
+	if err != nil {
+		t.Fatalf("integration.New: %v", err)
+	}
+	h := newHandler(t, ln)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m1 := message("hi")
+	m1.ContextID = "srv-ctx"
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m1})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if got := artifactText(resp.(*a2a.Task)); !strings.Contains(got, "from server") {
+		t.Fatalf("artifact = %q", got)
+	}
+
+	m2 := message("again")
+	m2.ContextID = "srv-ctx"
+	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m2}); err != nil {
+		t.Fatalf("second SendMessage: %v", err)
+	}
+	if creates != 1 || prompts != 2 {
+		t.Fatalf("creates=%d prompts=%d, want 1 and 2", creates, prompts)
+	}
+}
+
 func TestSendMessage_opencode(t *testing.T) {
 	h := newHandler(t, newLauncher(t, scriptPath(t, "fake-opencode.sh"), "exec", []string{"run", "{{.Prompt}}"}, nil))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -342,6 +521,28 @@ func TestSendMessage_opencode(t *testing.T) {
 	}
 	if got := artifactText(task); !strings.Contains(got, "listing files") {
 		t.Fatalf("artifact text = %q", got)
+	}
+}
+
+func TestIdleTimeout(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-slow.sh"), "stream-json", nil, nil)
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{IdleTimeout: 200 * time.Millisecond, Timeout: 20 * time.Second})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("go")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateFailed {
+		t.Fatalf("state = %s, want failed", task.Status.State)
+	}
+	if code := task.Status.Message.Metadata["harbor.errorCode"]; code != "timeout" {
+		t.Fatalf("errorCode = %v, want timeout", code)
 	}
 }
 
@@ -531,46 +732,6 @@ func newExecLauncher(t *testing.T, ac config.AgentConfig, opts integration.Optio
 		t.Fatalf("integration.New: %v", err)
 	}
 	return ln
-}
-
-func TestLoginTask(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "args.log")
-	bin := filepath.Join(dir, "codex")
-	script := "#!/bin/sh\necho \"$@\" >> \"$HARBOR_ARG_LOG\" 2>/dev/null\n" +
-		"echo 'Open https://example.test/device?code=abc to sign in'\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ln := newExecLauncher(t, config.AgentConfig{
-		ID: "codex", Binary: bin, Env: map[string]string{"HARBOR_ARG_LOG": logPath},
-	}, integration.Options{InheritEnv: true})
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
-	h := a2asrv.NewHandler(exec)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	m := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("please sign me in"))
-	m.Metadata = map[string]any{"harbor.login": true}
-	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-	task := resp.(*a2a.Task)
-	if task.Status.State != a2a.TaskStateCompleted {
-		t.Fatalf("state = %s, want completed", task.Status.State)
-	}
-	if got := artifactText(task); !strings.Contains(got, "https://example.test/device") {
-		t.Fatalf("artifact = %q, want the login URL", got)
-	}
-	log, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("read arg log: %v", err)
-	}
-	if !strings.Contains(string(log), "login") {
-		t.Fatalf("login args not used, log = %q", string(log))
-	}
 }
 
 func TestCardVersion(t *testing.T) {

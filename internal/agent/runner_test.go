@@ -3,6 +3,7 @@ package agent_test
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +79,31 @@ func TestRunnerAbandonedConsumerReleasesSlot(t *testing.T) {
 	}
 }
 
+// TestRunnerSetsPWDToDir verifies that a child launched with Dir also sees PWD
+// set to it, so a CLI that reads PWD runs in the right directory (regression:
+// opencode used the parent's PWD and wrote outside the workspace).
+func TestRunnerSetsPWDToDir(t *testing.T) {
+	r := agent.NewRunner(1, true, "")
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	inv := &agent.Invocation{Bin: "sh", Args: []string{"-c", `printf %s "$PWD"`}, Dir: dir}
+	ch, err := r.Start(ctx, "t1", inv, agent.NewLineParser())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	var out strings.Builder
+	for ev := range ch {
+		if ev.Kind == agent.EventTextDelta {
+			out.WriteString(ev.Text)
+		}
+	}
+	if got := strings.TrimSpace(out.String()); got != dir {
+		t.Errorf("child PWD = %q, want %q", got, dir)
+	}
+}
+
 // TestRunnerDeliversAllEventsToSlowConsumer verifies backpressure: a slow
 // consumer still receives every event produced during normal operation.
 func TestRunnerDeliversAllEventsToSlowConsumer(t *testing.T) {
@@ -98,5 +124,29 @@ func TestRunnerDeliversAllEventsToSlowConsumer(t *testing.T) {
 	}
 	if got != n {
 		t.Fatalf("received %d events, want %d", got, n)
+	}
+}
+
+// TestRunnerClosesStdinOneShot verifies that a one-shot invocation with no
+// initial Stdin gets EOF on stdin, so a CLI that reads stdin does not block
+// (regression: `opencode run` / `codex exec` hung on an open pipe).
+func TestRunnerClosesStdinOneShot(t *testing.T) {
+	r := agent.NewRunner(1, true, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	inv := &agent.Invocation{Bin: "sh", Args: []string{"-c", "cat >/dev/null; echo done"}}
+	ch, err := r.Start(ctx, "t1", inv, agent.NewLineParser())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var out strings.Builder
+	for ev := range ch {
+		if ev.Kind == agent.EventTextDelta {
+			out.WriteString(ev.Text)
+		}
+	}
+	if !strings.Contains(out.String(), "done") {
+		t.Fatalf("CLI blocked on stdin (no EOF); output = %q", out.String())
 	}
 }

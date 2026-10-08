@@ -40,3 +40,12 @@ func (p *Regex) Parse(rec []byte, out func(agent.Event)) error {
 
 // Flush implements agent.Parser.
 func (p *Regex) Flush(func(agent.Event)) error { return nil }
+
+func init() {
+	RegisterParser("regex", func(pattern string) (agent.Parser, error) {
+		if pattern == "" {
+			return nil, fmt.Errorf(`parser "regex" requires regex.text`)
+		}
+		return NewRegex(pattern)
+	})
+}

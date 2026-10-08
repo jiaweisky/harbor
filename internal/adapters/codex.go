@@ -22,8 +22,6 @@ func (codex) LoggedIn(home string, env map[string]string) bool {
 	return fileExists(filepath.Join(dir, "auth.json"))
 }
 
-func (codex) LoginArgs() []string { return []string{"login"} }
-
 // `codex login status` exits non-zero (and prints "not logged in") when there
 // is no active login.
 func (codex) StatusArgs() []string { return []string{"login", "status"} }

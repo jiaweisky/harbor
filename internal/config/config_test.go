@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jiaweisky/harbor/internal/config"
 )
@@ -44,6 +45,32 @@ agents:
 `)
 	if _, err := config.Load(path); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestServerProtocolValidation(t *testing.T) {
+	valid := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: server
+    server_protocol: acp
+`)
+	if _, err := config.Load(valid); err != nil {
+		t.Fatalf("unexpected error for acp protocol: %v", err)
+	}
+
+	bad := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: server
+    server_protocol: grpc
+`)
+	if _, err := config.Load(bad); err == nil || !strings.Contains(err.Error(), "server_protocol") {
+		t.Fatalf("expected a server_protocol error, got %v", err)
 	}
 }
 
@@ -141,6 +168,29 @@ agents:
 	_, err := config.Load(path)
 	if err == nil || !strings.Contains(err.Error(), "unknown binary") {
 		t.Fatalf("expected an unknown-binary error, got %v", err)
+	}
+}
+
+func TestLimitsParsed(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+    limits:
+      max_concurrent: 2
+      timeout: 30m
+      idle_timeout: 5m
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lim := cfg.Agents[0].Limits
+	if lim.Timeout != 30*time.Minute || lim.IdleTimeout != 5*time.Minute || lim.MaxConcurrent != 2 {
+		t.Fatalf("limits = %+v", lim)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/jsonrpc"
 )
 
 // scriptedWriter answers each outbound request via a canned response, so the
@@ -21,11 +22,14 @@ type scriptedWriter struct {
 func (w *scriptedWriter) Write(p []byte) (int, error) {
 	line := strings.TrimSpace(string(p))
 	w.written = append(w.written, line)
-	var m rpcMessage
+	var m struct {
+		Method string          `json:"method"`
+		ID     json.RawMessage `json:"id"`
+	}
 	if err := json.Unmarshal([]byte(line), &m); err == nil && m.Method != "" && w.response != nil {
-		id, _ := parseID(m.ID)
+		id, _ := strconv.ParseInt(strings.Trim(string(m.ID), `"`), 10, 64)
 		if resp := w.response(m.Method, id); resp != "" {
-			w.c.handle([]byte(resp), func(agent.Event) {})
+			w.c.Handle([]byte(resp))
 		}
 	}
 	return len(p), nil
@@ -33,10 +37,11 @@ func (w *scriptedWriter) Write(p []byte) (int, error) {
 
 func newTestConn() (*conn, *session, *scriptedWriter) {
 	s := &session{}
-	c := &conn{pending: map[int64]chan rpcMessage{}, s: s}
+	c := &conn{s: s}
 	s.conn = c
 	w := &scriptedWriter{c: c}
-	c.stdin = w
+	c.Conn = jsonrpc.New(w)
+	c.SetHandler(c)
 	return c, s, w
 }
 
@@ -45,7 +50,7 @@ func TestSendCorrelatesResponse(t *testing.T) {
 	w.response = func(method string, id int64) string {
 		return `{"jsonrpc":"2.0","id":` + itoa(id) + `,"result":{"sessionId":"ses_1"}}`
 	}
-	res, err := c.send(context.Background(), "session/new", map[string]any{"cwd": "/tmp"})
+	res, err := c.Conn.Request(context.Background(), "session/new", map[string]any{"cwd": "/tmp"})
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -63,7 +68,7 @@ func TestSendPropagatesRPCError(t *testing.T) {
 	w.response = func(method string, id int64) string {
 		return `{"jsonrpc":"2.0","id":` + itoa(id) + `,"error":{"code":-32602,"message":"nope"}}`
 	}
-	_, err := c.send(context.Background(), "session/prompt", nil)
+	_, err := c.Conn.Request(context.Background(), "session/prompt", nil)
 	if err == nil || !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("expected rpc error, got %v", err)
 	}
@@ -73,11 +78,12 @@ func TestSessionUpdateEmitsEvents(t *testing.T) {
 	c, _, _ := newTestConn()
 	var got []agent.Event
 	emit := func(ev agent.Event) { got = append(got, ev) }
+	c.setEmit(emit)
 
-	c.handle(updateLine("agent_thought_chunk", "why"), emit)
-	c.handle(updateLine("agent_message_chunk", "Hello"), emit)
-	c.handle(updateLine("agent_message_chunk", " world"), emit)
-	c.handle(toolCallLine("tool_call", "bash"), emit)
+	c.Handle(updateLine("agent_thought_chunk", "why"))
+	c.Handle(updateLine("agent_message_chunk", "Hello"))
+	c.Handle(updateLine("agent_message_chunk", " world"))
+	c.Handle(toolCallLine("tool_call", "bash"))
 
 	want := []agent.EventKind{
 		agent.EventThinking, agent.EventTextDelta, agent.EventTextDelta, agent.EventToolCall,
@@ -102,12 +108,13 @@ func TestToolCallUpdateOnlyEmitsWhenFinished(t *testing.T) {
 	c, _, _ := newTestConn()
 	var got []agent.Event
 	emit := func(ev agent.Event) { got = append(got, ev) }
+	c.setEmit(emit)
 
-	c.handle(statusLine("in_progress"), emit)
+	c.Handle(statusLine("in_progress"))
 	if len(got) != 0 {
 		t.Fatalf("in-progress update emitted %d events, want 0", len(got))
 	}
-	c.handle(statusLine("completed"), emit)
+	c.Handle(statusLine("completed"))
 	if len(got) != 1 || got[0].Kind != agent.EventToolResult {
 		t.Fatalf("completed update = %+v, want one tool result", got)
 	}
@@ -116,7 +123,8 @@ func TestToolCallUpdateOnlyEmitsWhenFinished(t *testing.T) {
 func TestPermissionRequestAndAnswer(t *testing.T) {
 	c, s, w := newTestConn()
 	var got []agent.Event
-	c.handle(permissionLine(), func(ev agent.Event) { got = append(got, ev) })
+	c.setEmit(func(ev agent.Event) { got = append(got, ev) })
+	c.Handle(permissionLine())
 
 	if len(got) != 1 || got[0].Kind != agent.EventPermissionRequest {
 		t.Fatalf("expected one permission event, got %+v", got)
@@ -142,8 +150,7 @@ func TestPermissionRequestAndAnswer(t *testing.T) {
 
 func TestUnadvertisedMethodIsRefused(t *testing.T) {
 	c, _, w := newTestConn()
-	c.handle([]byte(`{"jsonrpc":"2.0","id":5,"method":"fs/read_text_file","params":{}}`),
-		func(agent.Event) {})
+	c.Handle([]byte(`{"jsonrpc":"2.0","id":5,"method":"fs/read_text_file","params":{}}`))
 	if len(w.written) != 1 {
 		t.Fatalf("expected one response, got %d", len(w.written))
 	}

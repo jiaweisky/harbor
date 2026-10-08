@@ -68,6 +68,12 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 	cmd := exec.Command(inv.Bin, inv.Args...)
 	cmd.Dir = inv.Dir
 	cmd.Env = buildEnv(r.inheritEnv, r.cliHome, inv.Env)
+	// exec sets the child's working directory but leaves the inherited PWD
+	// pointing at the parent's; a CLI that reads PWD (not getcwd) would then run
+	// in the wrong directory. Keep PWD consistent with Dir.
+	if inv.Dir != "" {
+		cmd.Env = setEnv(cmd.Env, "PWD", inv.Dir)
+	}
 	setProcessGroup(cmd)
 
 	stdout, err := cmd.StdoutPipe()
@@ -98,6 +104,9 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 		stopped: make(chan struct{}),
 	}
 	r.procs.Store(taskID, proc)
+	if reg := activeProcs(); reg != nil {
+		reg.Add(proc.pgid, proc.cmd.Path)
+	}
 	go r.watchCancellation(ctx, proc)
 	go r.readLoop(stdout, p, out, stderr, proc, taskID)
 
@@ -105,9 +114,14 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 }
 
 // feedStdin copies an optional initial payload and, unless the invocation wants
-// a duplex pipe, closes stdin at EOF.
+// a duplex pipe, closes stdin so a one-shot CLI sees EOF. With no payload and no
+// duplex need, stdin is closed immediately: otherwise a CLI that reads stdin
+// (e.g. `opencode run`, `codex exec`) blocks forever on an open pipe.
 func (r *Runner) feedStdin(stdin io.WriteCloser, inv *Invocation) {
 	if inv.Stdin == nil {
+		if !inv.KeepStdinOpen {
+			_ = stdin.Close()
+		}
 		return
 	}
 	go func() {
@@ -132,6 +146,11 @@ func (r *Runner) readLoop(
 	defer close(proc.done)
 	defer r.release()
 	defer r.procs.CompareAndDelete(taskID, proc)
+	defer func() {
+		if reg := activeProcs(); reg != nil {
+			reg.Remove(proc.pgid)
+		}
+	}()
 
 	alive := true
 	emit := func(e Event) {
@@ -263,6 +282,18 @@ func (r *Runner) AuthBase() string {
 		return home
 	}
 	return ""
+}
+
+// setEnv sets key=value in env, replacing an existing entry or appending.
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
 
 func allowlistedEnv() []string {

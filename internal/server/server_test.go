@@ -100,11 +100,13 @@ func TestReadyzReportsAgents(t *testing.T) {
 	}
 }
 
-func TestStartupRefusesUnauthenticatedAgent(t *testing.T) {
+// TestUnauthenticatedCLIStillServed verifies Harbor does not gate an agent on
+// its own credential guess: a CLI whose status reports "not logged in" still
+// starts and is served (the CLI decides if it can run). Authentication is
+// reported as information and does not affect readiness.
+func TestUnauthenticatedCLIStillServed(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "codex")
-	// Login status always reports "not logged in"; the login command does not
-	// change that, so the agent cannot authenticate.
 	script := "#!/bin/sh\nif [ \"$1\" = login ] && [ \"$2\" = status ]; then echo 'Not logged in'; exit 1; fi\necho ok\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -113,32 +115,6 @@ func TestStartupRefusesUnauthenticatedAgent(t *testing.T) {
 		Version: 1,
 		Server:  config.ServerConfig{Listen: "127.0.0.1:0", BaseURL: "http://example.test"},
 		Agents:  []config.AgentConfig{{ID: "codex", Binary: bin}},
-	}
-	if _, err := server.NewHandler(context.Background(), cfg); err == nil {
-		t.Fatal("expected startup to fail when the only agent cannot log in")
-	}
-}
-
-func TestStartupLogsInWhenNoTicket(t *testing.T) {
-	dir := t.TempDir()
-	sentinel := filepath.Join(dir, "logged-in")
-	bin := filepath.Join(dir, "codex")
-	script := "#!/bin/sh\n" +
-		"if [ \"$1\" = login ] && [ \"$2\" = status ]; then\n" +
-		"  if [ -f \"$HARBOR_SENTINEL\" ]; then echo 'Logged in using ChatGPT'; exit 0; fi\n" +
-		"  echo 'Not logged in'; exit 1\n" +
-		"fi\n" +
-		"if [ \"$1\" = login ]; then touch \"$HARBOR_SENTINEL\"; echo 'device code: ABCD-1234'; exit 0; fi\n" +
-		"echo ok\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cfg := &config.Config{
-		Version: 1,
-		Server:  config.ServerConfig{Listen: "127.0.0.1:0", BaseURL: "http://example.test"},
-		Agents: []config.AgentConfig{{
-			ID: "codex", Binary: bin, Env: map[string]string{"HARBOR_SENTINEL": sentinel},
-		}},
 	}
 	srv := newTestServer(t, cfg)
 	defer srv.Close()
@@ -149,7 +125,7 @@ func TestStartupLogsInWhenNoTicket(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 after startup login", resp.StatusCode)
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	var body struct {
 		Ready  bool `json:"ready"`
@@ -161,8 +137,12 @@ func TestStartupLogsInWhenNoTicket(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if !body.Ready || !body.Agents["codex"].Auth {
-		t.Fatalf("body = %+v, want ready with auth", body)
+	codex := body.Agents["codex"]
+	if !body.Ready || !codex.Ready {
+		t.Fatalf("body = %+v, want ready", body)
+	}
+	if codex.Auth {
+		t.Fatalf("body = %+v, want auth=false (informational only)", body)
 	}
 }
 

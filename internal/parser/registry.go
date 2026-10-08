@@ -1,48 +1,54 @@
+// Package parser normalizes raw coding-agent CLI output into agent.Events.
+//
+// Parsers register themselves by name, so a new output format is a new file
+// that calls RegisterParser from its init — no central switch to edit.
 package parser
 
 import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 )
 
-// builders maps a parser name to its constructor. The regex parser needs a
-// pattern (from config); the others ignore it.
-var builders = map[string]func(pattern string) (agent.Parser, error){
-	"text": func(string) (agent.Parser, error) {
-		return NewText(), nil
-	},
-	"stream-json": func(string) (agent.Parser, error) {
-		return NewStreamJSON(), nil
-	},
-	"codex": func(string) (agent.Parser, error) {
-		return NewCodex(), nil
-	},
-	"regex": func(pattern string) (agent.Parser, error) {
-		if pattern == "" {
-			return nil, fmt.Errorf("parser %q requires regex.text", "regex")
-		}
-		return NewRegex(pattern)
-	},
+// Builder constructs a parser. pattern carries the configuration for parsers
+// that need one (for example "regex"); others ignore it.
+type Builder func(pattern string) (agent.Parser, error)
+
+var (
+	mu       sync.RWMutex
+	builders = map[string]Builder{}
+)
+
+// RegisterParser associates a parser name with its builder. It is called from a
+// parser's init.
+func RegisterParser(name string, b Builder) {
+	mu.Lock()
+	builders[name] = b
+	mu.Unlock()
 }
 
 // Build constructs a parser by name.
 func Build(name, pattern string) (agent.Parser, error) {
+	mu.RLock()
 	build, ok := builders[name]
+	mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unknown parser %q (known: %s)", name, strings.Join(Names(), ", "))
 	}
 	return build(pattern)
 }
 
-// Names lists the parser names accepted by Build.
+// Names lists the registered parser names.
 func Names() []string {
+	mu.RLock()
 	names := make([]string, 0, len(builders))
 	for name := range builders {
 		names = append(names, name)
 	}
+	mu.RUnlock()
 	sort.Strings(names)
 	return names
 }

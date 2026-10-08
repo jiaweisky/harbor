@@ -29,7 +29,6 @@ const (
 	codeWorkdirDenied      = "workdir_denied"
 	codeTimeout            = "timeout"
 	codeAgentUnavailable   = "agent_unavailable"
-	codeAuthRequired       = "auth_required"
 )
 
 // Metadata keys carried on task status messages. The interaction id is both
@@ -56,6 +55,7 @@ type CLIExecutor struct {
 	live         *agent.LiveSessions
 	workspace    *workspace.Resolver
 	timeout      time.Duration // total task timeout; 0 disables
+	idleTimeout  time.Duration // fail a task with no output for this long; 0 disables
 	breaker      *breaker      // nil disables
 	baselines    sync.Map      // taskID -> changes.Baseline
 	locks        sync.Map      // taskID -> func() (workdir lock release)
@@ -79,13 +79,14 @@ func NewCLIExecutor(
 	ws *workspace.Resolver, limits config.LimitsConfig,
 ) *CLIExecutor {
 	return &CLIExecutor{
-		launcher:  ln,
-		sessions:  sessions,
-		live:      live,
-		workspace: ws,
-		timeout:   limits.Timeout,
-		breaker:   newBreaker(limits.Breaker),
-		metrics:   &agentMetrics{},
+		launcher:    ln,
+		sessions:    sessions,
+		live:        live,
+		workspace:   ws,
+		timeout:     limits.Timeout,
+		idleTimeout: limits.IdleTimeout,
+		breaker:     newBreaker(limits.Breaker),
+		metrics:     &agentMetrics{},
 	}
 }
 
@@ -323,10 +324,21 @@ func (e *CLIExecutor) pump(
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 
+	var idle *time.Timer
+	var idleC <-chan time.Time
+	if e.idleTimeout > 0 {
+		idle = time.NewTimer(e.idleTimeout)
+		idleC = idle.C
+		defer idle.Stop()
+	}
+
 	ch := sess.Events()
 	for {
 		select {
 		case ev, ok := <-ch:
+			if idle != nil {
+				idle.Reset(e.idleTimeout)
+			}
 			if !ok {
 				e.finish(ctx, ec, taskID, sess, sink, emit)
 				return
@@ -338,6 +350,9 @@ func (e *CLIExecutor) pump(
 			if !sink.Flush() {
 				return
 			}
+		case <-idleC:
+			e.idleTimeoutFail(ec, taskID, sess, sink, emit)
+			return
 		}
 	}
 }
@@ -370,10 +385,20 @@ func (e *CLIExecutor) handleEvent(
 			e.forget(taskID)
 			return false
 		}
-		e.emitChanges(ec, taskID, emit)
-		e.forget(taskID)
-		e.breaker.Failure()
-		emit(failedStatus(ec, codeInternal, eventErrorText(ev)))
+		e.fail(ec, taskID, emit, codeInternal, eventErrorText(ev))
+		return false
+	case agent.EventDone:
+		// The CLI reported its terminal result. A duplex session stays alive
+		// waiting for more input, so finish the task here instead of waiting
+		// for the process to exit.
+		if !sink.Flush() {
+			return false
+		}
+		if sess.Canceled() {
+			e.forget(taskID)
+			return false
+		}
+		e.complete(ec, taskID, emit)
 		return false
 	case agent.EventThinking, agent.EventToolCall, agent.EventToolResult, agent.EventUsage:
 		if !sink.Flush() {
@@ -437,14 +462,46 @@ func (e *CLIExecutor) finish(
 	if sess.Canceled() {
 		return // Cancel already emitted the canceled state.
 	}
-	e.emitChanges(ec, taskID, emit)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		e.breaker.Failure()
-		emit(failedStatus(ec, codeTimeout, "task timed out"))
+		e.fail(ec, taskID, emit, codeTimeout, "task timed out")
 		return
 	}
+	e.emitChanges(ec, taskID, emit)
 	e.breaker.Success()
 	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil))
+}
+
+// complete finishes a task on a terminal event the CLI reported, without
+// waiting for the process to exit (a duplex CLI keeps running for more input).
+func (e *CLIExecutor) complete(ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool) {
+	e.emitChanges(ec, taskID, emit)
+	e.forget(taskID)
+	e.breaker.Success()
+	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil))
+}
+
+// idleTimeoutFail fails a task whose CLI produced no output within the idle
+// timeout. It stops the process and reports a timeout.
+func (e *CLIExecutor) idleTimeoutFail(
+	ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
+	sink *textSink, emit func(a2a.Event) bool,
+) {
+	sink.Flush()
+	if sess.Canceled() {
+		return // Cancel already ended the task.
+	}
+	e.fail(ec, taskID, emit, codeTimeout, "task idle timeout")
+}
+
+// fail captures a task's changes, releases its state, and emits a failed status
+// with a machine-readable code.
+func (e *CLIExecutor) fail(
+	ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool, code, msg string,
+) {
+	e.emitChanges(ec, taskID, emit)
+	e.forget(taskID)
+	e.breaker.Failure()
+	emit(failedStatus(ec, code, msg))
 }
 
 // releaseLock releases the workdir lock held for a task, if any. It is idempotent.
@@ -503,7 +560,6 @@ func (e *CLIExecutor) Cancel(_ context.Context, ec *a2asrv.ExecutorContext) iter
 // and request-level metadata (request-level wins).
 func (e *CLIExecutor) toRequest(ec *a2asrv.ExecutorContext) (*agent.Request, error) {
 	meta := mergeMetadata(ec)
-	login := metaBool(meta, "harbor.login")
 	dir, err := e.workspace.Resolve(contextKey(ec), metaString(meta, "harbor.workDir"))
 	if err != nil {
 		return nil, err
@@ -512,7 +568,7 @@ func (e *CLIExecutor) toRequest(ec *a2asrv.ExecutorContext) (*agent.Request, err
 	if err != nil {
 		return nil, err
 	}
-	if prompt == "" && !login {
+	if prompt == "" {
 		return nil, errNoText
 	}
 	sid, _ := e.sessions.Get(contextKey(ec))
@@ -525,7 +581,6 @@ func (e *CLIExecutor) toRequest(ec *a2asrv.ExecutorContext) (*agent.Request, err
 		SessionID:   sid,
 		Continue:    sid == "" && metaBool(meta, "harbor.continue"),
 		MaxTurns:    metaInt(meta, "harbor.maxTurns"),
-		Login:       login,
 		Meta:        meta,
 	}, nil
 }
@@ -559,10 +614,6 @@ func codeForStartError(err error) string {
 	switch {
 	case errors.Is(err, agent.ErrCLINotFound):
 		return codeCLINotFound
-	case errors.Is(err, agent.ErrAuthRequired):
-		return codeAuthRequired
-	case errors.Is(err, agent.ErrNoLogin):
-		return codeUnsupportedContent
 	default:
 		return codeInternal
 	}
@@ -674,10 +725,16 @@ func interactionPayload(itx *agent.Interaction) map[string]any {
 // as a text fallback for clients that do not use the extension.
 func (e *CLIExecutor) answerFromMessage(taskID string, m *a2a.Message) (agent.Input, error) {
 	id, answer := parseAnswer(m)
-	if cur, ok := e.pendingInteraction(taskID); ok && id != "" && id != cur.ID {
-		return agent.Input{}, fmt.Errorf("interaction id mismatch: got %q, want %q", id, cur.ID)
+	kind := "answer"
+	if cur, ok := e.pendingInteraction(taskID); ok {
+		if id != "" && id != cur.ID {
+			return agent.Input{}, fmt.Errorf("interaction id mismatch: got %q, want %q", id, cur.ID)
+		}
+		// Use the interaction's own id and kind so the session can build the
+		// right response even when the client answered with plain text.
+		id, kind = cur.ID, string(cur.Kind)
 	}
-	return agent.Input{Kind: "answer", ID: id, Answer: answer}, nil
+	return agent.Input{Kind: kind, ID: id, Answer: answer}, nil
 }
 
 // parseAnswer extracts the interaction id and answer text from a client reply.

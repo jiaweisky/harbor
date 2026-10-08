@@ -82,7 +82,7 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 		}
 
 		resolver := workspace.NewResolverWithIsolation(cfg.Sandbox.WorkdirRoot,
-			cfg.Sandbox.AllowOutside, cfg.Sandbox.Isolation, cfg.Sandbox.IsolationRoot)
+			cfg.Sandbox.AllowOutside, cfg.Sandbox.Isolation, cfg.Sandbox.IsolationRoot, ac.Workdir)
 		exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), resolver, ac.Limits)
 		execs = append(execs, exec)
 		authReady[ac.ID] = ln.AuthReady(ctx)
@@ -117,17 +117,16 @@ type agentReadiness struct {
 }
 
 // readinessHandler reports service readiness as JSON. An agent is ready when
-// its circuit breaker is closed and its CLI is authenticated; the service is
-// ready when at least one agent is ready.
+// its circuit breaker is closed; the CLI's authentication is reported separately
+// as information and never affects readiness (the CLI decides if it can run).
 func readinessHandler(execs []*bridge.CLIExecutor, authReady map[string]bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		agents := make(map[string]agentReadiness, len(execs))
 		ready := false
 		for _, e := range execs {
 			name := e.Name()
-			auth := authReady[name]
-			rdy := e.Ready() && auth
-			agents[name] = agentReadiness{Breaker: e.BreakerState(), Auth: auth, Ready: rdy}
+			rdy := e.Ready()
+			agents[name] = agentReadiness{Breaker: e.BreakerState(), Auth: authReady[name], Ready: rdy}
 			if rdy {
 				ready = true
 			}

@@ -32,6 +32,9 @@ type Resolver struct {
 	allowOutside bool
 	isolation    string
 	isoRoot      string
+	// defaultDir is used when a request does not name a working directory, so an
+	// agent can be pinned to a project (whose CLI config it then loads).
+	defaultDir string
 
 	mu    sync.Mutex
 	bound map[string]string // contextID -> resolved directory
@@ -42,12 +45,13 @@ type Resolver struct {
 // allowOutside is true the root confinement is not enforced. An empty root
 // disables resolution.
 func NewResolver(root string, allowOutside bool) *Resolver {
-	return NewResolverWithIsolation(root, allowOutside, IsolationShared, "")
+	return NewResolverWithIsolation(root, allowOutside, IsolationShared, "", "")
 }
 
 // NewResolverWithIsolation creates a resolver with an isolation strategy.
 // worktree/copy need isolationRoot (where per-context copies are created).
-func NewResolverWithIsolation(root string, allowOutside bool, isolation, isolationRoot string) *Resolver {
+// defaultDir, when set, is used for requests that name no working directory.
+func NewResolverWithIsolation(root string, allowOutside bool, isolation, isolationRoot, defaultDir string) *Resolver {
 	if isolation == "" {
 		isolation = IsolationShared
 	}
@@ -56,6 +60,7 @@ func NewResolverWithIsolation(root string, allowOutside bool, isolation, isolati
 		allowOutside: allowOutside,
 		isolation:    isolation,
 		isoRoot:      isolationRoot,
+		defaultDir:   defaultDir,
 		bound:        map[string]string{},
 		locks:        newLockSet(),
 	}
@@ -95,6 +100,9 @@ func (r *Resolver) resolveUnlocked(contextID, requested string) (string, error) 
 		return "", fmt.Errorf("%w: workdir_root: %v", ErrDenied, err)
 	}
 
+	if requested == "" {
+		requested = r.defaultDir
+	}
 	if requested == "" {
 		dir := filepath.Join(root, scratchName(contextID))
 		if err := os.MkdirAll(dir, 0o755); err != nil {

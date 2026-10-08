@@ -41,15 +41,12 @@ func AuthFor(binary, version string) (agent.Authenticator, bool) {
 }
 
 // Unverified returns the authenticator for a CLI Harbor has no built-in adapter
-// for: login state cannot be determined, so it never blocks and has no login
-// command.
+// for: login state cannot be determined, so it never blocks.
 func Unverified() agent.Authenticator { return unverified{} }
 
 type unverified struct{}
 
 func (unverified) LoggedIn(string, map[string]string) bool { return true }
-
-func (unverified) LoginArgs() []string { return nil }
 
 func (unverified) StatusArgs() []string { return nil }
 

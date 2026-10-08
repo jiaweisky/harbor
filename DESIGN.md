@@ -286,7 +286,7 @@ Adapter 针对不同 CLI 选择“集成模式”。以下基于各 CLI `-h` 实
 | Agent | 适配形态 | 关键参数 | 会话续跑 | 备注 |
 |---|---|---|---|---|
 | **claude** | 无头 `stream-json` | `-p --output-format stream-json --verbose --input-format stream-json --include-partial-messages` | `--resume <id>` / `--session-id <uuid>` | 结构化流；`--append-system-prompt`、`--allowedTools`、`--permission-mode`。 |
-| **codebuddy** | 无头 `stream-json` | `-p --output-format stream-json --input-format stream-json --include-partial-messages` | `-r/--resume`、`--session-id` | 与 claude 同源；危险开关为 `-y/--dangerously-skip-permissions`；另有 `--acp`（`--acp-transport` stdio/streamable-http）。 |
+| **codebuddy** | 无头 `stream-json` / `exec` / `acp` / `server` | `-p --output-format stream-json --input-format stream-json --include-partial-messages`；`--serve` | `-r/--resume`、`--session-id`；server 用 `conversation.id` | 与 claude 同源；危险开关为 `-y/--dangerously-skip-permissions`；`--acp`（stdio）；`--serve` 暴露 **HTTP API 与 ACP-over-HTTP 两种协议**（`server_protocol`，见 §5.4）。 |
 | **opencode** | 无头 `text` 或 `server` | `run <msg> -m provider/model --agent <a> --session <id> --continue`；或 `serve` / `acp` | `--session` / `--continue` / `--fork` | `run` 无 stream-json，用行缓冲近似流式；结构化可用 `serve`(HTTP) 或 `acp`。 |
 | **codex** | 无头 `exec`（`--json`）或 `server` | `codex exec "<prompt>"`；`-m` / `-C/--cd` / `-s/--sandbox` / `-a/--ask-for-approval` / `-i/--image` / `--add-dir` / `--json` / `--output-schema` / `-o/--output-last-message` | `codex exec resume --last` / `codex exec fork` | 危险开关 `--dangerously-bypass-approvals-and-sandbox`；常驻用 `app-server`。 |
 | **custom** | 无头 `text` / `regex` | 由 YAML 指定 | 由 YAML 指定 | 通用模板 Adapter，覆盖任意二进制。 |
@@ -296,6 +296,8 @@ Adapter 针对不同 CLI 选择“集成模式”。以下基于各 CLI `-h` 实
 > **CLI Profile**：Harbor 内置按**二进制名**识别的 profile（`codebuddy`→`stream-json`、`claude`→`stream-json`、`opencode`/`codex`→`exec`）。配置省略 `integration` 时取其默认；显式配置但**不被该 CLI 支持**时启动报错（如 `claude`+`exec`）；**未知二进制必须显式指定 `integration`**。因此无需记忆“何时配哪种模式”。
 >
 > **最小版本**：profile 记录已适配的**最低版本**（如 codebuddy `2.161.4`、claude `2.1.292`、opencode `1.18.35`、codex `0.160.1`）。启动时探测版本，**低于该版本则拒绝启动并提示升级**；无法探测版本时跳过校验。若未来某版本出现不兼容，再在对应 adapter 中**按版本号加兼容分支**（而不是现在就引入变体框架）。
+>
+> **每个 CLI 的落地启动参数、凭据环境变量与配置根见 §5.4。**
 
 ### 5.1 集成模式定义
 
@@ -306,7 +308,14 @@ Adapter 针对不同 CLI 选择“集成模式”。以下基于各 CLI `-h` 实
 - `stream-json` / JSONL：`-p --output-format stream-json`（claude/codebuddy）、`codex exec --json`；结构化流，各 schema 用各自 Parser 映射。
 - `text`：一次性 stdout 作为最终文本 artifact（`opencode run`；`codex exec` 无 `--json` 时）。配置为 `exec` 时**必须在 args 中含 `{{.Prompt}}`**（否则启动校验失败并提示改用 `stream-json`）。
 
-**B. 服务端（server）**：CLI 常驻 HTTP/app-server（`opencode serve`、`codebuddy --serve`、`codex app-server`）；Harbor 作**客户端代理其 API** → A2A。只是“怎么调”的一种实现。
+**B. 服务端（server）**：CLI 常驻 HTTP/app-server（`opencode serve`、`codebuddy --serve`、`codex app-server`）；Harbor 作**客户端代理其 API** → A2A。只是“怎么调”的一种实现。**已落地：opencode**——Harbor 懒启动 `opencode serve`（`--port 0`，从 stdout 解析监听 URL；也可用 `server_url` 连接到既有实例），按 `contextId` 复用服务端 session（首个任务 `POST /session` 建会话并回报 id，后续同 context 直接复用）。**逐 token 流式**：先订阅 `GET /event`（SSE），再 `POST /session/:id/message {parts:[{type:"text",text}]}`；把 `message.part.delta`（`field=="text"`，按 sessionID 过滤）的 `delta` 作为增量输出，prompt 的阻塞回复作为**兜底**（SSE 不可用时用整段文本）；`POST /session/:id/abort` 取消。实测：真机一轮返回 9 个 delta、文本 `"1 2 3 4 5"`。
+
+**已落地：codebuddy**——`codebuddy --serve` 的 HTTP server **同时暴露两种协议**，Harbor 用 `server_protocol` 选择：
+
+- **HTTP API**（默认，`server_protocol: http`）：Harbor spawn `codebuddy --serve --host 127.0.0.1 --auth none`（从 stdout 的 `Endpoint` 行解析监听 URL；也可用 `server_url` 连接既有实例），驱动其 runs API：`POST /api/v1/runs`（Gateway 消息体，`source.conversation.id` = 会话 id）→ `runId` → `GET /api/v1/runs/:runId/stream`（SSE）。回复为**回合级**：一条 `message`（`content.markdown` 为整段文本）后接 `done`；`POST /api/v1/runs/:runId/cancel` 取消。多轮连续性按 `source.conversation.id` 维持，Harbor 把生成的会话 id 作为 `EventSession` 回报并复用。全部请求带 `X-CodeBuddy-Request: 1`（CSRF 头）。
+- **ACP over HTTP**（`server_protocol: acp`）：同一 server 的 `/api/v1/acp`（JSON-RPC over SSE，与 `--acp`(stdio) 同一 ACP 协议，仅传输不同）。Harbor `POST /api/v1/acp/connect` 取 `connectionId`；**命令用 `POST /api/v1/acp` 发出，其响应与该命令相关的通知在该 POST 自身的 SSE 回复里流回**；另有一条 `GET /api/v1/acp`（`acp-connection-id` 头）接收服务器**主动**通知。Harbor 复用与 stdio ACP 完全相同的 `conn`/`session` 映射（`initialize` → `session/new`（或 `session/load`）→ `session/prompt`，`session/update` 流、`session/request_permission` 桥接），因此能力与 `--acp` 一致（逐 token、工具轨迹、权限交互）。`connectionId` 按任务建立、回合结束即 `DELETE`，服务器进程跨任务复用。
+
+**已落地：codex**——`codex app-server`（**换行分隔 JSON-RPC over stdio**；协议由 `codex app-server generate-json-schema` 产出、并经真机 `initialize`/`thread/start`/`turn/start` 验证）。流程：`initialize` → 按 context `thread/start`（`approvalPolicy:"never"` 以无人值守）或 `thread/resume {threadId}` → `turn/start {threadId, input:[{type:"text",text}]}`；`item/agentMessage/delta` 的 `delta` 作增量输出，`turn/completed`（`status`）收尾，`error`（`willRetry:false`）失败，`turn/interrupt` 取消。Harbor 作客户端代理其 API。（注：本机 codex 登录已失效，真机只能验证 handshake/thread/turn/错误路由，成功增量路径由假服务器测试覆盖。）
 
 **C. ACP**：CLI 常驻 ACP（`opencode acp`、`codebuddy --acp`）经 stdio；Harbor 作 ACP 客户端，双向。**已实现**（stdio；`--acp-transport streamable-http` 未实现）。
 
@@ -314,7 +323,7 @@ Adapter 针对不同 CLI 选择“集成模式”。以下基于各 CLI `-h` 实
 >
 > 配置 `integration` 取值映射：`exec`（无头/text）、`stream-json`（无头/结构化）、`server`、`acp`。
 
-> 落地顺序：**M1 = 无头 `stream-json`（codebuddy；claude 同源顺带）+ 无头 `text`（opencode `run`）** → 后续 `exec`（codex/custom）→ `server` → `acp`。**顺序只反映落地成本，不代表模式优劣。** 现状：`stream-json` / `exec` / `acp` 已落地；`server` 未实现。
+> 落地顺序：**M1 = 无头 `stream-json`（codebuddy；claude 同源顺带）+ 无头 `text`（opencode `run`）** → 后续 `exec`（codex/custom）→ `server` → `acp`。**顺序只反映落地成本，不代表模式优劣。** 现状：`stream-json` / `exec` / `acp` / `server`(opencode、codebuddy、codex) 已落地。
 
 ### 5.2 集成模式取舍（为什么不优先 ACP）
 
@@ -333,7 +342,7 @@ ACP（Agent Client Protocol）很诱人，但属于**条件性最优**，并非�
 
 - **模式在注册/配置时静态选定（一个 Adapter 一种模式）**，核心不做运行时模式协商；`Probe()` 只做存活/版本/能力探测（详见 §4.5）。选型依据：需富交互且支持 ACP → `acp`；需结构化流 → 无头 `stream-json`/JSONL；有稳定 serve/app-server 且需高并发/会话复用 → `server`；否则无头 `text`。
 - 真正的硬约束是**覆盖**（claude/codex 无 ACP）与**Harbor 作为 client 的实现成本**，而非“ACP 只能 stdio/编辑器”。
-- **实现顺序按“覆盖 + 成本”**：v1 用 stream-json/exec 先覆盖 4 家 → v2 用 ACP 收敛统一（仅对支持的 CLI）。codebuddy 可对比 `--acp --acp-transport streamable-http` 与 `--serve` 两条服务化路径。
+- **实现顺序按“覆盖 + 成本”**：v1 用 stream-json/exec 先覆盖 4 家 → v2 用 ACP 收敛统一（仅对支持的 CLI）。codebuddy 的服务化路径 `--serve` 已落地（`--acp-transport streamable-http` 未实现）。
 - ACP 是唯一**跨 CLI 标准化**的集成协议，长期确实是最优收敛点；但“长期统一”不等于“短期优先”。（各家 HTTP `app-server`/`serve` 也各不同、不标准化，故仍以 ACP 为长期目标。）
 - **ACP 已按此路径落地（stdio）**，`opencode acp` 实测端到端通过。覆盖：`initialize` → `session/new` → `session/prompt` 的一轮生命周期、`session/update` 流式映射（`agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update`）、以及 `session/request_permission` → A2A `input-required` 的桥接（应答为被选 `optionId`）。`fs/*` 与 `terminal/*` **不声明也不实现**：实测 opencode 自带工具、不回调这些方法，故仅对未声明能力返回 method-not-found。跨任务会话续接（`session/load`）暂缓：一轮 prompt 结束即停止进程，一个 A2A 任务对应一次 ACP 会话生命周期。
 
@@ -369,6 +378,66 @@ func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
 ```
 
 > 本段为**简化示意**；完整实现以 **A.7** 为准（含 `stream_event` 嵌套与 thinking / tool_result）。
+
+### 5.4 各 CLI 的启动参数与环境变量（落地值）
+
+Harbor **只以非交互模式**驱动 CLI：**凭据一律经环境变量注入**，Harbor 不运行登录命令、不处理 `/login`（见 §10.4）。下面是每个 CLI 的具体约定；`agents[].args` / `agents[].env` / `agents[].session` 可按此配置，未配置时取 profile 默认（§5）。
+
+> **范围**：本节只列 **Harbor 驱动该 CLI 所依赖**的凭据 / 配置 / 网关变量与启动参数，**不是各 CLI 环境变量的全集**（各 CLI 另有大量遥测、UI、MCP、A2A 等与 Harbor 无关的变量；完整清单以各 CLI 官方文档为准，如 codebuddy <https://www.codebuddy.ai/docs/zh/cli/env-vars>）。
+
+**共同的环境基座**：隔离时把 CLI 的配置根重定向到 `sandbox.cli_home`（§10.3）——Unix 用 `HOME` / `XDG_CONFIG_HOME`，Windows 用 `USERPROFILE` / `APPDATA` / `LOCALAPPDATA`，再叠加各 CLI 的专用配置变量。
+
+#### claude
+
+- **集成模式**：`stream-json`。
+- **启动参数**：`-p --output-format stream-json --verbose --input-format stream-json --include-partial-messages`（prompt 经 **stdin** 的 stream-json user message）。Harbor 追加 `--model <m>`、`--append-system-prompt <s>`；`allow_dangerous` → `--dangerously-skip-permissions`。
+- **会话续跑**：`--resume <id>` / `--session-id <uuid>` / `-c/--continue` / `--fork-session`。
+- **凭据变量**：`ANTHROPIC_API_KEY`（`X-Api-Key`；`-p` 下只要存在就用）、`ANTHROPIC_AUTH_TOKEN`（`Authorization: Bearer`）、`CLAUDE_CODE_OAUTH_TOKEN`（claude.ai OAuth，优先于 Keychain）。第三方后端各有变量：Bedrock `CLAUDE_CODE_USE_BEDROCK` + `AWS_BEARER_TOKEN_BEDROCK`、Vertex `CLAUDE_CODE_USE_VERTEX`、Foundry `CLAUDE_CODE_USE_FOUNDRY` + `ANTHROPIC_FOUNDRY_API_KEY`。
+- **配置根**：`CLAUDE_CONFIG_DIR`（默认 `~/.claude`）。
+- **自建网关**：`ANTHROPIC_BASE_URL`。
+- **隔离要点**：`--bare`（等价环境变量 `CLAUDE_CODE_SIMPLE=1`）跳过 Keychain 与 OAuth；此时 Anthropic 直连鉴权**严格取 `ANTHROPIC_API_KEY`**（或 `--settings` 的 apiKeyHelper），`ANTHROPIC_AUTH_TOKEN` 不适用——这是无头且隔离环境下最干净的模式。
+
+#### codebuddy
+
+- **集成模式**：`stream-json`（默认）/ `exec` / `acp` / `server`。
+- **启动参数**：`-p --input-format stream-json --output-format stream-json --include-partial-messages`（prompt 经 **stdin**）。Harbor 追加 `--model`、`--append-system-prompt`；`allow_dangerous` → `-y/--dangerously-skip-permissions`。
+- **server 模式**（`--serve`，含两种协议，`server_protocol` 选择）：Harbor spawn `codebuddy --serve --host 127.0.0.1 --auth none`，从 stdout 的 `Endpoint` 行解析监听 URL（或用 `server_url`）；所有请求带 `X-CodeBuddy-Request: 1`。
+  - `http`（默认）：`POST /api/v1/runs`（Gateway 消息体）+ `GET /api/v1/runs/:runId/stream`（SSE，回合级 `message` + `done`），`source.conversation.id` 维持多轮连续。
+  - `acp`：`/api/v1/acp`（ACP over HTTP/SSE，与 `--acp` 同一协议）——`connect` → 命令走 `POST`（响应/相关通知在该 POST 的 SSE 回复里流回）→ `GET` 收主动通知；复用 stdio ACP 的 `session/new`/`session/load`/`session/prompt`/`session/update`/`session/request_permission` 映射，能力与 `--acp` 一致（逐 token、工具轨迹、权限交互）。
+- **会话续跑**：`--resume` / `--session-id` / `-c`（无头）；`server`+`http` 用 `source.conversation.id`；`server`+`acp` 用 ACP `session/load`（`session/new` 返回的 id 作为 `EventSession` 复用）。
+- **凭据变量**：`CODEBUDDY_API_KEY`（官方文档：非交互 `-p` 模式**始终使用**）、`CODEBUDDY_AUTH_TOKEN`、`ANTHROPIC_API_KEY`（走 Anthropic 协议的自建网关）。
+- **配置根 / 模型 / 网关**：`CODEBUDDY_CONFIG_DIR`（默认 `~/.codebuddy`）、`CODEBUDDY_MODEL`、`CODEBUDDY_BASE_URL`。
+- **dangerous 全通过**：`-y` **且**进程环境 `CODEBUDDY_IS_SANDBOX=1`（仅隔离沙箱）。
+- **其他可选**：`CODEBUDDY_INTERNET_ENVIRONMENT`（`internal`/`ioa` 版本）、`CODEBUDDY_STREAM_TIMEOUT_MS` / `CODEBUDDY_FIRST_TOKEN_TIMEOUT_MS`（流式静默上限）、`CODEBUDDY_CODE_MAX_TURNS`（轮次上限）、`DISABLE_TELEMETRY` / `DISABLE_AUTOUPDATER`。
+- **`--serve` 自身鉴权**：`--auth password|none`（默认 `password`；`none` 关闭鉴权，允许本机任意进程经该服务执行命令/读写文件）。Harbor spawn 时用 `--host 127.0.0.1 --auth none`（仅回环、不对外暴露；与 opencode server 的无鉴权回环姿态一致），并始终携带 `X-CodeBuddy-Request: 1`。这属于 serve 自身的 HTTP 鉴权，与 Harbor 的 A2A 鉴权（§9）无关。
+- **官方全集**：<https://www.codebuddy.ai/docs/zh/cli/env-vars>。
+
+#### opencode
+
+- **集成模式**：`exec`（默认）/ `acp` / `server`。
+- **启动参数**：exec `run {{.Prompt}} -m {{.Model}}`（另 `--agent`、`--variant`、`-f/--file`、`--format json`）；acp `acp`；server `serve --hostname 127.0.0.1 --port 0`（`--port 0` 由内核分配，从 stdout 解析监听 URL）。
+- **会话续跑**：`-s/--session <id>` / `-c/--continue` / `--fork`。
+- **凭据变量**：provider key（`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` 等，或 `OPENCODE_API_KEY`）；或凭据文件 `~/.local/share/opencode/auth.json`（`opencode providers login` 写入），无头注入可用 `OPENCODE_AUTH_CONTENT`（内联 auth.json 内容；源码/二进制确认，官方文档未列）。
+- **配置根**：`OPENCODE_CONFIG`（自定义配置文件）、`OPENCODE_CONFIG_DIR`（自定义配置目录）、`OPENCODE_CONFIG_CONTENT`（内联 JSON，优先级最高）；默认 `~/.config/opencode`，遵循 `XDG_CONFIG_HOME`。
+- **`serve`/`web` 的 HTTP 鉴权**：`OPENCODE_SERVER_PASSWORD`（+ `OPENCODE_SERVER_USERNAME`，默认 `opencode`）——仅作用于常驻服务，与 Harbor A2A 鉴权无关。
+- **dangerous**：`--auto`。
+
+#### codex
+
+- **集成模式**：`exec`（默认）/ `server`。
+- **启动参数**：exec `exec --json --skip-git-repo-check {{.Prompt}}`（另 `-m/--model`、`-s/--sandbox`、`-a/--ask-for-approval`、`-C/--cd`、`--output-schema`、`-o/--output-last-message`）；server `app-server`（默认 `--listen stdio://`；`thread/start` 带 `cwd`、`approvalPolicy:"never"`）。
+- **会话续跑**：`exec resume --last` / `exec resume <id>`。
+- **凭据变量**：`OPENAI_API_KEY`（`codex login --with-api-key` 从 stdin 读入）、`CODEX_API_KEY`（**非交互** `exec`/`review`/SDK 直接使用）、`CODEX_ACCESS_TOKEN`（可信自动化；`login --with-access-token`）。
+- **配置根**：`CODEX_HOME`（默认 `~/.codex`），配置在 `config.toml`。
+- **自建网关 / 自定义 provider**：经 `config.toml` 的 `openai_base_url`，或 `model_providers.<id>.base_url`（+ `env_key`）。官方 env 文档未列 base-url 变量（二进制含 `OPENAI_BASE_URL` 字符串但未证实生效，以 `config.toml` 为准）。
+- **dangerous**：`--dangerously-bypass-approvals-and-sandbox`。
+
+#### 跨 CLI 说明
+
+- **prompt 传递**：claude / codebuddy 经 `--input-format stream-json` 从 **stdin** 传首条 user message（Session 因此双向，可原生应答权限/澄清）；opencode / codex 用参数模板 `{{.Prompt}}`。
+- **模型 / 系统提示**：claude / codebuddy 由 Harbor 追加 `--model` / `--append-system-prompt`；opencode / codex 走各自模板（如 `-m {{.Model}}`）。
+- **配置根隔离**：各 CLI 从 **cwd** 加载项目级配置（`opencode.json`/`.opencode`、`.codebuddy`、`.claude`、`.codex` 等），Harbor 只把 cwd 设为任务工作目录并可选重定向配置根（§10.3、§6.7）。
+- **权限模式**：`allow_dangerous` 映射到各 CLI 的危险参数（见上）；codebuddy 另需 `CODEBUDDY_IS_SANDBOX=1`。
 
 ---
 
@@ -596,13 +665,14 @@ Coding agent 只有在**真实代码库**里才有意义，所以工作目录不
 - **来源**：调用方通过 A2A `Message.Metadata`（约定键 `harbor.workDir`）指定；`sandbox.workdir_root` 是唯一允许的根。
 - **校验（安全前提）**：对请求路径与 `workdir_root` 都取 realpath，按**路径分量**做前缀判断；**拒绝** `..` 穿越与 symlink 逃逸；`allow_outside=false` 时越界直接拒绝（fail fast，不启动 CLI）。
 - **绑定 `contextId`**：工作目录与 A2A `contextId` 绑定。同一 context 的后续任务（含 `--resume`）**必须复用同一工作树**，否则 CLI 会话与文件改动错位。
-- **未指定时**：按 context 分配 scratch 目录（仅适合无需既有代码的任务）。
+- **未指定时**：先看 `agents[].workdir`（每个 agent 可选的默认项目目录，受 `workdir_root` 约束）；仍未配置则按 context 分配 scratch 目录（仅适合无需既有代码的任务）。这是"把某 CLI 固定到某个项目"的唯一手段——因为 CLI 以 cwd 为项目根，从这里加载 `opencode.json`/`.opencode`/`.codebuddy`/`.claude`/`.codex` 等项目级配置、技能与子 agent。
 - **scratch 命名安全**：`contextId` 客户端可控，**不可直接拼进路径**——取其 hash 或白名单字符，拒绝 `..` 与路径分隔符。
 - **隔离策略**（配置，决定并发安全）：
   - `shared`：直接在指定目录运行（最快；同目录并发会互相干扰，需按**工作目录加锁串行化**）。
   - `worktree`（推荐，M2）：目标为 git 仓库时，为**每个 context** 建 `git worktree`，实现隔离与并发；`--fork` → 新 worktree。
   - `copy`：非 git 目录做整目录拷贝。
 - **附加目录**：`--add-dir` 等额外可写目录同样必须通过上述校验。
+- **cwd 与 `PWD`**：子进程以工作目录为 **cwd** 启动，并同步把 **`PWD`** 设为该目录——`exec` 只改内核 cwd、不会更新继承来的 `PWD`，而部分 CLI（如 opencode）以 `PWD` 判定会话/项目目录，不同步会导致它读写到 Harbor 的 cwd。
 
 > 结论：**不是二选一**——`harbor.workDir` 元数据是主来源并绑定 context；“每 context 一个子目录”只是未指定时的 fallback；并发隔离由 `worktree` / 目录锁策略负责。
 
@@ -635,7 +705,6 @@ coding agent 的核心产出是**代码改动**，必须作为 artifact 交付�
 | `harbor.maxTurns` | int | 最大轮次 |
 | `harbor.continue` | bool | 无 sessionId 时续用最近会话（`--continue`） |
 | `harbor.interactionId` | string | 回答 `input-required` 时回带的交互 id（§7.4） |
-| `harbor.login` | bool | 运行 CLI 登录命令而非 prompt（重新获取票据，见 §10.4） |
 
 **错误码**（失败时置于 `TaskStatus.Message.Metadata["harbor.errorCode"]`，值域固定）：
 
@@ -643,7 +712,7 @@ coding agent 的核心产出是**代码改动**，必须作为 artifact 交付�
 |---|---|
 | `unsupported_content` | 请求能力不在生效能力内（§7.5） |
 | `workdir_denied` | 工作目录越界 / 校验失败（§6.7） |
-| `auth_required` | CLI provider 未登录 / 鉴权失效（§10.5） |
+| `auth_required` | CLI provider 未登录 / 鉴权失效（§10.5）。保留值域；当前由 CLI 自身错误呈现（未主动发出） |
 | `cli_not_found` | 二进制缺失或不可执行 |
 | `agent_unavailable` | agent 熔断（连续失败）或未启用，快速失败（§11.2） |
 | `timeout` | 总 / 空闲超时 |
@@ -745,7 +814,12 @@ type Capabilities struct {
 | 不支持交互 | 由配置策略决定（预授权 / 自动拒绝 / bypass），**永不发** `input-required`；Card 声明不支持。 |
 | 客户端只会发文本 | 问题以文本 + 选项列表呈现；结构化答复仅对支持扩展的客户端可用。 |
 
-**已落地**：Capability 对齐中的交互规范化在 ACP 路径实现——`input-required` 消息同时携带人可读 `TextPart` 与结构化 `DataPart`（`{kind,id,action,target,risk,options,resume}`）；答复可用同构 `DataPart`（Harbor 校验 `id`，不匹配则拒绝）或纯文本兜底；Card 在存在交互能力时声明扩展 `https://github.com/jiaweisky/harbor/extensions/interaction/v1`（schema 见 `extensions/interaction.md`）。尚未接入：stream-json 的 `control_request`、`question` / `plan_approval` 两类（Canonical 已定义，无 CLI 来源）、以及“不支持挂起续答”时的 `--resume` 有损注入。
+**已落地**：交互规范化在 **ACP** 与 **stream-json** 两条路径实现——`input-required` 消息同时携带人可读 `TextPart` 与结构化 `DataPart`（`{kind,id,action,target,risk,options,resume}`）；答复可用同构 `DataPart`（Harbor 校验 `id`，不匹配则拒绝）或纯文本兜底；Card 在存在交互能力时声明扩展 `https://github.com/jiaweisky/harbor/extensions/interaction/v1`（schema 见 `extensions/interaction.md`）。
+
+- **ACP**：`session/request_permission` → `input-required`（optionId 作答）。
+- **stream-json**：`control_request` 且 `request.subtype="can_use_tool"`（claude/codebuddy 无头模式的实际权限通道）→ `InteractionPermission`（`id` = `request_id`，选项 `allow`/`deny`）；答复经 `Session.Send` 编码为 `control_response`（`response.response` 同时带 codebuddy 的 `allowed` 与 claude 的 `behavior`，两种 CLI 通用）；**原进程挂起**等待 stdin，无需重启。实测 codebuddy：暂停于 `input-required` → 答复 `allow` → Bash 执行 → 完成。
+
+尚未接入：`elicitation_create` / `question`（codebuddy `AskUserForStructuredInput` 的响应形状为 `{action,content}`，与权限不同）、`plan_approval`，以及“不支持挂起续答”时的 `--resume` 有损注入。
 
 ### 7.5 媒体类型对齐
 
@@ -822,12 +896,23 @@ agents:
       max_turns: 100
 ```
 
-### 级别 2：自定义 Parser（少量 Go 代码）
+### 级别 2：自定义 Parser（少量 Go 代码）— **已落地**
 
-实现 `Parser` 接口并注册，用于输出格式奇特但仍是子进程的 CLI。
+实现 `Parser` 接口并注册，用于输出格式奇特但仍是子进程的 CLI。解析器按名字注册（`internal/parser.RegisterParser`），新增格式 = **新建一个文件 + `init()` 注册**，不改中央 switch；内置 `text`/`stream-json`/`codex`/`regex` 均以此注册。
 
 ```go
-func init() { agent.RegisterParser("my-format", func() agent.Parser { return &myParser{} }) }
+// internal/parser/mine.go
+func init() {
+    RegisterParser("my-format", func(pattern string) (agent.Parser, error) { return &myParser{}, nil })
+}
+```
+
+### 级别 3：完整 Adapter（复杂 CLI）
+
+实现 `Adapter` 接口并注册，例如需要握手、多次 stdin 往返、专用协议的 CLI。（未落地：现有复杂适配器 ACP 仍经 `config.Integration` 分支装配；抽出注册表需先解耦 config 校验与构建，留后续。）
+
+```go
+func init() { agent.RegisterAdapter("weird-cli", newWeirdAdapter) }
 ```
 
 ### 级别 3：完整 Adapter（复杂 CLI）
@@ -891,21 +976,23 @@ func init() { agent.RegisterAdapter("weird-cli", newWeirdAdapter) }
 
 | CLI | 默认配置根 | 覆盖变量 | 依据 |
 |---|---|---|---|
-| claude | `~/.claude` | `HOME`；`CLAUDE_CONFIG_DIR`；凭据 `ANTHROPIC_API_KEY` | 待实测确认 |
-| codebuddy | `~/.codebuddy` | `HOME`；专用变量待确认 | 待实测（M3） |
-| opencode | `~/.config/opencode` | `HOME` / `XDG_CONFIG_HOME`；`OPENCODE_CONFIG*` 待确认 | 待实测（M3） |
+| claude | `~/.claude` | `HOME`；`CLAUDE_CONFIG_DIR`；凭据 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | ✅ 二进制变量表确认 |
+| codebuddy | `~/.codebuddy` | `HOME`；`CODEBUDDY_CONFIG_DIR`；凭据 `CODEBUDDY_API_KEY` | ✅ 官方 env-vars 文档 |
+| opencode | `~/.config/opencode` | `HOME` / `XDG_CONFIG_HOME`；`OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` | ✅ 二进制变量表确认 |
 | codex | `$CODEX_HOME`（默认 `~/.codex`） | `CODEX_HOME` | ✅ 由 `codex -h` 确认 |
 
 ```
 HOME=<cli_home>
 CLAUDE_CONFIG_DIR=<cli_home>/.claude
+CODEBUDDY_CONFIG_DIR=<cli_home>/.codebuddy
+OPENCODE_CONFIG_DIR=<cli_home>/.config/opencode
 CODEX_HOME=<cli_home>/.codex
 XDG_CONFIG_HOME=<cli_home>/.config   # opencode 等遵循 XDG
 USERPROFILE=<cli_home>               # Windows 根
 APPDATA=<cli_home>/AppData/Roaming
 ```
 
-> 优先用 `HOME`（对所有 CLI 生效），专用变量仅作精确覆盖；各 CLI 的配置根以其实测 `-h`/文档为准（M1 接 codebuddy + opencode：codebuddy 同 claude 用 `CLAUDE_CONFIG_DIR`/`ANTHROPIC_API_KEY` 一类的变量待实测，opencode 记 `XDG_CONFIG_HOME`）。
+> 优先用 `HOME`（对所有 CLI 生效），专用变量仅作精确覆盖；各 CLI 的启动参数与凭据变量汇总见 §5.4。
 
 **跨平台（Linux / macOS / Windows）**：隔离**策略**与平台无关，但需三处平台 shim：
 
@@ -915,18 +1002,26 @@ APPDATA=<cli_home>/AppData/Roaming
 
 > 结论：**架构不依赖平台差异**，差异收敛为“根环境变量 shim + 回避 Keychain + 进程控制 build tag”；部署上建议**每个 agent 固定运行平台**（如 Linux 容器），不追求同一 CLI 跨平台行为一致。
 
-### 10.4 Headless 登录的可行路径
+### 10.4 凭据注入：非交互模式 + 环境变量
 
-1. **预置（推荐）**：在带浏览器的机器上完成登录 / 生成 API key / `claude setup-token` / `codex login`，把结果以 **secret** 挂载进 Harbor；Harbor 不负责交互登录。
-2. **API key 注入（BYO，不实现）**：调用方按请求携带 provider key、只注入当次子进程 env。本项目不采用（模型 A 单凭据），留作记录。
-3. **设备码 / 登录任务（进阶）**：Harbor 发起登录，把 URL/码作为 A2A 消息/artifact 返回（可 `input-required`），客户端/管理员完成后 Harbor 收口 token——把“登录”建模成一个 A2A 任务。
-4. 明确**不追求**在 headless 上跑浏览器 OAuth 回调。
+Harbor 只以**非交互模式**启动 CLI，凭据通过**环境变量**注入（不由 Harbor 运行任何登录命令、不处理 `/login`）。各 CLI 均提供 env 或专用配置根来设置票据（完整启动参数、配置根与网关/模型变量见 **§5.4**）：
+
+| CLI | 主要环境变量 | 配置根 |
+|---|---|---|
+| claude | `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN` | `CLAUDE_CONFIG_DIR`（`--bare`= `CLAUDE_CODE_SIMPLE=1`：不读 Keychain/OAuth，直连鉴权严格取 `ANTHROPIC_API_KEY`） |
+| codebuddy | `CODEBUDDY_API_KEY`（非交互模式 `-p` 始终使用）、`CODEBUDDY_AUTH_TOKEN`、`ANTHROPIC_API_KEY` | `CODEBUDDY_CONFIG_DIR`；`CODEBUDDY_BASE_URL` 可指向自建网关 |
+| opencode | provider key（`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 等）、`OPENCODE_API_KEY`、`OPENCODE_AUTH_CONTENT` | `OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` / `OPENCODE_CONFIG_CONTENT` |
+| codex | `OPENAI_API_KEY`、`CODEX_API_KEY`（非交互 exec/review/SDK）、`CODEX_ACCESS_TOKEN` | `CODEX_HOME`；自建网关只能改 `config.toml`（无 base-url env） |
+
+- **预置（推荐）**：在带浏览器的机器上完成登录 / 生成 key，把结果以 **secret** 挂载为上述 env 或配置目录；Harbor 不负责交互登录。
+- **BYO（不实现）**：调用方按请求携带 provider key、只注入当次子进程 env——本项目采用单凭据（模型 A），不实现。
+- 明确**不追求**在 headless 上跑浏览器 OAuth 回调。
 
 ### 10.5 登录状态 = 能力状态
 
-- `Probe()` 需探测**认证状态**并计入生效能力（§7.2）：未登录 → AgentCard 标记 degraded/unavailable，或隐藏需要登录的 skill。
-- `/readyz` 判定包含“已认证”。
-- 运行中鉴权失效 → 映射为**类型化错误**（`TaskStateFailed` + 机器可读 reason），必要时转 `input-required` 触发重登，而非当作普通失败。
+- **实现取舍（重要）**：Harbor **不以票据状态禁用/降级 agent**，也不在启动时按自己的判断跑登录。原因：CLI 的凭据解析是"项目级(cwd) → 主机级 → Keychain → env"的多级过程，Harbor 无法准确复刻；自行猜测会与 CLI 不一致，出现"单独能起 CLI、Harbor 却报错"。因此把 CLI 当权威：任务照常交给 CLI，`.opencode`/`opencode.json` 等项目级配置由 CLI 从工作目录自带解析。
+- `/readyz` 的 `auth` 字段来自 CLI 自身状态命令（claude/codex；opencode/codebuddy 无状态命令则恒真），**仅信息展示**，不影响就绪。
+- 运行中鉴权失效：由 CLI 在任务里报错（当前映射为通用失败；若要精确，可在 adapter 里识别该 CLI 的鉴权错误并映射 `auth_required`）。重新取票由部署方更新注入的 env/secret 完成。
 
 ### 10.6 凭据存储与生命周期
 
@@ -942,23 +1037,22 @@ APPDATA=<cli_home>/AppData/Roaming
 | **Harbor 鉴权** | A2A 客户端 ↔ Harbor | 谁可以调用 Harbor | **只用 Bearer**；不做 OAuth2 资源服务器（§9） |
 | **CLI 登录** | CLI ↔ 模型 provider | CLI 获取 provider 凭据 | 常为 OAuth2 / 设备码 / API key，但**由 CLI 自己完成**；Harbor 不实现 OAuth |
 
-- “不支持 OAuth2”**仅指前者**；后者（`/login`）不是被砍，而是走 §10.4 的路径支持。
-- Harbor 通常**无需实现 OAuth 客户端**：预置路径直接复用 CLI 已登录的 config/home；设备码路径仅**调用 CLI 的登录命令**并转发 URL/码，OAuth 仍由 CLI 执行；token 刷新/生命周期也归 CLI（Harbor 只隔离/轮换其 config 目录）。
-- 即“OAuth2 与 /login 强相关”**在语义层成立、在实现层可解耦**。
+- “不支持 OAuth2”**仅指前者**：Harbor 自身不做 OAuth2 资源服务器。
+- Harbor **无需实现 OAuth 客户端**：CLI 以非交互模式运行，凭据由部署方通过 env/secret 注入（§10.4）；token 刷新/生命周期归 CLI（Harbor 只隔离/轮换其 config 目录）。
 
-> M1 范围：**服务级凭据（模型 A）+ CLI home 隔离 + `Probe` 认证探测 + 鉴权失效类型化错误**。按调用方凭据（模型 B）与“登录任务”留后续。
+> M1 范围：**服务级凭据（模型 A）+ CLI home 隔离 + `Probe` 认证探测 + 鉴权失效类型化错误**。按调用方凭据（模型 B）留后续。
 
 **已落地（模型 A，单凭据）**：Harbor 以某个操作系统用户运行，**每个 CLI 只在该系统用户下维护一份登录票据**，所有通过 A2A 鉴权的调用方共用它；调用方之间的区分靠**鉴权（谁能调）+ 会话（`contextId`）**，不做按调用方的凭据隔离。（如需多份凭据，直接起多个 Harbor 实例、各自用不同系统用户。）
 
-认证逻辑抽象为 `agent.Authenticator` 接口（`CredentialEnv` / `LoggedIn(home, env)` / `StatusArgs` / `LoggedInStatus` / `LoginArgs`），每个 CLI 在 `internal/adapters/` 用自己的文件实现，按二进制名注册（`adapters.AuthFor(binary, version)`）。工厂接收**探得的版本号**，因此当某版本改了状态/输出格式时，只需在**那一个 adapter 文件**里按版本号加兼容分支（`Factory(version)`），不预先构建变体框架、不动其它包。机制：
+认证逻辑抽象为 `agent.Authenticator` 接口（`LoggedIn(home, env)` / `StatusArgs` / `LoggedInStatus`），每个 CLI 在 `internal/adapters/` 用自己的文件实现，按二进制名注册（`adapters.AuthFor(binary, version)`）。工厂接收**探得的版本号**，因此当某版本改了状态/输出格式时，只需在**那一个 adapter 文件**里按版本号加兼容分支（`Factory(version)`），不预先构建变体框架、不动其它包。机制：
 
-- **登录是启动前置**：`integration.Build` 调用 `Launcher.EnsureLogin`——探测票据（有状态命令则运行，如 claude `auth status` / codex `login status`；否则看凭据文件/env）；**有** → agent 就绪；**没有** → 运行 CLI 登录命令（`Authenticator.LoginArgs`，输出逐行打进日志，便于运维看设备码/URL），成功后**再次校验**；仍拿不到票据 → 该 agent 不可用（`ErrAuthRequired`），全部不可用则拒绝启动。
-- **票据定位**：`sandbox.cli_home` 可选——设置时把 **Unix 根** `HOME`/`XDG_*`、**Windows 根** `USERPROFILE`/`APPDATA`/`LOCALAPPDATA` 及 CLI 专用 `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`CODEBUDDY_CONFIG_DIR`/`OPENCODE_CONFIG_DIR` 重定向到该目录；未设置则用系统用户的真实 home/keychain。`LoggedIn` 从**生效 env 的取值**解析配置位置（如 `CLAUDE_CONFIG_DIR`/`XDG_DATA_HOME`/`CODEX_HOME`），因此同一 CLI 在不同 OS/自定义路径下都能定位票据。
-- **`harbor.login` 任务**：请求元数据 `harbor.login: true` 时运行登录命令并按文本流式返回输出，进程退出即完成——用于**运行期重新获取票据**（无需重启 Harbor）。
-- **`/readyz`**：就绪 = 熔断关闭 **且** `AuthReady`（按 CLI 状态命令/凭据对系统用户探测）。
-- **检测不绕过钥匙串**：优先用 CLI 自身状态命令（会正确读取 Keychain/OAuth），无状态命令才退到 env/文件；两者都不行的 CLI（codebuddy）标记“不可验证”（`LoggedIn` 恒真，不做否定判定）。
+- **Harbor 不对票据设门槛（关键）**：CLI 才是权威。Harbor **不**在启动时探测票据、**不**自动跑登录（也就不会因 Harbor 自己的判断而"CLI 能起、Harbor 报错"）、**不**因未登录禁用 agent。任务照常交给 CLI，由 CLI 自行决定能否运行（它遵循自己的项目级(cwd)/主机级/Keychain/env 解析）。`integration.Build` 只探测二进制与版本。
 
-**刻意不做**：登录过程的 `input-required` 双向 stdin——a2a-go 对**运行中**任务的后续消息返回 `ErrExecutionInProgress`，只有 `input-required` 才能回传，而登录进程自行退出时无法在暂停态完成任务，会卡死；设备码登录（codex/claude）无需 stdin，opencode 交互式登录可用 `OPENCODE_AUTH_CONTENT` 预置。
+- **票据定位**：`sandbox.cli_home` 可选——设置时把 **Unix 根** `HOME`/`XDG_*`、**Windows 根** `USERPROFILE`/`APPDATA`/`LOCALAPPDATA` 及 CLI 专用 `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`CODEBUDDY_CONFIG_DIR`/`OPENCODE_CONFIG_DIR` 重定向到该目录；未设置则用系统用户的真实 home/keychain。**项目级配置**由 CLI 从任务工作目录(cwd)读取（`agents[].workdir` 可给默认项目目录，见 §6.7）。
+- **`/readyz`**：就绪 = 熔断关闭；`AuthReady`（CLI 自身状态命令，claude/codex；无状态命令的 opencode/codebuddy 恒真）仅作**信息展示**，不影响就绪判定。
+- **不重复 CLI 的解析逻辑**：Harbor 不建"凭据文件/env 猜测"（那会与 CLI 的项目级/主机级解析不一致，导致误判）。CLI 若确实无法运行，会在任务里报错。
+
+**刻意不做**：Harbor 不运行任何登录命令、不处理 `/login`——CLI 以非交互模式启动，凭据由部署方通过 env/secret 注入（§10.4）。
 
 ---
 
@@ -983,10 +1077,10 @@ APPDATA=<cli_home>/AppData/Roaming
 | 运行时二进制消失 / 不可执行 | `exec.Start()` 返回 errno | `ENOENT`→`cli_not_found`；`EACCES`→`internal`（附 errno）；任务 Failed |
 | 启动即崩溃（缺库 / 架构不符） | 首事件前退出 | Failed + **截断 stderr**（脱敏） |
 | 运行中崩溃（信号 / 非零退出） | `cmd.Wait()` 的 exit/signal | Failed `internal`；**但若已发出 `result`/`Done` 则视为 Completed**（非零退出不覆盖成功结果） |
-| CLI 挂起无输出 | 空闲超时 | Failed `timeout`；走 `Runner.Kill` |
+| CLI 挂起无输出 | 空闲超时（`limits.idle_timeout`，无事件即触发） | Failed `timeout`；取消 run → 杀进程组 |
 | **用户取消后进程退出** | — | **必须抑制取消后的 `EventError`**（canceled 标志），否则会覆盖 `Canceled` |
 | 反复崩溃 | 连续失败计数 | agent 标记 unhealthy / 熔断，`/readyz` 失败并停止接单 |
-| Harbor 崩溃留孤儿 | 启动扫描 | 记录 PID / 进程组（pidfile 或 cgroup），启动时按标记清理 |
+| Harbor 崩溃留孤儿 | 启动扫描（已落地） | `Runner` 把每进程的**进程组**记到 `<state_dir>/procs`（`sandbox.state_dir`，默认临时目录）；进程退出即移除。启动时 `SweepOrphans` 读取记录，**仅当该组命令仍匹配记录的二进制**才杀（防 PID 复用），再清空记录。Windows 不校验故不清理。 |
 
 要点：
 
@@ -1111,6 +1205,7 @@ sandbox:
   isolation: shared          # shared | worktree | copy（见 §6.7）
   inherit_env: true
   cli_home: "/srv/harbor-cli-home"   # 可选：把 CLI config/home 重定向到此（见 §10.3）
+  state_dir: "/var/lib/harbor"       # 运行时状态（孤儿进程记录）；默认临时目录
   default_timeout: 30m
   max_concurrent: 8
   # container: { image: "harbor/claude:latest", network: none }  # 可选强隔离（§9）
@@ -1129,13 +1224,17 @@ agents:
       - "--verbose"
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "--continue" }
     allow_dangerous: false
-    limits: { max_concurrent: 3, timeout: 30m }
+    env:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"   # 凭据/网关变量见 §5.4
+    limits: { max_concurrent: 3, timeout: 30m, idle_timeout: 5m }
 
   - id: codebuddy
     binary: codebuddy
     integration: stream-json
     args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages"]
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
+    env:
+      CODEBUDDY_API_KEY: "${CODEBUDDY_API_KEY}"   # 可选：CODEBUDDY_BASE_URL / CODEBUDDY_MODEL
 
   - id: opencode
     binary: opencode
@@ -1143,12 +1242,16 @@ agents:
     parser: text
     args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]   # opencode run 仅支持位置参数
     session: { id_flag: "--session", continue_flag: "--continue" }
+    env:
+      OPENCODE_API_KEY: "${OPENCODE_API_KEY}"     # 或 provider key（ANTHROPIC_API_KEY 等）
 
   - id: codex
     binary: codex
     integration: exec
     parser: text
     args: ["exec", "-"]        # prompt 经 stdin 传入（避免 argv 限制）
+    env:
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"         # 或 CODEX_API_KEY / CODEX_ACCESS_TOKEN
 
   # ACP 模式：内建 Launcher，经 stdio 驱动 CLI 的 ACP 模式（不做运行时协商）
   # 同一 CLI 支持多模式时：静态二选一，或注册为两个 agent（两张卡，客户端自选）
@@ -1162,6 +1265,29 @@ agents:
     integration: acp
     args: ["--acp"]
   # …同时可保留上面的 codebuddy(stream-json)，两者互不影响
+
+  # server 模式（opencode）：Harbor 懒启动 `opencode serve` 并复用其 session
+  - id: opencode-server
+    binary: opencode
+    integration: server
+    # server_url: "http://127.0.0.1:4096"   # 可选：连接既有实例而非自行启动
+
+  # server 模式（codebuddy，HTTP API）：`codebuddy --serve` 的 runs API（回合级），conversation 复用
+  - id: codebuddy-server
+    binary: codebuddy
+    integration: server
+    # server_protocol: http   # 默认
+
+  # server 模式（codebuddy，ACP over HTTP）：同一 `--serve` 的 /api/v1/acp，能力与 --acp 一致
+  - id: codebuddy-server-acp
+    binary: codebuddy
+    integration: server
+    server_protocol: acp
+
+  # server 模式（codex）：Harbor 启动 `codex app-server`（stdio JSON-RPC），thread 复用
+  - id: codex-server
+    binary: codex
+    integration: server
 
   # 零代码扩展：任意 CLI
   - id: my-coder
@@ -1233,7 +1359,7 @@ codebuddy
 | **M3 多 Agent 宽度** | codex（独立 JSONL Parser）、generic 配置 Adapter、claude 顺带；多 agent 路由与多卡片。 |
 | **M4 产出与交互完善** | ~~代码变更 artifact（diff / 文件，见 §6.8）~~（已落地）、~~push notifications~~（已落地）、~~交互规范化（Canonical interaction + `input-required` DataPart + Card 扩展，见 §7.4）~~（已落地，ACP 路径）、完整交互降级矩阵（question / plan_approval / `--resume` 有损注入）、durable interaction。 |
 | **M5 安全与运维** | 容器 / worktree 沙箱、~~指标~~（已落地，Prometheus 文本）、~~审计日志~~（已落地，slog）、~~持久化 TaskStore~~（已落地，JSON 文件）。 |
-| **M6 进阶** | ~~ACP 集成模式~~（已落地，stdio）、~~启动前置登录 + `harbor.login` 任务（§10，模型 A）~~（已落地）、Go plugin 扩展。 |
+| **M6 进阶** | ~~ACP 集成模式~~（已落地，stdio）、~~server 集成模式（opencode `serve` / codebuddy `--serve` / codex `app-server`）~~（已落地）、~~服务级凭据（§10，模型 A）~~（已落地）、Go plugin 扩展。 |
 
 ---
 
@@ -1418,9 +1544,11 @@ type AgentConfig struct {
     ID             string            `yaml:"id"`
     DisplayName    string            `yaml:"display_name"`
     Binary         string            `yaml:"binary"`
-    Integration    string            `yaml:"integration"` // exec | stream-json | acp（server 未实现）
+    Integration    string            `yaml:"integration"` // exec | stream-json | acp | server
     Parser         string            `yaml:"parser"`      // exec 模式用：text | codex | regex
     Args           []string          `yaml:"args"`        // acp 模式用其选定 ACP 子命令（opencode 由 profile 默认）
+    ServerURL      string            `yaml:"server_url"`       // server 模式：连接既有实例而非自行启动
+    ServerProtocol string            `yaml:"server_protocol"`  // server 模式协议：http（默认）| acp（codebuddy 的 serve 两种协议）
     Env            map[string]string `yaml:"env"`
     AllowDangerous bool              `yaml:"allow_dangerous"`
     Session        SessionConfig     `yaml:"session"`
@@ -1784,4 +1912,4 @@ a2a send http://localhost:8080/agents/opencode  "list files"
 6. **模块路径/命名（已定）**：`github.com/jiaweisky/harbor`（对应 repo `https://github.com/jiaweisky/harbor.git`）。
 7. **codex 适配（已定，M3）**：已确认非交互入口 `codex exec`、事件流 `--json`（JSONL）、结构化输出 `--output-schema`、常驻 `app-server`、续跑 `codex exec resume`。**为何需独立 Parser**：JSONL 只是分帧，codex 的 item/turn 事件 schema 与 claude 的 message/`content_block`  schema 不同，Parser 必须先归一化，配置/正则无法可靠映射嵌套事件（仅多注册一个 Parser，其余全部复用）。**为何不在 M1**：M1 追求“用最少的 adapter 打通链路”，codebuddy 的 stream-json 覆盖构造最全且与 claude 共用 Parser，投入即覆盖 2 个 agent；codex 只增宽度、不验证新架构点，故归 M3「多 Agent」。可按需提前到 M2。
 8. **能力模型落地范围（已定，M1）**：M1 即引入 `Capabilities` 类型与 `Adapter.Capabilities()`，由 AgentCard 投影读取；**只填 M1 用到的字段**（文本 in/out、逐 token 流式、会话续跑、权限模型），其余留默认零值。理由：能力从第一天就是单一事实来源（§7.2），避免 M2 返工；成本仅多一个结构体，非过度设计。
-9. **CLI 凭据模型（已定）**：采用**服务级凭据（模型 A）**——Harbor 以某个 OS 用户运行，每个 CLI 一份登录票据，所有鉴权通过的调用方共享；调用方隔离靠鉴权 + 会话（`contextId`）。登录是**启动前置**（`EnsureLogin`：探测→必要时跑 CLI 登录命令→复检，失败则 agent 不可用），`harbor.login` 任务用于运行期重新取票。**不实现**按调用方凭据（模型 B）与按请求 BYO 注入；如需多份凭据，起多个 Harbor 实例各用不同 OS 用户。票据定位优先 CLI 状态命令（会读 Keychain/OAuth），无状态命令才退到 env/文件。
+9. **CLI 凭据模型（已定）**：采用**服务级凭据（模型 A）**——Harbor 以某个 OS 用户运行，每个 CLI 一份登录票据，所有鉴权通过的调用方共享；调用方隔离靠鉴权 + 会话（`contextId`）。**Harbor 不对票据设门槛**：不启动探测、不自动登录、不因未登录禁用 agent——CLI 是权威，其项目级/主机级/Keychain/env 解析由 CLI 自己完成（详见 §10.5）。凭据由部署方通过 env/secret 注入（§10.4）；Harbor 不运行登录命令。**不实现**按调用方凭据（模型 B）与按请求 BYO 注入；如需多份凭据，起多个 Harbor 实例各用不同 OS 用户。

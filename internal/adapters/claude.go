@@ -24,10 +24,6 @@ func (claude) LoggedIn(home string, env map[string]string) bool {
 	return fileExists(filepath.Join(dir, ".credentials.json"))
 }
 
-// `claude auth login` runs the OAuth login; `setup-token` only mints a CI token
-// and does not create a stored login.
-func (claude) LoginArgs() []string { return []string{"auth", "login"} }
-
 // `claude auth status` prints a JSON object with a loggedIn field.
 func (claude) StatusArgs() []string { return []string{"auth", "status"} }
 

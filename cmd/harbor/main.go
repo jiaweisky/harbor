@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/server"
@@ -45,6 +46,10 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Clean up CLI processes left behind by a previous crash, then track ours.
+	agent.SweepOrphans(cfg.Sandbox.StateDir)
+	agent.InitProcs(cfg.Sandbox.StateDir)
 
 	handler, err := server.NewHandler(ctx, cfg)
 	if err != nil {

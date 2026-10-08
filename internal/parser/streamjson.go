@@ -1,4 +1,3 @@
-// Package parser normalizes raw coding-agent CLI output into agent.Events.
 package parser
 
 import (
@@ -37,6 +36,8 @@ func (p *StreamJSON) Parse(rec []byte, out func(agent.Event)) error {
 		p.parseAssistant(rec, out)
 	case "user":
 		p.parseUser(rec, out)
+	case "control_request":
+		p.parseControlRequest(rec, out)
 	case "result":
 		p.parseResult(rec, out)
 	}
@@ -90,6 +91,57 @@ func (p *StreamJSON) parseUser(rec []byte, out func(agent.Event)) {
 			out(agent.Event{Kind: agent.EventToolResult, Raw: rec})
 		}
 	}
+}
+
+// parseControlRequest handles a CLI control_request. Harbor answers a
+// can_use_tool (tool permission) request by surfacing it as a permission
+// interaction; other subtypes have no Harbor-side handler and are ignored.
+func (p *StreamJSON) parseControlRequest(rec []byte, out func(agent.Event)) {
+	var m struct {
+		RequestID string `json:"request_id"`
+		Request   struct {
+			Subtype  string         `json:"subtype"`
+			ToolName string         `json:"tool_name"`
+			Input    map[string]any `json:"input"`
+		} `json:"request"`
+	}
+	if json.Unmarshal(rec, &m) != nil || m.Request.Subtype != "can_use_tool" || m.RequestID == "" {
+		return
+	}
+	out(agent.Event{
+		Kind:      agent.EventPermissionRequest,
+		Text:      permissionText(m.Request.ToolName, m.Request.Input),
+		Tool:      m.Request.ToolName,
+		ToolInput: m.Request.Input,
+		Interaction: &agent.Interaction{
+			Kind:    agent.InteractionPermission,
+			ID:      m.RequestID,
+			Action:  m.Request.ToolName,
+			Target:  permissionTarget(m.Request.Input),
+			Options: []string{"allow", "deny"},
+			Resume:  true,
+		},
+		Raw: rec,
+	})
+}
+
+// permissionText renders a human-readable prompt for a tool permission request.
+func permissionText(tool string, input map[string]any) string {
+	s := "permission required: " + tool
+	if t := permissionTarget(input); t != "" {
+		s += " (" + t + ")"
+	}
+	return s + " — reply allow or deny"
+}
+
+// permissionTarget picks the most descriptive string in a tool's input.
+func permissionTarget(input map[string]any) string {
+	for _, k := range []string{"command", "file_path", "path", "pattern", "url"} {
+		if v, ok := input[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // parseResult handles the terminal result record.
@@ -169,4 +221,8 @@ func deltaText(rec []byte) string {
 		return ""
 	}
 	return e.Event.Delta.Text
+}
+
+func init() {
+	RegisterParser("stream-json", func(string) (agent.Parser, error) { return NewStreamJSON(), nil })
 }

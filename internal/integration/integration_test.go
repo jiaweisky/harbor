@@ -13,13 +13,48 @@ func newAdapter(ac config.AgentConfig) (agent.Launcher, error) {
 	return integration.New(ac, integration.Options{InheritEnv: true})
 }
 
-func TestNewRecognizedButUnimplemented(t *testing.T) {
+func TestServerModeRejectsOtherBinary(t *testing.T) {
 	_, err := newAdapter(config.AgentConfig{ID: "x", Binary: "sh", Integration: config.IntegrationServer})
-	if err == nil {
-		t.Fatal("server: expected an error")
+	if err == nil || !strings.Contains(err.Error(), `got "sh"`) {
+		t.Fatalf("expected an unsupported-binary error, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "recognized but not implemented") {
-		t.Errorf("server: unhelpful error: %v", err)
+}
+
+func TestNewServerCodebuddy(t *testing.T) {
+	ln, err := newAdapter(config.AgentConfig{
+		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
+		ServerURL: "http://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := ln.Capabilities().Streaming; got != agent.StreamTurn {
+		t.Fatalf("expected turn streaming, got %v", got)
+	}
+}
+
+func TestNewServerCodex(t *testing.T) {
+	ln, err := newAdapter(config.AgentConfig{
+		ID: "cx", Binary: "codex", Integration: config.IntegrationServer,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := ln.Capabilities().Streaming; got != agent.StreamToken {
+		t.Fatalf("expected token streaming, got %v", got)
+	}
+}
+
+func TestNewServerOpencode(t *testing.T) {
+	ln, err := newAdapter(config.AgentConfig{
+		ID: "oc", Binary: "opencode", Integration: config.IntegrationServer,
+		ServerURL: "http://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := ln.Capabilities().Streaming; got != agent.StreamToken {
+		t.Fatalf("expected token streaming, got %v", got)
 	}
 }
 
