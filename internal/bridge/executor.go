@@ -72,6 +72,7 @@ type CLIExecutor struct {
 	taskStart     sync.Map      // taskID -> time.Time (submission, for duration)
 	structured    sync.Map      // taskID -> *structuredState
 	turns         sync.Map      // taskID -> *atomic.Int64 (start + resumes)
+	pauseReap     sync.Map      // taskID -> context.CancelFunc (paused-task reaper)
 	maxTurns      int
 	fileArtifacts bool // emit a per-file artifact for each changed file
 	taskLookup    func(context.Context, a2a.TaskID) (*a2a.Task, bool)
@@ -350,6 +351,7 @@ func (e *CLIExecutor) resume(
 	ec *a2asrv.ExecutorContext, taskID string,
 	yield func(a2a.Event, error) bool,
 ) {
+	e.disarmPauseReaper(taskID)
 	if e.takeTurn(taskID) {
 		if sess, ok := e.live.Get(taskID); ok {
 			e.teardown(taskID, sess)
@@ -455,6 +457,7 @@ func (e *CLIExecutor) teardown(taskID string, sess agent.Session) {
 // change baseline, pending interaction, and workdir lock. It is idempotent and
 // does not touch the failure breaker.
 func (e *CLIExecutor) forget(taskID string) {
+	e.disarmPauseReaper(taskID)
 	e.endRun(taskID)
 	e.live.Del(taskID)
 	e.baselines.Delete(taskID)
@@ -462,6 +465,42 @@ func (e *CLIExecutor) forget(taskID string) {
 	e.structured.Delete(taskID)
 	e.turns.Delete(taskID)
 	e.releaseLock(taskID)
+}
+
+// armPauseReaper reaps a task paused on input-required if it is not answered
+// before idleTimeout elapses or its run deadline passes. Without it a paused
+// task holds its CLI process and workdir lock until the client answers.
+func (e *CLIExecutor) armPauseReaper(taskID string, runCtx context.Context, sess agent.Session) {
+	ctx, cancel := context.WithCancel(context.Background())
+	e.pauseReap.Store(taskID, cancel)
+	go func() {
+		defer cancel()
+		if e.idleTimeout > 0 {
+			t := time.NewTimer(e.idleTimeout)
+			defer t.Stop()
+			select {
+			case <-runCtx.Done():
+			case <-t.C:
+			case <-ctx.Done():
+				return
+			}
+		} else {
+			select {
+			case <-runCtx.Done():
+			case <-ctx.Done():
+				return
+			}
+		}
+		e.teardown(taskID, sess)
+	}()
+}
+
+// disarmPauseReaper stops a paused task's reaper, called when it resumes. It is
+// idempotent.
+func (e *CLIExecutor) disarmPauseReaper(taskID string) {
+	if v, ok := e.pauseReap.LoadAndDelete(taskID); ok {
+		v.(context.CancelFunc)()
+	}
 }
 
 // takeTurn counts a turn for the task (a start or a resume) and reports
@@ -531,6 +570,11 @@ func (e *CLIExecutor) pump(
 				return
 			}
 			if !e.handleEvent(ec, taskID, sess, sink, emit, ev) {
+				// A pause keeps the process and workdir lock alive for the client's
+				// answer; reap them if the answer never arrives.
+				if _, paused := e.interactions.Load(taskID); paused {
+					e.armPauseReaper(taskID, ctx, sess)
+				}
 				return
 			}
 		case <-ticker.C:
@@ -1003,11 +1047,15 @@ func isTerminalState(s a2a.TaskState) bool {
 
 // duplicateTask returns the earlier task for a repeated messageId, so a
 // duplicate send is not executed twice. The first occurrence records the mapping.
+// The mapping is scoped by caller so one caller cannot replay another's task by
+// reusing a message id; a context id is not part of the scope because the server
+// may assign a fresh one per request.
 func (e *CLIExecutor) duplicateTask(ctx context.Context, ec *a2asrv.ExecutorContext) (*a2a.Task, bool) {
 	if e.taskLookup == nil || ec.StoredTask != nil || ec.Message == nil || ec.Message.ID == "" {
 		return nil, false
 	}
-	prev, existed := e.idem.getOrPut(ec.Message.ID, ec.TaskID)
+	key := callerScope(ec) + "\x00" + ec.Message.ID
+	prev, existed := e.idem.getOrPut(key, ec.TaskID)
 	if !existed || prev == ec.TaskID {
 		return nil, false
 	}
@@ -1015,10 +1063,20 @@ func (e *CLIExecutor) duplicateTask(ctx context.Context, ec *a2asrv.ExecutorCont
 	if !ok || task == nil || task.Status.State == a2a.TaskStateRejected {
 		// The earlier attempt was rejected (e.g. the breaker was open); do not
 		// pin that transient result, let this attempt proceed.
-		e.idem.set(ec.Message.ID, ec.TaskID)
+		e.idem.set(key, ec.TaskID)
 		return nil, false
 	}
 	return task, true
+}
+
+// callerScope returns the authenticated caller's identity for idempotency
+// scoping, or empty when unauthenticated (a message id is only unique per
+// caller).
+func callerScope(ec *a2asrv.ExecutorContext) string {
+	if ec.User == nil {
+		return ""
+	}
+	return ec.User.Name
 }
 
 // replayDuplicate answers a duplicate send by replaying the earlier task's

@@ -62,6 +62,15 @@ func TestIsolationCopy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "run.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A symlink to a file outside the source tree must be recreated as a link,
+	// not followed and copied.
+	outside := filepath.Join(parent, "outside.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(src, "link")); err != nil {
+		t.Fatal(err)
+	}
 
 	r := workspace.NewResolverWithIsolation(src, workspace.IsolationCopy, iso)
 	a, err := r.Resolve("ctx-a")
@@ -82,6 +91,10 @@ func TestIsolationCopy(t *testing.T) {
 	got, err := os.Stat(filepath.Join(a, "run.sh"))
 	if err != nil || got.Mode().Perm() != want.Mode().Perm() {
 		t.Fatalf("copied mode = %v, %v; want %v", got, err, want.Mode().Perm())
+	}
+	li, err := os.Lstat(filepath.Join(a, "link"))
+	if err != nil || li.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("copied symlink = %v, %v; want a symlink", li, err)
 	}
 }
 

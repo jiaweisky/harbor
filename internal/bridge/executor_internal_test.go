@@ -86,3 +86,35 @@ func taskText(task *a2a.Task) string {
 	}
 	return b.String()
 }
+
+// TestDuplicateTaskScopedByCaller verifies a repeated message id is treated as a
+// duplicate only for the same caller, so one caller cannot replay another's task.
+func TestDuplicateTaskScopedByCaller(t *testing.T) {
+	orig := &a2a.Task{ID: "t1", Status: a2a.TaskStatus{State: a2a.TaskStateCompleted}}
+	e := &CLIExecutor{idem: newIdemCache(8)}
+	e.taskLookup = func(_ context.Context, id a2a.TaskID) (*a2a.Task, bool) {
+		return orig, id == "t1"
+	}
+	msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi"))
+	msg.ID = "m1"
+
+	alice := func(taskID a2a.TaskID) *a2asrv.ExecutorContext {
+		return &a2asrv.ExecutorContext{
+			TaskID: taskID, ContextID: "c1", Message: msg,
+			User: a2asrv.NewAuthenticatedUser("alice", nil),
+		}
+	}
+	if _, ok := e.duplicateTask(context.Background(), alice("t1")); ok {
+		t.Fatal("the first occurrence must not be a duplicate")
+	}
+	if _, ok := e.duplicateTask(context.Background(), alice("t2")); !ok {
+		t.Fatal("the same caller with the same message id must replay")
+	}
+	bob := &a2asrv.ExecutorContext{
+		TaskID: "t3", ContextID: "c2", Message: msg,
+		User: a2asrv.NewAuthenticatedUser("bob", nil),
+	}
+	if _, ok := e.duplicateTask(context.Background(), bob); ok {
+		t.Fatal("a different caller must not replay another caller's task")
+	}
+}

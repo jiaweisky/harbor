@@ -139,11 +139,30 @@ func copyTree(src, dst string) error {
 			return err
 		}
 		target := filepath.Join(dst, rel)
-		if d.IsDir() {
+		switch {
+		case d.IsDir():
 			return os.MkdirAll(target, 0o755)
+		case d.Type()&os.ModeSymlink != 0:
+			return copySymlink(path, target)
+		case d.Type().IsRegular():
+			return copyFile(path, target)
+		default:
+			return nil // skip sockets, fifos, and device nodes
 		}
-		return copyFile(path, target)
 	})
+}
+
+// copySymlink recreates a symbolic link with the same target, so copy isolation
+// does not follow the link and duplicate (or read) whatever it points to.
+func copySymlink(src, dst string) error {
+	link, err := os.Readlink(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.Symlink(link, dst)
 }
 
 func copyFile(src, dst string) error {

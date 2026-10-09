@@ -120,7 +120,7 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 		cfg:            cfg,
 		auth:           auth,
 		bearer:         cfg.Server.Auth.Mode == "bearer",
-		rl:             newRateLimiter(cfg.Server.RateLimit),
+		rl:             newRateLimiter(cfg.Server.RateLimit, cfg.Server.Auth.Mode == "bearer"),
 		taskLookup:     taskLookupFunc(taskStore),
 		mux:            http.NewServeMux(),
 		authReady:      make(map[string]bool, len(cfg.Agents)),
@@ -272,13 +272,15 @@ func traceMiddleware(next http.Handler) http.Handler {
 func grpcServerOptions(auth config.AuthConfig, rl *rateLimiter, agentID string) []grpc.ServerOption {
 	unary := []grpc.UnaryServerInterceptor{traceUnaryInterceptor}
 	stream := []grpc.StreamServerInterceptor{traceStreamInterceptor}
-	if rl != nil {
-		unary = append(unary, rl.unaryInterceptor(agentID))
-		stream = append(stream, rl.streamInterceptor(agentID))
-	}
+	// Authenticate before rate limiting so the limiter only sees validated
+	// callers (mirroring the HTTP order).
 	if auth.Mode == "bearer" {
 		unary = append(unary, bearerUnaryInterceptor(auth.Tokens))
 		stream = append(stream, bearerStreamInterceptor(auth.Tokens))
+	}
+	if rl != nil {
+		unary = append(unary, rl.unaryInterceptor(agentID))
+		stream = append(stream, rl.streamInterceptor(agentID))
 	}
 	return []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(unary...),
@@ -288,7 +290,7 @@ func grpcServerOptions(auth config.AuthConfig, rl *rateLimiter, agentID string) 
 
 func (l *rateLimiter) unaryInterceptor(agentID string) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if !l.allow(agentID + "\x00" + grpcCallerKey(ctx)) {
+		if !l.allow(agentID + "\x00" + l.grpcCallerKey(ctx)) {
 			return nil, status.Error(codes.ResourceExhausted, "rate limit exceeded")
 		}
 		return handler(ctx, req)
@@ -297,20 +299,23 @@ func (l *rateLimiter) unaryInterceptor(agentID string) grpc.UnaryServerIntercept
 
 func (l *rateLimiter) streamInterceptor(agentID string) grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if !l.allow(agentID + "\x00" + grpcCallerKey(ss.Context())) {
+		if !l.allow(agentID + "\x00" + l.grpcCallerKey(ss.Context())) {
 			return status.Error(codes.ResourceExhausted, "rate limit exceeded")
 		}
 		return handler(srv, ss)
 	}
 }
 
-// grpcCallerKey identifies a gRPC caller: a hash of the bearer token when
-// present, otherwise the peer address.
-func grpcCallerKey(ctx context.Context) string {
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if v := md.Get("authorization"); len(v) > 0 {
-			if tok, ok := bridge.BearerToken(v[0]); ok {
-				return tokenKey(tok)
+// grpcCallerKey identifies a gRPC caller. As with the HTTP limiter, the bearer
+// token is only used when authentication validated it ahead of the limiter;
+// otherwise the peer address identifies the caller.
+func (l *rateLimiter) grpcCallerKey(ctx context.Context) string {
+	if l.authEnabled {
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			if v := md.Get("authorization"); len(v) > 0 {
+				if tok, ok := bridge.BearerToken(v[0]); ok {
+					return tokenKey(tok)
+				}
 			}
 		}
 	}

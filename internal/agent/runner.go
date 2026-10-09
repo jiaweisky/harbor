@@ -203,7 +203,9 @@ func (r *Runner) command(inv *Invocation, env []string) (string, []string) {
 
 // command builds the container runtime invocation: bind-mount the sandbox roots
 // at their host paths, set the working directory, forward the environment, then
-// run the CLI.
+// run the CLI. Environment values are not placed on the runtime argv (world
+// readable via /proc): only the variable names are passed with -e, so the
+// runtime reads each value from its own (owner-only) environment.
 func (c *ContainerSpec) command(inv *Invocation, env []string) (string, []string) {
 	args := []string{"run", "--rm", "-i", "--network", c.Network}
 	for _, m := range c.Mounts {
@@ -213,7 +215,8 @@ func (c *ContainerSpec) command(inv *Invocation, env []string) (string, []string
 		args = append(args, "-w", inv.Dir)
 	}
 	for _, kv := range env {
-		args = append(args, "--env", kv)
+		key, _, _ := strings.Cut(kv, "=")
+		args = append(args, "-e", key)
 	}
 	args = append(args, c.Image, inv.Bin)
 	args = append(args, inv.Args...)

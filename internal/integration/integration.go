@@ -137,12 +137,12 @@ func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 			invoke:    streamJSONInvoke(ac),
 		}), nil
 	case config.IntegrationExec:
-		p, err := buildExecParser(ac)
+		newParser, err := execParserFactory(ac)
 		if err != nil {
 			return nil, err
 		}
 		return headlessLauncher(ac, opts, auth, versionArgs, execCaps(ac, inputImage, profile.OutputImage),
-			headlessSpec{parser: p, invoke: textInvoke(ac)}), nil
+			headlessSpec{newParser: newParser, invoke: textInvoke(ac)}), nil
 	case config.IntegrationACP:
 		return acpLauncher(ac, opts, auth, versionArgs), nil
 	case config.IntegrationServer:
@@ -256,9 +256,10 @@ func textCaps(outputImage []string) agent.Capabilities {
 	}
 }
 
-// buildExecParser builds the parser for a one-shot (exec) invocation. The
-// parser name comes from config (default "text"); "regex" also needs a pattern.
-func buildExecParser(ac config.AgentConfig) (agent.Parser, error) {
+// execParserFactory validates the configured exec parser once and returns a
+// constructor. Each task gets its own parser instance because parsers may carry
+// per-task state and tasks run concurrently.
+func execParserFactory(ac config.AgentConfig) (func() agent.Parser, error) {
 	name := ac.Parser
 	if name == "" {
 		name = "text"
@@ -267,7 +268,16 @@ func buildExecParser(ac config.AgentConfig) (agent.Parser, error) {
 	if ac.Regex != nil {
 		pattern = ac.Regex.Text
 	}
-	return parser.Build(name, pattern)
+	if _, err := parser.Build(name, pattern); err != nil {
+		return nil, err
+	}
+	return func() agent.Parser {
+		p, err := parser.Build(name, pattern)
+		if err != nil {
+			return parser.NewText()
+		}
+		return p
+	}, nil
 }
 
 // streamJSONInvoke builds a duplex invocation: the prompt is written to stdin

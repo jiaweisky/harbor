@@ -6,8 +6,8 @@ import (
 )
 
 // TestContainerSpecCommand verifies the container runtime argv: flags, mounts at
-// host paths, working directory, environment forwarding, image, and the wrapped
-// CLI command.
+// host paths, working directory, environment forwarding by name, image, and the
+// wrapped CLI command.
 func TestContainerSpecCommand(t *testing.T) {
 	c := &ContainerSpec{
 		Runtime: "docker", Image: "img:latest", Network: "none",
@@ -25,7 +25,7 @@ func TestContainerSpecCommand(t *testing.T) {
 		"run", "--rm", "-i", "--network", "none",
 		"-v", "/srv/work:/srv/work", "-v", "/home/cli:/home/cli",
 		"-w", "/srv/work/task",
-		"--env", "PATH=/bin", "--env", "PWD=/srv/work/task",
+		"-e", "PATH", "-e", "PWD",
 		"img:latest", "claude", "-p", "hi",
 	}
 	if !reflect.DeepEqual(args, want) {

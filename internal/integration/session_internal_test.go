@@ -27,3 +27,23 @@ func TestSessionArgsResumeWithoutFork(t *testing.T) {
 		t.Fatalf("sessionArgs = %v, want [--resume s1]", got)
 	}
 }
+
+// TestExecParserFactoryRejectsUnknown verifies an unknown parser name fails at
+// build time rather than per task.
+func TestExecParserFactoryRejectsUnknown(t *testing.T) {
+	if _, err := execParserFactory(config.AgentConfig{Parser: "no-such-parser"}); err == nil {
+		t.Fatal("unknown parser name must error")
+	}
+}
+
+// TestExecParserFactoryFreshPerTask verifies each task gets its own parser
+// instance, since a stream-json parser carries per-task state.
+func TestExecParserFactoryFreshPerTask(t *testing.T) {
+	f, err := execParserFactory(config.AgentConfig{Parser: "stream-json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f() == f() {
+		t.Fatal("each task must get a fresh parser instance")
+	}
+}
