@@ -72,7 +72,7 @@ func (r *Resolver) Resolve(contextID string) (string, error) {
 		}
 	}
 	dir := r.workdir
-	if r.isolation == IsolationWorktree || r.isolation == IsolationCopy {
+	if r.isolation != IsolationShared {
 		d, err := r.isolate(contextID)
 		if err != nil {
 			return "", err
@@ -87,6 +87,15 @@ func (r *Resolver) Resolve(contextID string) (string, error) {
 
 // isolate creates a per-context working copy of the configured workdir.
 func (r *Resolver) isolate(contextID string) (string, error) {
+	var provision func(src, dst string) error
+	switch r.isolation {
+	case IsolationWorktree:
+		provision = gitWorktree
+	case IsolationCopy:
+		provision = copyTree
+	default:
+		return "", fmt.Errorf("unknown isolation %q", r.isolation)
+	}
 	if r.isoRoot == "" {
 		return "", fmt.Errorf("isolation_root is required for %q", r.isolation)
 	}
@@ -97,17 +106,8 @@ func (r *Resolver) isolate(contextID string) (string, error) {
 	if err := os.MkdirAll(r.isoRoot, 0o755); err != nil {
 		return "", err
 	}
-	switch r.isolation {
-	case IsolationWorktree:
-		if err := gitWorktree(r.workdir, dst); err != nil {
-			return "", fmt.Errorf("worktree: %w", err)
-		}
-	case IsolationCopy:
-		if err := copyTree(r.workdir, dst); err != nil {
-			return "", fmt.Errorf("copy: %w", err)
-		}
-	default:
-		return "", fmt.Errorf("unknown isolation %q", r.isolation)
+	if err := provision(r.workdir, dst); err != nil {
+		return "", fmt.Errorf("%s: %w", r.isolation, err)
 	}
 	return dst, nil
 }
@@ -152,6 +152,10 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -159,11 +163,14 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(dst, info.Mode().Perm())
 }
 
 // contextName derives a stable, filesystem-safe directory name from a context.

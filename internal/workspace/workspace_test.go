@@ -59,6 +59,9 @@ func TestIsolationCopy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("base"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(src, "run.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	r := workspace.NewResolverWithIsolation(src, workspace.IsolationCopy, iso)
 	a, err := r.Resolve("ctx-a")
@@ -71,6 +74,14 @@ func TestIsolationCopy(t *testing.T) {
 	copied, err := os.ReadFile(filepath.Join(a, "a.txt"))
 	if err != nil || string(copied) != "base" {
 		t.Fatalf("copied file: %q, %v", copied, err)
+	}
+	want, err := os.Stat(filepath.Join(src, "run.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.Stat(filepath.Join(a, "run.sh"))
+	if err != nil || got.Mode().Perm() != want.Mode().Perm() {
+		t.Fatalf("copied mode = %v, %v; want %v", got, err, want.Mode().Perm())
 	}
 }
 
