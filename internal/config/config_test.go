@@ -459,6 +459,52 @@ agents:
 	}
 }
 
+func TestCardOverrideConfig(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    args: ["-p"]
+    description: "My CodeBuddy"
+    skills:
+      - id: code-review
+        name: Code review
+        description: Review a diff for issues
+        tags: ["review", "quality"]
+        examples: ["review this diff"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	a := cfg.Agents[0]
+	if a.Description != "My CodeBuddy" {
+		t.Fatalf("description = %q", a.Description)
+	}
+	if len(a.Skills) != 1 || a.Skills[0].ID != "code-review" || len(a.Skills[0].Tags) != 2 {
+		t.Fatalf("skills = %+v", a.Skills)
+	}
+}
+
+func TestSkillsRequireIDNameDescription(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    args: ["-p"]
+    skills:
+      - id: only-id
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "requires id, name, and description") {
+		t.Fatalf("expected a skills validation error, got %v", err)
+	}
+}
+
 func TestTelemetryConfig(t *testing.T) {
 	path := writeConfig(t, `
 version: 1

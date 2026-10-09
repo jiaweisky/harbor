@@ -66,7 +66,25 @@ func Build(ctx context.Context, ac config.AgentConfig, opts Options) (agent.Laun
 	}
 	// Harbor does not gate on its own credential guess: the CLI decides whether
 	// it can run, so a CLI that starts standalone is served as-is.
-	return ln, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Path: path, Enabled: true, Version: ver}, nil
+	return ln, agent.Info{
+		Name: ac.ID, DisplayName: ac.DisplayName, Description: ac.Description,
+		Skills: infoSkills(ac), Path: path, Enabled: true, Version: ver,
+	}, nil
+}
+
+// infoSkills maps the configured card skills onto the agent package type.
+func infoSkills(ac config.AgentConfig) []agent.Skill {
+	if len(ac.Skills) == 0 {
+		return nil
+	}
+	out := make([]agent.Skill, 0, len(ac.Skills))
+	for _, s := range ac.Skills {
+		out = append(out, agent.Skill{
+			ID: s.ID, Name: s.Name, Description: s.Description,
+			Tags: s.Tags, Examples: s.Examples, InputModes: s.InputModes, OutputModes: s.OutputModes,
+		})
+	}
+	return out
 }
 
 // New constructs a Launcher for the given agent config. When the integration

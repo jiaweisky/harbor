@@ -45,6 +45,10 @@ agents:
     args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages"]
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
     limits: { max_concurrent: 3, timeout: 30m, breaker: { threshold: 3, cooldown: 30s, max_cooldown: 10m } }
+    # Optional agent-card overrides. `description` replaces the card text.
+    # `skills` advertises capabilities to callers (each needs id/name/description,
+    # tags optional); when omitted, no skills are advertised.
+    description: "CodeBuddy is a helpful software-development assistant that can write, review, and fix code in your repository."
 
   - id: opencode
     display_name: "OpenCode"
@@ -53,6 +57,7 @@ agents:
     args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]
     session: { id_flag: "--session", continue_flag: "--continue" }
     limits: { max_concurrent: 2 }
+    description: "OpenCode is a helpful software-development assistant for reading, searching, and explaining a codebase."
 
   - id: codex
     display_name: "Codex"
@@ -62,16 +67,19 @@ agents:
     # Images are passed as arguments; input_image declares the accepted types.
     # image_args/top-level input_image default from the codex profile.
     limits: { max_concurrent: 2 }
+    description: "Codex is a helpful software-development assistant that implements code changes and returns the diff."
     # Optional A2A gRPC binding for this agent (host:port).
     # grpc_listen: "127.0.0.1:50051"
 
-  # Zero-code custom CLI: extract text from output with a regex.
-  - id: my-coder
-    display_name: "My Coder"
-    binary: my-coder
-    integration: exec
-    parser: regex
-    regex: { text: '^OUT:\s*(.+)$' }
-    args: ["--prompt", "{{.Prompt}}"]
-    limits: { max_concurrent: 2 }
+  # Zero-code custom CLI (template): point `binary` at your own executable, then
+  # uncomment. Unknown binaries need an explicit `integration` (and a `parser`
+  # for the exec mode). The binary below does not exist, so it stays disabled.
+  # - id: my-coder
+  #   display_name: "My Coder"
+  #   binary: my-coder
+  #   integration: exec
+  #   parser: regex
+  #   regex: { text: '^OUT:\s*(.+)$' }
+  #   args: ["--prompt", "{{.Prompt}}"]
+  #   limits: { max_concurrent: 2 }
 

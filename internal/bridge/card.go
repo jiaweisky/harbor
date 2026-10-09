@@ -32,6 +32,10 @@ func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool)
 	if version == "" {
 		version = "0.1.0"
 	}
+	description := info.Description
+	if description == "" {
+		description = "Remote A2A wrapper for the " + displayName + " coding agent CLI"
+	}
 	in := caps.InputModes()
 	if len(in) == 0 {
 		in = []string{"text/plain"}
@@ -43,7 +47,7 @@ func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool)
 
 	card := &a2a.AgentCard{
 		Name:        "Harbor/" + displayName,
-		Description: "Remote A2A wrapper for the " + displayName + " coding agent CLI",
+		Description: description,
 		Version:     version,
 		SupportedInterfaces: []*a2a.AgentInterface{
 			{
@@ -64,13 +68,7 @@ func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool)
 		},
 		DefaultInputModes:  in,
 		DefaultOutputModes: out,
-		Skills: []a2a.AgentSkill{{
-			ID:          ln.Name(),
-			Name:        displayName,
-			Description: "Run a coding task with " + displayName,
-			Tags:        []string{"coding", "cli", ln.Name()},
-			Examples:    []string{"fix the failing test in ./pkg", "review this diff"},
-		}},
+		Skills:             cardSkills(info.Skills),
 	}
 
 	if bearer {
@@ -83,6 +81,25 @@ func BuildCard(ln agent.Launcher, info agent.Info, endpoint string, bearer bool)
 		}
 	}
 	return card
+}
+
+// cardSkills maps the operator-configured skills onto card skills. It returns a
+// non-nil (possibly empty) slice so the serialized card always carries a
+// "skills" field (never null).
+func cardSkills(skills []agent.Skill) []a2a.AgentSkill {
+	out := make([]a2a.AgentSkill, 0, len(skills))
+	for _, s := range skills {
+		out = append(out, a2a.AgentSkill{
+			ID:          s.ID,
+			Name:        s.Name,
+			Description: s.Description,
+			Tags:        append([]string{}, s.Tags...), // non-nil so tags serialize as [], not null
+			Examples:    s.Examples,
+			InputModes:  s.InputModes,
+			OutputModes: s.OutputModes,
+		})
+	}
+	return out
 }
 
 // interactionExtensions declares the interaction extension when the CLI can

@@ -1,38 +1,38 @@
 # AGENTS.md
 
-本文件为 Harbor 仓库提供代理与协作者的工程约定。
+This file provides engineering conventions for agents and collaborators working in the Harbor repository.
 
-## 设计与实现标准
+## Design and Implementation Standards
 
-**核心标准：只做当前问题所需的“最合理”设计——既不预留用不上的抽象（过度设计），也不为省事留注定返工的临时/简化版。两者都错。**
+**Core standard: do only the "most reasonable" design required by the current problem—neither reserve abstractions that won't be used (over-engineering), nor leave a temporary/simplified version that is bound to be reworked just to save effort. Both are wrong.**
 
-- “最小必要”≠“简单版/基础版”。约束刚好够、直接解决当前问题的方案就是正解；不要用“简单/基础”去贬低它。
-- 引入抽象或框架前，必须能指出**当前存在**的需求、约束或已发生的失败作为依据；不为“假想的未来”预先造机制。
-- 演进按需增量：例如某个 CLI 版本与现有代码不兼容时，就在对应适配器**按版本号加兼容分支**，而不是预先构建变体/约束框架。
-- 评审与沟通用中性语言，不把合理设计称为“简化/临时”。
+- "Minimal necessary" ≠ "simplified/basic version". A solution whose constraints are just enough and that directly solves the current problem is the correct one; do not disparage it as "simple/basic".
+- Before introducing an abstraction or framework, you must be able to point to a **currently existing** requirement, constraint, or failure that has already occurred as justification; do not build mechanisms in advance for a "hypothetical future".
+- Evolve incrementally as needed: for example, when a certain CLI version is incompatible with existing code, add a compatibility branch in the corresponding adapter **keyed by version number**, rather than pre-building a variants/constraints framework.
+- Use neutral language in review and communication; do not call a reasonable design "simplified/temporary".
 
-## 沟通与措辞规范
+## Communication and Wording Standards
 
-措辞要让读者**信任实现是可靠的**，不要因用词让人觉得作者自己没底。
+Wording should make the reader **trust that the implementation is reliable**; do not use phrasing that makes the author appear unsure of themselves.
 
-- 陈述正确的决定时**直接下结论并给依据**，不加保留词（如“当前足够/暂时/先用/基础版”）。
-- 存在真实限制时**精确、局部地陈述**，不放大成整体能力的不足。
-- 只在**有具体触发条件**时谈扩展或演进；不预列“未来可能升级”来暗示当前欠缺。
-- 真正不确定时，明确给出**不确定点与验证方式**，而不是模糊留白。
-- 不用“简单/基础/简化”去形容本已合理的设计。
+- When stating a correct decision, **state the conclusion directly and give the justification**, without hedging words (such as "currently sufficient/temporary/for now/basic version").
+- When a real limitation exists, **state it precisely and locally**; do not magnify it into a deficiency of overall capability.
+- Discuss extension or evolution only **when there is a concrete triggering condition**; do not pre-list "possible future upgrades" to imply a current shortcoming.
+- When genuinely uncertain, explicitly give the **uncertain point and the way to verify it**, rather than leaving it vaguely open.
+- Do not use "simple/basic/simplified" to describe a design that is already reasonable.
 
-## 代码质量约定
+## Code Quality Conventions
 
-- **代码注释一律用英文**（标识符、注释、提交信息对外可读）。
-- 单行不超过 **120** 字符（由 `golangci-lint` 的 `lll` 强制）。
-- 函数拆分以**可读性**为先：即便总复杂度无法降低，也应拆成更小的函数。
-- 注释**自包含**，不引用外部设计文档；命名与注释语义一致。
-- 消除重复代码；接口与类型的命名清晰、贴合语义。
+- **Code comments are always in English** (identifiers, comments, and commit messages are externally readable).
+- A single line must not exceed **120** characters (enforced by `golangci-lint`'s `lll`).
+- Function decomposition prioritizes **readability**: even if the total complexity cannot be reduced, split it into smaller functions.
+- Comments must be **self-contained** and must not reference external design documents; naming and comment semantics must be consistent.
+- Eliminate duplicated code; name interfaces and types clearly and in a way that fits their semantics.
 
-## 构建与检查
+## Build and Checks
 
-- `make build`、`make vet`、`make test`（带 `-race`）、`make lint`。
-- `golangci-lint` 需由 **Go ≥ module `go` 指令版本** 构建；低于该版本的二进制会拒绝运行或崩溃。
+- `make build`, `make vet`, `make test` (with `-race`), `make lint`.
+- `golangci-lint` must be built by **Go ≥ the version of the module's `go` directive**; a binary of a lower version will refuse to run or crash.
 
 ## Git: do not commit automatically
 

@@ -1,75 +1,75 @@
-# Harbor — 把 Coding Agent CLI 封装成 A2A 远程 Agent 的设计方案
+# Harbor — A Design for Wrapping Coding Agent CLIs as A2A Remote Agents
 
-> 版本：v1-rc（关键决策已定，见 A.12）
-> 目标语言：Go 1.27+（`iter.Seq2`、`log/slog`、`os/exec`、context 取消）
-> 依赖：`github.com/a2aproject/a2a-go/v2`（A2A 协议 v1.0，当前 v2.6.0，要求 Go 1.25+）
-> 项目代号：Harbor（停泊/调度各类“专业编程 Agent 进程”的港口）
+> Version: v1-rc (key decisions finalized, see A.12)
+> Target language: Go 1.27+ (`iter.Seq2`, `log/slog`, `os/exec`, context cancellation)
+> Dependencies: `github.com/a2aproject/a2a-go/v2` (A2A protocol v1.0, currently v2.6.0, requires Go 1.25+)
+> Project codename: Harbor (a port for berthing/scheduling various "professional coding Agent processes")
 
 ---
 
-## 1. 背景与目标
+## 1. Background and Goals
 
-`opencode`、`codebuddy`、`claude`、`codex` 等 CLI 都是能力很强的编程 Agent，且**多数已具备服务端/远程模式**（如 `opencode serve`、`codebuddy --serve`、`codex app-server`）。问题不在“能否远程”，而在**各自的协议与 API 互不相同**：
+CLIs such as `opencode`, `codebuddy`, `claude`, and `codex` are all highly capable coding Agents, and **most already provide a server/remote mode** (e.g. `opencode serve`, `codebuddy --serve`, `codex app-server`). The problem is not "whether they can be remote", but that **their respective protocols and APIs differ from one another**:
 
-| CLI | 可被封装形态 | 接口形态 |
+| CLI | Wrappable form | Interface form |
 |---|---|---|
-| opencode | `serve` / `web` / `acp` | 自有 REST + SSE |
-| codebuddy | `--serve`（REST/ACP-over-SSE）**与无头 `-p`** | 自有 REST + ACP / 无头 |
-| codex | `app-server` / `exec-server` / `remote-control`**与无头 `exec`** | 自有 JSON-RPC 类协议 / 无头 |
-| claude | **无本地 serve**（仅无头 `-p` / SDK / `--cloud`） | 无头 stream-json / SDK |
+| opencode | `serve` / `web` / `acp` | proprietary REST + SSE |
+| codebuddy | `--serve` (REST/ACP-over-SSE) **and headless `-p`** | proprietary REST + ACP / headless |
+| codex | `app-server` / `exec-server` / `remote-control` **and headless `exec`** | proprietary JSON-RPC-like protocol / headless |
+| claude | **no local serve** (only headless `-p` / SDK / `--cloud`) | headless stream-json / SDK |
 
-> 注：`-p/--print` 是**无头（非交互）**模式，**不是 serve**；Harbor 的 `exec` / `stream-json` 适配的正是无头模式，`serve` / `app-server` 才是常驻服务。
+> Note: `-p/--print` is the **headless (non-interactive)** mode, **not serve**; Harbor's `exec` / `stream-json` adapters target exactly the headless mode, while `serve` / `app-server` are long-running services.
 
-它们的**发现、认证、会话、任务、流式与能力模型均不统一**，远程系统与其它 Agent 难以用**一套客户端**统一调用与编排。
+Their **discovery, authentication, session, task, streaming, and capability models are all non-uniform**, making it hard for remote systems and other Agents to invoke and orchestrate them through **a single client**.
 
-**目标**：用 Go 编写一个服务，把任意 coding-agent CLI 归一为符合 **A2A（Agent2Agent）v1.0** 的统一 Agent Server，从而：
+**Goal**: Write a service in Go that normalizes any coding-agent CLI into a unified Agent Server conforming to **A2A (Agent2Agent) v1.0**, so as to:
 
-- 以**统一协议**（JSON-RPC + SSE）调用这些异构 CLI，而非各写一套客户端；
-- 每个 CLI 暴露标准 **AgentCard**，可被发现与协商（含多 CLI 联邦）；
-- 支持 **流式输出、任务取消、多轮会话续跑、权限/澄清交互**；
-- 统一 **鉴权、配额、沙箱、审计**（§9/§10/§11）；
-- **无需改代码即可扩展**新的 coding-agent CLI（配置驱动），也保留 Go 接口级扩展能力。
+- Invoke these heterogeneous CLIs through **a unified protocol** (JSON-RPC + SSE), instead of writing a separate client for each;
+- Have each CLI expose a standard **AgentCard** that can be discovered and negotiated (including multi-CLI federation);
+- Support **streaming output, task cancellation, multi-turn session resumption, permission/clarification interactions**;
+- Unify **authentication, quota, sandboxing, auditing** (§9/§10/§11);
+- Allow new coding-agent CLIs to be added **with no code changes** (configuration-driven), while also retaining Go interface-level extensibility.
 
-**协议范围**：**仅支持 A2A v1.0**（以 `github.com/a2aproject/a2a-go/v2` 导出的 `a2a.Version` 为准）；不兼容 v0.x / 早期草案。请求携带的 `A2A-Version` 不匹配时返回 `ErrVersionNotSupported`。
+**Protocol scope**: **only A2A v1.0 is supported** (as defined by `a2a.Version` exported by `github.com/a2aproject/a2a-go/v2`); v0.x / early drafts are not compatible. When the `A2A-Version` carried by a request does not match, `ErrVersionNotSupported` is returned.
 
-**非目标（v1）**：不做 UI；不做多 Agent 自动路由决策（DAG 编排留给上层）；不实现自己的模型访问，完全复用各 CLI 自带能力与凭据。
+**Non-goals (v1)**: no UI; no multi-Agent automatic routing decisions (DAG orchestration is left to the upper layer); no implementation of its own model access — it fully reuses each CLI's built-in capabilities and credentials.
 
 ---
 
-## 2. 设计原则
+## 2. Design Principles
 
-| 原则 | 说明 |
+| Principle | Description |
 |---|---|
-| **薄封装、不重造** | 只负责“调用 CLI + 解析输出 + 翻译成 A2A 事件”，不复制 CLI 的 agent 逻辑。 |
-| **CLI 差异隔离** | 每个 CLI 的差异集中在 `Adapter`，核心执行器与 A2A 层保持零特判。 |
-| **配置优先扩展** | 新增 CLI 首选 YAML 配置 + 内置解析器；特殊场景再写 Go 代码。 |
-| **A2A 语义对齐** | 用 A2A 的 `TaskState`、`contextId`、`artifact`、`input-required` 精确表达 CLI 行为。 |
-| **机制内建、策略可配** | Harbor 只内建“可强制边界”的机制（鉴权钩子、工作目录约束、进程隔离、并发/超时上限）；具体开关与取值均为配置项，默认取最小权限。 |
+| **Thin wrapper, no reinvention** | Only responsible for "invoking the CLI + parsing output + translating into A2A events", not copying the CLI's agent logic. |
+| **CLI differences isolated** | Each CLI's differences are concentrated in its `Adapter`, while the core executor and A2A layer remain free of special-casing. |
+| **Configuration-first extension** | Adding a CLI prefers YAML configuration + built-in parser; only special cases require writing Go code. |
+| **A2A semantic alignment** | Precisely express CLI behavior using A2A's `TaskState`, `contextId`, `artifact`, and `input-required`. |
+| **Mechanisms built in, policies configurable** | Harbor only builds in mechanisms with "enforceable boundaries" (auth hooks, workdir constraints, process isolation, concurrency/timeout ceilings); the specific toggles and values are all configuration items, defaulting to least privilege. |
 
-### 2.1 机制 vs 策略
+### 2.1 Mechanisms vs. Policies
 
-沙箱、鉴权、危险开关等都是**可配置策略**，不是设计原则本身。原则只保证“边界能被强制”，而是否启用、取值多少交给部署方：
+Sandboxing, authentication, dangerous switches, etc. are all **configurable policies**, not design principles themselves. The principles only guarantee that "boundaries can be enforced", while whether to enable them and what values to use are left to the deployer:
 
-| 可配置项 | 配置键 | 默认值 | 放开的意义 |
+| Configurable item | Config key | Default | Meaning of enabling |
 |---|---|---|---|
-| 鉴权 | `server.auth.mode` | `none`（本地）/ `bearer`（对外） | 对接外部系统 |
-| 工作目录范围 | `sandbox.workdir_root` / `allow_outside` | 受限 / `false` | 允许访问任意路径 |
-| 环境变量 | `sandbox.inherit_env` | `true`（继承启动用户环境） | 设为 `false` 时仅注入白名单 |
-| 危险开关 | `agents[].allow_dangerous` | `false` | 打开 `--dangerously-skip-permissions`/`-y`/`bypassPermissions` |
-| 容器沙箱 | `sandbox.container` | 关闭 | 强隔离（网络/文件系统） |
-| 并发/超时 | `agents[].limits.*` | 保守值 | 提高吞吐 |
+| Authentication | `server.auth.mode` | `none` (local) / `bearer` (external) | Integrate with external systems |
+| Workdir scope | `sandbox.workdir_root` / `allow_outside` | restricted / `false` | Allow access to arbitrary paths |
+| Environment variables | `sandbox.inherit_env` | `true` (inherit the launching user's environment) | When set to `false`, only a whitelist is injected |
+| Dangerous switches | `agents[].allow_dangerous` | `false` | Enable `--dangerously-skip-permissions`/`-y`/`bypassPermissions` |
+| Container sandbox | `sandbox.container` | off | Strong isolation (network/filesystem) |
+| Concurrency/timeout | `agents[].limits.*` | conservative values | Increase throughput |
 
-> 结论：Harbor 保证“边界可强制”，但不替部署方决定策略；危险能力一律 opt-in，并在启动日志高亮告警。
+> Conclusion: Harbor guarantees "boundaries can be enforced", but does not decide policies on behalf of the deployer; dangerous capabilities are always opt-in and are highlighted with warnings in the startup log.
 
 ---
 
-## 3. 总体架构
+## 3. Overall Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Remote["远程调用方"]
+    subgraph Remote["Remote Callers"]
         C1["A2A Client / Orchestrator"]
-        C2["a2a-cli / 其它 Agent"]
+        C2["a2a-cli / other Agent"]
     end
 
     subgraph Harbor["Harbor (Go 1.27+)"]
@@ -77,7 +77,7 @@ flowchart LR
         S["A2A Transport\n(JSON-RPC / REST / gRPC + SSE)"]
         R["Registry\n(AgentCard + Adapter)"]
         E["CLIExecutor\n(a2asrv.AgentExecutor)"]
-        RUN["Runner\n(exec + stdout pump + 生命周期)"]
+        RUN["Runner\n(exec + stdout pump + lifecycle)"]
         STORE["TaskStore / SessionStore"]
         SEC["Auth / Sandbox / RateLimit"]
 
@@ -88,7 +88,7 @@ flowchart LR
         S --> SEC
     end
 
-    subgraph Agents["Coding Agent CLI 进程"]
+    subgraph Agents["Coding Agent CLI processes"]
         A1["opencode"]
         A2["claude"]
         A3["codebuddy"]
@@ -105,37 +105,37 @@ flowchart LR
     RUN -->|stdin/stdout| A5
 ```
 
-### 组件职责
+### Component Responsibilities
 
-| 组件 | 职责 |
+| Component | Responsibility |
 |---|---|
-| `a2asrv.RequestHandler` | a2a-go 提供，处理协议、任务状态机、事件持久化、推送。 |
-| `CLIExecutor` | 实现 `a2asrv.AgentExecutor`；把 CLI 输出翻译为 A2A 事件。 |
-| `Registry` | 维护 `agentID → (AgentCard, Adapter, 并发配额)`。 |
-| `Runner` | 启动/杀死子进程、按行/字节泵 stdout、处理超时与进程组。 |
-| `Parser` | 把 CLI 原始输出（stream-json / text / 自定义）解析为统一事件。 |
-| `SessionStore` | 维护 `A2A contextId ↔ CLI native sessionId` 映射。 |
-| `Sandbox` | 工作目录白名单、环境变量裁剪、可选容器化。 |
+| `a2asrv.RequestHandler` | Provided by a2a-go; handles the protocol, task state machine, event persistence, and push. |
+| `CLIExecutor` | Implements `a2asrv.AgentExecutor`; translates CLI output into A2A events. |
+| `Registry` | Maintains `agentID → (AgentCard, Adapter, concurrency quota)`. |
+| `Runner` | Starts/kills child processes, pumps stdout line/byte-wise, handles timeouts and process groups. |
+| `Parser` | Parses raw CLI output (stream-json / text / custom) into unified events. |
+| `SessionStore` | Maintains the `A2A contextId ↔ CLI native sessionId` mapping. |
+| `Sandbox` | Workdir whitelist, environment variable trimming, optional containerization. |
 
-### 3.1 多 CLI 管理
+### 3.1 Multi-CLI Management
 
-Harbor 的定位就是**同时托管多个 coding CLI**，分三层：
+Harbor's very purpose is to **host multiple coding CLIs simultaneously**, in three layers:
 
-- **宿主多个 CLI（v1）**：单进程按 `agents:` 列表加载多个 CLI，各自生成 `/agents/{id}` 路由与独立 AgentCard；`Registry` 维护 `agentID → (Card, Adapter/Launcher, 配额)`。
-- **逐个隔离**：每个 agent 有独立能力（→Card 投影）、并发配额、工作目录、`allow_dangerous` 与**凭据/home 隔离**（§10.3），互不串号。
-- **同一 CLI 多模式**：同一二进制可注册多次（如 `codebuddy`(stream-json) + `codebuddy-acp`），各出一张卡，客户端自选。
+- **Host multiple CLIs (v1)**: a single process loads multiple CLIs according to the `agents:` list, each generating its own `/agents/{id}` route and independent AgentCard; the `Registry` maintains `agentID → (Card, Adapter/Launcher, quota)`.
+- **Per-agent isolation**: each agent has independent capabilities (→Card projection), concurrency quota, workdir, `allow_dangerous`, and **credential/home isolation** (§10.3), without cross-contamination.
+- **Same CLI, multiple modes**: the same binary can be registered multiple times (e.g. `codebuddy`(stream-json) + `codebuddy-acp`), each producing a card for the client to choose from.
 
-**不在范围**：跨 CLI 的**智能路由/自动挑选**（属上层编排，§1 非目标）；CLI 二进制的**安装/升级**（只做 `Probe` 存活与登录态探测，§10.5）。
+**Out of scope**: **intelligent routing/automatic selection** across CLIs (belongs to upper-layer orchestration, §1 non-goal); **installation/upgrade** of CLI binaries (only `Probe` liveness and login-state detection, §10.5).
 
-> 部署可选：单进程多 agent（统一鉴权/配额/运维）或每 agent 独立进程/容器（更强隔离），见 §18。
+> Optional deployment: a single process with multiple agents (unified auth/quota/operations) or an independent process/container per agent (stronger isolation); see §18.
 
 ---
 
-## 4. 核心抽象：Adapter + Parser + Runner
+## 4. Core Abstraction: Adapter + Parser + Runner
 
-### 4.1 统一事件模型
+### 4.1 Unified Event Model
 
-不同 CLI 输出格式各异，先归一化成内部事件流：
+Different CLIs have different output formats; first normalize them into an internal event stream:
 
 ```go
 package agent
@@ -167,7 +167,7 @@ type Event struct {
 }
 ```
 
-### 4.2 请求模型（A2A → 归一化）
+### 4.2 Request Model (A2A → normalized)
 
 ```go
 type Request struct {
@@ -183,7 +183,7 @@ type Request struct {
 }
 ```
 
-### 4.3 Adapter 接口（可扩展的关键）
+### 4.3 Adapter Interface (the key to extensibility)
 
 ```go
 type Adapter interface {
@@ -215,9 +215,9 @@ type Parser interface {
 }
 ```
 
-> **解耦要点**：`Adapter` 决定“怎么调”，`Parser` 决定“怎么读”，`Runner` 决定“怎么跑”。三者都可独立替换，从而覆盖绝大多数 CLI。
+> **Decoupling point**: the `Adapter` decides "how to invoke", the `Parser` decides "how to read", and the `Runner` decides "how to run". All three can be replaced independently, thereby covering the vast majority of CLIs.
 
-### 4.4 Runner：进程生命周期
+### 4.4 Runner: process lifecycle
 
 ```go
 type Runner struct {
@@ -238,24 +238,24 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 }
 ```
 
-关键点：
+Key points:
 
-- **进程组隔离**：CLI 常再 spawn 子进程（shell、MCP server），必须整组 kill。
-- **空闲/总超时**：`WithAgentInactivityTimeout`（a2a-go 提供）+ 自定义总超时。
-- **stderr 不污染协议流**：只并入日志与错误诊断，不当作 artifact。
-- **背压**：事件 channel 有界缓冲，客户端消费慢时阻塞读取，避免内存膨胀。
-- **进程控制平台相关**：Unix 用进程组（`SysProcAttr{Setpgid:true}` + `kill(-pgid, ...)`），Windows 用 Job Object / `taskkill /T`；以 build tag（`runner_unix.go` / `runner_windows.go`）分实现（详见 §10.3）。
-- **取消必须走 `Runner.Kill`（进程组）**：`exec.CommandContext` 的 ctx 取消只会 kill **直接子进程**、不杀进程组；空闲/总超时都应调用 `Runner.Kill`，不要只依赖 ctx 默认行为。
+- **Process-group isolation**: CLIs often spawn further child processes (shell, MCP server), so the whole group must be killed.
+- **Idle/total timeout**: `WithAgentInactivityTimeout` (provided by a2a-go) + a custom total timeout.
+- **stderr must not pollute the protocol stream**: it is merged only into logs and error diagnostics, never treated as an artifact.
+- **Backpressure**: the event channel has a bounded buffer; when the client consumes slowly, reads block to avoid memory growth.
+- **Process control is platform-specific**: Unix uses process groups (`SysProcAttr{Setpgid:true}` + `kill(-pgid, ...)`), while Windows uses a Job Object / `taskkill /T`; split implementations by build tag (`runner_unix.go` / `runner_windows.go`) (see §10.3 for details).
+- **Cancellation must go through `Runner.Kill` (process group)**: cancelling the ctx of `exec.CommandContext` only kills the **direct child process**, not the process group; both idle and total timeouts should call `Runner.Kill`, not rely solely on the ctx default behavior.
 
-### 4.5 复杂度控制：模式是共享基础设施，不做运行时协商
+### 4.5 Complexity Control: Modes Are Shared Infrastructure, No Runtime Negotiation
 
-“按能力自动选模式（ACP → stream-json → exec）”看着灵活，实则会引爆复杂度：N 个 CLI × M 个模式、运行时回退分支、双向(ACP)与单向(line)的行为差异泄漏进执行器。因此**收敛**为：
+"Automatically selecting a mode by capability (ACP → stream-json → exec)" looks flexible, but in reality it explodes complexity: N CLIs × M modes, runtime fallback branches, and the behavioral differences between bidirectional (ACP) and unidirectional (line) leaking into the executor. Therefore it is **converged** to:
 
-1. **一个 Adapter 只绑定一种集成模式**（注册/配置时**静态**确定），核心不做运行时模式协商。
-2. **模式是共享基础设施，不是每个 CLI 重写**：**`headless`（配 `text` / `stream-json` parser）、`server`、`acp`** 各实现一次即可被多个 CLI 复用（claude+codebuddy 共用 headless/stream-json；opencode+codebuddy 共用 ACP 或 server；codex 用 headless/jsonl）。**Launcher 数 ≈ 3，而非 CLI×模式。**
-3. **CLI 差异尽量声明式**：参数模板、capability 标志、会话标志映射放进 Spec/配置；只有怪癖才写薄 Adapter。
-4. **核心只认一个契约**：`Launcher.Start → Session{ Events(); Send(); Cancel() }`。line-based 与 ACP 都实现它，Executor 无感知（`Send` 用于 **duplex** 模式：ACP 及 stream-json stdin 输入的权限/澄清/续答；纯 `exec` 单向模式为 no-op）。
-5. **回退是显式可选**：确需“某模式不可用则降级”时，用**显式 composite launcher**或配置策略，而非核心默认行为。
+1. **One Adapter binds to exactly one integration mode** (determined **statically** at registration/configuration time); the core performs no runtime mode negotiation.
+2. **Modes are shared infrastructure, not rewritten per CLI**: **`headless` (with a `text` / `stream-json` parser), `server`, and `acp`** each only need to be implemented once and can be reused by multiple CLIs (claude+codebuddy share headless/stream-json; opencode+codebuddy share ACP or server; codex uses headless/jsonl). **The number of Launchers ≈ 3, not CLI×mode.**
+3. **CLI differences should be as declarative as possible**: argument templates, capability flags, and session-flag mappings go into the Spec/configuration; only quirks require writing a thin Adapter.
+4. **The core recognizes only one contract**: `Launcher.Start → Session{ Events(); Send(); Cancel() }`. Both line-based and ACP implement it, and the Executor is unaware (`Send` is used for **duplex** modes: permission/clarification/continuation answers in ACP and stream-json stdin input; it is a no-op for pure one-shot `exec` mode).
+5. **Fallback is explicitly optional**: when "degrade if a certain mode is unavailable" is truly needed, use an **explicit composite launcher** or a configuration policy, rather than core default behavior.
 
 ```go
 // The single core contract; transport-agnostic.
@@ -274,81 +274,81 @@ type Launcher interface { // implemented once per mode, reused by many CLIs
 }
 ```
 
-> 关系：§4.3 的 `Adapter`/`Parser` 与 §4.4 的 `Runner` 是 **line-based 模式**（exec / stream-json）在同一契约下的内部实现；ACP 模式则是另一个 `Launcher/Session` 实现。对 Executor 而言二者无差别。
+> Relationship: the `Adapter`/`Parser` of §4.3 and the `Runner` of §4.4 are the internal implementation of the **line-based mode** (exec / stream-json) under the same contract; the ACP mode is another implementation of `Launcher/Session`. To the Executor the two are indistinguishable.
 
-这样复杂度上界 = **模式数 + CLI 配置数**，而非笛卡尔积。
+Thus the complexity upper bound = **number of modes + number of CLI configurations**, rather than a Cartesian product.
 
 ---
 
-## 5. 各 CLI 适配策略
+## 5. Per-CLI Adaptation Strategy
 
-Adapter 针对不同 CLI 选择“集成模式”。以下基于各 CLI `-h` 实际参数：
+The Adapter selects an "integration mode" for each different CLI. The following is based on the actual `-h` arguments of each CLI:
 
-| Agent | 适配形态 | 关键参数 | 会话续跑 | 备注 |
+| Agent | Adaptation form | Key arguments | Session resumption | Notes |
 |---|---|---|---|---|
-| **claude** | 无头 `stream-json` | `-p --output-format stream-json --verbose --input-format stream-json --include-partial-messages` | `--resume <id>` / `--session-id <uuid>` | 结构化流；`--append-system-prompt`、`--allowedTools`、`--permission-mode`。 |
-| **codebuddy** | 无头 `stream-json` / `exec` / `acp` / `server` | `-p --output-format stream-json --input-format stream-json --include-partial-messages`；`--serve` | `-r/--resume`、`--session-id`；server 用 `conversation.id` | 与 claude 同源；危险开关为 `-y/--dangerously-skip-permissions`；`--acp`（stdio）；`--serve` 暴露 **HTTP API 与 ACP-over-HTTP 两种协议**（`server_protocol`，见 §5.4）。 |
-| **opencode** | 无头 `text` 或 `server` | `run <msg> -m provider/model --agent <a> --session <id> --continue`；或 `serve` / `acp` | `--session` / `--continue` / `--fork` | `run` 无 stream-json，用行缓冲近似流式；结构化可用 `serve`(HTTP) 或 `acp`。 |
-| **codex** | 无头 `exec`（`--json`）或 `server` | `codex exec "<prompt>"`；`-m` / `-C/--cd` / `-s/--sandbox` / `-a/--ask-for-approval` / `-i/--image` / `--add-dir` / `--json` / `--output-schema` / `-o/--output-last-message` | `codex exec resume --last` / `codex exec fork` | 危险开关 `--dangerously-bypass-approvals-and-sandbox`；常驻用 `app-server`。 |
-| **custom** | 无头 `text` / `regex` | 由 YAML 指定 | 由 YAML 指定 | 通用模板 Adapter，覆盖任意二进制。 |
+| **claude** | headless `stream-json` | `-p --output-format stream-json --verbose --input-format stream-json --include-partial-messages` | `--resume <id>` / `--session-id <uuid>` | Structured stream; `--append-system-prompt`, `--allowedTools`, `--permission-mode`. |
+| **codebuddy** | headless `stream-json` / `exec` / `acp` / `server` | `-p --output-format stream-json --input-format stream-json --include-partial-messages`; `--serve` | `-r/--resume`, `--session-id`; server uses `conversation.id` | Same lineage as claude; the dangerous switch is `-y/--dangerously-skip-permissions`; `--acp` (stdio); `--serve` exposes **two protocols, HTTP API and ACP-over-HTTP** (`server_protocol`, see §5.4). |
+| **opencode** | headless `text` or `server` | `run <msg> -m provider/model --agent <a> --session <id> --continue`; or `serve` / `acp` | `--session` / `--continue` / `--fork` | `run` has no stream-json, so line buffering approximates streaming; for structured output use `serve`(HTTP) or `acp`. |
+| **codex** | headless `exec` (`--json`) or `server` | `codex exec "<prompt>"`; `-m` / `-C/--cd` / `-s/--sandbox` / `-a/--ask-for-approval` / `-i/--image` / `--add-dir` / `--json` / `--output-schema` / `-o/--output-last-message` | `codex exec resume --last` / `codex exec fork` | Dangerous switch `--dangerously-bypass-approvals-and-sandbox`; for a long-running service use `app-server`. |
+| **custom** | headless `text` / `regex` | specified by YAML | specified by YAML | Generic template Adapter, covering any binary. |
 
-> 注：claude/codebuddy 的 prompt 经 `--input-format stream-json` 从 **stdin** 传入（首条 user message），非位置参数；这使 Session 为双向（`Session.Send`），权限/澄清可原生应答（见 §4.5、§7.4）。codex 无结构化输入，`exec` 用 stdin 文本传 prompt。
+> Note: claude/codebuddy prompts are passed via `--input-format stream-json` from **stdin** (the first user message), not as positional arguments; this makes the Session bidirectional (`Session.Send`), so permission/clarification can be answered natively (see §4.5, §7.4). codex has no structured input; `exec` passes the prompt as stdin text.
 >
-> **CLI Profile**：Harbor 内置按**二进制名**识别的 profile（`codebuddy`→`stream-json`、`claude`→`stream-json`、`opencode`/`codex`→`exec`）。配置省略 `integration` 时取其默认；显式配置但**不被该 CLI 支持**时启动报错（如 `claude`+`exec`）；**未知二进制必须显式指定 `integration`**。因此无需记忆“何时配哪种模式”。
+> **CLI Profile**: Harbor has built-in profiles recognized by **binary name** (`codebuddy`→`stream-json`, `claude`→`stream-json`, `opencode`/`codex`→`exec`). When the configuration omits `integration`, its default is used; when it is configured explicitly but **not supported by that CLI**, startup fails (e.g. `claude`+`exec`); **an unknown binary must specify `integration` explicitly**. Therefore there is no need to memorize "when to configure which mode".
 >
-> **最小版本**：profile 记录已适配的**最低版本**（如 codebuddy `2.161.4`、claude `2.1.292`、opencode `1.18.35`、codex `0.160.1`）。启动时探测版本，**低于该版本则拒绝启动并提示升级**；无法探测版本时跳过校验。若未来某版本出现不兼容，再在对应 adapter 中**按版本号加兼容分支**（而不是现在就引入变体框架）。
+> **Minimum version**: the profile records the **minimum version** already adapted (e.g. codebuddy `2.161.4`, claude `2.1.292`, opencode `1.18.35`, codex `0.160.1`). The version is probed at startup, and **if it is below that version, startup is refused with a prompt to upgrade**; if the version cannot be probed, the check is skipped. If a future version turns out to be incompatible, a **compatibility branch keyed by version number** is added in the corresponding adapter (rather than introducing a variants framework now).
 >
-> **每个 CLI 的落地启动参数、凭据环境变量与配置根见 §5.4。**
+> **See §5.4 for each CLI's concrete launch arguments, credential environment variables, and configuration root.**
 
-### 5.1 集成模式定义
+### 5.1 Integration Mode Definitions
 
-先分**传输/交互形态**，无头模式再按**输入输出 framing** 细分。以下都是 `Adapter` 的实现形态，注册时**静态选定**（§4.5），无高下之分：
+First distinguish **transport/interaction form**, then subdivide headless modes by **input/output framing**. The following are all implementation forms of the `Adapter`, **statically chosen** at registration time (§4.5); none is superior to another:
 
-**A. 无头（headless）**：Harbor spawn CLI 子进程、经 stdin/stdout 通信。`-p/--print`、`codex exec`、`opencode run` 都属此类。按 framing 再分：
+**A. Headless**: Harbor spawns a CLI child process and communicates via stdin/stdout. `-p/--print`, `codex exec`, and `opencode run` all belong here. They are further divided by framing:
 
-- `stream-json` / JSONL：`-p --output-format stream-json`（claude/codebuddy）、`codex exec --json`；结构化流，各 schema 用各自 Parser 映射。
-- `text`：一次性 stdout 作为最终文本 artifact（`opencode run`；`codex exec` 无 `--json` 时）。配置为 `exec` 时**必须在 args 中含 `{{.Prompt}}`**（否则启动校验失败并提示改用 `stream-json`）。
+- `stream-json` / JSONL: `-p --output-format stream-json` (claude/codebuddy), `codex exec --json`; structured streams, each schema mapped by its own Parser.
+- `text`: one-shot stdout as the final text artifact (`opencode run`; `codex exec` without `--json`). When configured as `exec`, **the args must contain `{{.Prompt}}`** (otherwise startup validation fails and suggests switching to `stream-json`).
 
-**B. 服务端（server）**：CLI 常驻 HTTP/app-server（`opencode serve`、`codebuddy --serve`、`codex app-server`）；Harbor 作**客户端代理其 API** → A2A。只是“怎么调”的一种实现。**已落地：opencode**——Harbor 懒启动 `opencode serve`（`--port 0`，从 stdout 解析监听 URL；也可用 `server_url` 连接到既有实例），按 `contextId` 复用服务端 session（首个任务 `POST /session` 建会话并回报 id，后续同 context 直接复用）。**逐 token 流式**：先订阅 `GET /event`（SSE），再 `POST /session/:id/message {parts:[{type:"text",text}]}`；把 `message.part.delta`（`field=="text"`，按 sessionID 过滤）的 `delta` 作为增量输出，prompt 的阻塞回复作为**兜底**（SSE 不可用时用整段文本）；`POST /session/:id/abort` 取消。实测：真机一轮返回 9 个 delta、文本 `"1 2 3 4 5"`。
+**B. Server**: the CLI is a long-running HTTP/app-server (`opencode serve`, `codebuddy --serve`, `codex app-server`); Harbor acts as a **client proxying its API** → A2A. It is just one implementation of "how to invoke". **Already implemented: opencode** — Harbor lazily launches `opencode serve` (`--port 0`, parsing the listening URL from stdout; `server_url` can also be used to connect to an existing instance), and reuses the server-side session by `contextId` (the first task `POST /session` creates a session and reports its id; subsequent tasks with the same context reuse it directly). **Per-token streaming**: first subscribe to `GET /event` (SSE), then `POST /session/:id/message {parts:[{type:"text",text}]}`; the `delta` of `message.part.delta` (`field=="text"`, filtered by sessionID) is used as incremental output, and the blocking reply of the prompt serves as a **fallback** (when SSE is unavailable, the whole text is used); `POST /session/:id/abort` cancels. Measured: a real-machine single round returned 9 deltas, with the text `"1 2 3 4 5"`.
 
-**已落地：codebuddy**——`codebuddy --serve` 的 HTTP server **同时暴露两种协议**，Harbor 用 `server_protocol` 选择：
+**Already implemented: codebuddy** — the HTTP server of `codebuddy --serve` **exposes two protocols at once**; Harbor selects one with `server_protocol`:
 
-- **HTTP API**（默认，`server_protocol: http`）：Harbor spawn `codebuddy --serve --host 127.0.0.1 --auth none`（从 stdout 的 `Endpoint` 行解析监听 URL；也可用 `server_url` 连接既有实例），驱动其 runs API：`POST /api/v1/runs`（Gateway 消息体，`source.conversation.id` = 会话 id）→ `runId` → `GET /api/v1/runs/:runId/stream`（SSE）。回复为**回合级**：一条 `message`（`content.markdown` 为整段文本）后接 `done`；`POST /api/v1/runs/:runId/cancel` 取消。多轮连续性按 `source.conversation.id` 维持，Harbor 把生成的会话 id 作为 `EventSession` 回报并复用。全部请求带 `X-CodeBuddy-Request: 1`（CSRF 头）。
-- **ACP over HTTP**（`server_protocol: acp`）：同一 server 的 `/api/v1/acp`（JSON-RPC over SSE，与 `--acp`(stdio) 同一 ACP 协议，仅传输不同）。Harbor `POST /api/v1/acp/connect` 取 `connectionId`；**命令用 `POST /api/v1/acp` 发出，其响应与该命令相关的通知在该 POST 自身的 SSE 回复里流回**；另有一条 `GET /api/v1/acp`（`acp-connection-id` 头）接收服务器**主动**通知。Harbor 复用与 stdio ACP 完全相同的 `conn`/`session` 映射（`initialize` → `session/new`（或 `session/load`）→ `session/prompt`，`session/update` 流、`session/request_permission` 桥接），因此能力与 `--acp` 一致（逐 token、工具轨迹、权限交互）。`connectionId` 按任务建立、回合结束即 `DELETE`，服务器进程跨任务复用。
-  - **`--acp-transport streamable-http`（`server_protocol: acp-streamable-http`）**：`codebuddy --acp --acp-transport streamable-http` 启动一个常驻 ACP 服务，向 **stderr** 打印 `ACP streamable-http endpoint: http://host:port/api/v1/acp`（故 `SpawnServer` 同时扫描 stdout 与 stderr 获取监听地址）。其线协议与上面**完全一致**（`POST /api/v1/acp/connect` 取 `connectionId`，`POST /api/v1/acp` + `acp-connection-id` 头发命令、SSE 回帧，`GET` 订阅主动通知，均带 `X-CodeBuddy-Request: 1`），故复用同一 ACP-over-HTTP 客户端，唯一差别是启动参数（改为 `--acp --acp-transport streamable-http`）与 **endpoint 归一化**：打印的 URL 已含 `/api/v1/acp`，Harbor 剥离该后缀得到 base，再拼回 `acpPath`，使 `--serve`（打印 server 根）与此模式共用同一路径拼装。
+- **HTTP API** (default, `server_protocol: http`): Harbor spawns `codebuddy --serve --host 127.0.0.1 --auth none` (parsing the listening URL from the `Endpoint` line of stdout; `server_url` can also be used to connect to an existing instance), and drives its runs API: `POST /api/v1/runs` (Gateway message body, with `source.conversation.id` = session id) → `runId` → `GET /api/v1/runs/:runId/stream` (SSE). The reply is **turn-level**: one `message` (`content.markdown` holds the whole text) followed by `done`; `POST /api/v1/runs/:runId/cancel` cancels. Multi-turn continuity is maintained by `source.conversation.id`, and Harbor reports the generated session id as an `EventSession` and reuses it. All requests carry `X-CodeBuddy-Request: 1` (CSRF header).
+- **ACP over HTTP** (`server_protocol: acp`): `/api/v1/acp` of the same server (JSON-RPC over SSE, the same ACP protocol as `--acp` (stdio), only the transport differs). Harbor does `POST /api/v1/acp/connect` to obtain a `connectionId`; **commands are sent with `POST /api/v1/acp`, and their responses plus the notifications related to that command flow back in the SSE reply of that same POST**; a separate `GET /api/v1/acp` (with the `acp-connection-id` header) receives server-**initiated** notifications. Harbor reuses the exact same `conn`/`session` mapping as stdio ACP (`initialize` → `session/new` (or `session/load`) → `session/prompt`, `session/update` streaming, `session/request_permission` bridging), so its capabilities match `--acp` (per-token, tool trace, permission interaction). The `connectionId` is established per task and `DELETE`d at the end of the turn, while the server process is reused across tasks.
+  - **`--acp-transport streamable-http` (`server_protocol: acp-streamable-http`)**: `codebuddy --acp --acp-transport streamable-http` starts a long-running ACP service that prints `ACP streamable-http endpoint: http://host:port/api/v1/acp` to **stderr** (so `SpawnServer` scans both stdout and stderr to obtain the listening address). Its wire protocol is **exactly the same** as above (`POST /api/v1/acp/connect` obtains a `connectionId`; `POST /api/v1/acp` + the `acp-connection-id` header sends commands and returns frames over SSE; `GET` subscribes to initiated notifications, all carrying `X-CodeBuddy-Request: 1`), so it reuses the same ACP-over-HTTP client; the only differences are the launch arguments (changed to `--acp --acp-transport streamable-http`) and **endpoint normalization**: the printed URL already contains `/api/v1/acp`, so Harbor strips that suffix to get the base and re-appends `acpPath`, letting `--serve` (which prints the server root) and this mode share the same path assembly.
 
-**已落地：codex**——`codex app-server`（**换行分隔 JSON-RPC over stdio**；协议由 `codex app-server generate-json-schema` 产出、并经真机 `initialize`/`thread/start`/`turn/start` 验证）。流程：`initialize` → 按 context `thread/start`（`approvalPolicy:"never"` 以无人值守）或 `thread/resume {threadId}` → `turn/start {threadId, input:[{type:"text",text}]}`；`item/agentMessage/delta` 的 `delta` 作增量输出，`turn/completed`（`status`）收尾，`error`（`willRetry:false`）失败，`turn/interrupt` 取消。Harbor 作客户端代理其 API。（注：本机 codex 登录已失效，真机只能验证 handshake/thread/turn/错误路由，成功增量路径由假服务器测试覆盖。）
+**Already implemented: codex** — `codex app-server` (**newline-delimited JSON-RPC over stdio**; the protocol is produced by `codex app-server generate-json-schema` and verified on a real machine via `initialize`/`thread/start`/`turn/start`). Flow: `initialize` → `thread/start` by context (with `approvalPolicy:"never"` for unattended operation) or `thread/resume {threadId}` → `turn/start {threadId, input:[{type:"text",text}]}`; the `delta` of `item/agentMessage/delta` is used as incremental output, `turn/completed` (`status`) finishes it, `error` (`willRetry:false`) fails it, and `turn/interrupt` cancels. Harbor acts as a client proxying its API. (Note: the local codex login has expired, so on a real machine only the handshake/thread/turn/error routing can be verified; the successful incremental path is covered by tests with a fake server.)
 
-**C. ACP**：CLI 常驻 ACP（`opencode acp`、`codebuddy --acp`）经 stdio；Harbor 作 ACP 客户端，双向。**已实现**（stdio；`codebuddy --acp --acp-transport streamable-http` 的服务化端点已实现，见 §5.4 `server_protocol: acp-streamable-http`）。
+**C. ACP**: the CLI is a long-running ACP server (`opencode acp`, `codebuddy --acp`) over stdio; Harbor acts as an ACP client, bidirectional. **Already implemented** (stdio; the serverized endpoint of `codebuddy --acp --acp-transport streamable-http` is implemented, see §5.4 `server_protocol: acp-streamable-http`).
 
-> 交互式 TUI 不使用。`-p/--print` 是**无头标志**（claude/codebuddy 都有），**不是 serve**——它是 `stream-json` / `text` 模式的载体。
+> Interactive TUI is not used. `-p/--print` is a **headless flag** (present in both claude/codebuddy), **not serve** — it is the carrier of `stream-json` / `text` modes.
 >
-> 配置 `integration` 取值映射：`exec`（无头/text）、`stream-json`（无头/结构化）、`server`、`acp`。
+> Configuration value mapping for `integration`: `exec` (headless/text), `stream-json` (headless/structured), `server`, `acp`.
 
-> 落地顺序：**M1 = 无头 `stream-json`（codebuddy；claude 同源顺带）+ 无头 `text`（opencode `run`）** → 后续 `exec`（codex/custom）→ `server` → `acp`。**顺序只反映落地成本，不代表模式优劣。** 现状：`stream-json` / `exec` / `acp` / `server`(opencode、codebuddy、codex) 已落地。
+> Implementation order: **M1 = headless `stream-json` (codebuddy; claude comes along from the same lineage) + headless `text` (opencode `run`)** → then `exec` (codex/custom) → `server` → `acp`. **The order reflects only implementation cost, not mode superiority.** Current status: `stream-json` / `exec` / `acp` / `server` (opencode, codebuddy, codex) are already implemented.
 
-### 5.2 集成模式取舍（为什么不优先 ACP）
+### 5.2 Integration Mode Trade-offs (Why ACP Is Not Prioritized)
 
-ACP（Agent Client Protocol）很诱人，但属于**条件性最优**，并非全面占优，故不作为 v1 首选/唯一实现：
+ACP (Agent Client Protocol) is very appealing, but it is a **conditionally optimal** choice and not universally superior, so it is not the v1 first choice / sole implementation:
 
-| 维度 | ACP | 无头（stream-json / exec） |
+| Dimension | ACP | Headless (stream-json / exec) |
 |---|---|---|
-| 覆盖 | 部分 CLI：`opencode` / `codebuddy` 有；`claude` / `codex` 无 | claude / codebuddy / codex 直接支持 |
-| 角色 | Harbor 当 ACP **client**，需实现协议 + 回调（`fs/*`、`terminal/*`、`permission`） | Harbor 只读 stdout |
-| 场景 | 传输不限于 stdio：opencode 为 stdio；`codebuddy --acp-transport streamable-http` 可服务化 | 远程 / 批处理 / 无人值守一次性任务 |
-| 对齐成本 | 统一“下游”，但上游 A2A 投影（§7）照旧 | 每 CLI 一个 Parser |
-| 稳定性 | 协议仍在演进，schema 可能随 CLI 升级而变 | claude/codebuddy 有官方 stream-json 实现 |
-| 安全面 | 需响应 fs / terminal 回调，边界更大 | 边界较小 |
+| Coverage | Some CLIs: `opencode` / `codebuddy` have it; `claude` / `codex` do not | claude / codebuddy / codex support it directly |
+| Role | Harbor acts as an ACP **client**, needing to implement the protocol + callbacks (`fs/*`, `terminal/*`, `permission`) | Harbor only reads stdout |
+| Scenario | Transport is not limited to stdio: opencode uses stdio; `codebuddy --acp-transport streamable-http` can be serverized | Remote / batch / unattended one-shot tasks |
+| Alignment cost | Unifies the "downstream", but the upstream A2A projection (§7) stays the same | One Parser per CLI |
+| Stability | The protocol is still evolving; the schema may change with CLI upgrades | claude/codebuddy have official stream-json implementations |
+| Security surface | Must respond to fs / terminal callbacks; larger boundary | Smaller boundary |
 
-决策：
+Decision:
 
-- **模式在注册/配置时静态选定（一个 Adapter 一种模式）**，核心不做运行时模式协商；`Probe()` 只做存活/版本/能力探测（详见 §4.5）。选型依据：需富交互且支持 ACP → `acp`；需结构化流 → 无头 `stream-json`/JSONL；有稳定 serve/app-server 且需高并发/会话复用 → `server`；否则无头 `text`。
-- 真正的硬约束是**覆盖**（claude/codex 无 ACP）与**Harbor 作为 client 的实现成本**，而非“ACP 只能 stdio/编辑器”。
-- **实现顺序按“覆盖 + 成本”**：v1 用 stream-json/exec 先覆盖 4 家 → v2 用 ACP 收敛统一（仅对支持的 CLI）。codebuddy 的两条服务化路径均已落地：`--serve`（`server_protocol: acp`）与 `--acp --acp-transport streamable-http`（`server_protocol: acp-streamable-http`），二者用同一 ACP-over-HTTP 客户端。
-- ACP 是唯一**跨 CLI 标准化**的集成协议，长期确实是最优收敛点；但“长期统一”不等于“短期优先”。（各家 HTTP `app-server`/`serve` 也各不同、不标准化，故仍以 ACP 为长期目标。）
-- **ACP 已按此路径落地（stdio）**，`opencode acp` 实测端到端通过。覆盖：`initialize` → `session/new` → `session/prompt` 的一轮生命周期、`session/update` 流式映射（`agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update`）、以及 `session/request_permission` → A2A `input-required` 的桥接（应答为被选 `optionId`）。`fs/*` 与 `terminal/*` **不声明也不实现**：实测 opencode 自带工具、不回调这些方法，故仅对未声明能力返回 method-not-found。跨任务会话续接（`session/load`）**已落地**：每个任务仍对应一次进程/会话生命周期，但当请求带 `sessionId`（由 executor 按 `contextId` 记录自 `EventSession`）时，`initialize` 后改用 `session/load` 载入该会话（CLI 不支持则回退 `session/new`），并在启动后回报 `EventSession` 以便后续任务续接。
+- **The mode is statically chosen at registration/configuration time (one Adapter, one mode)**, and the core performs no runtime mode negotiation; `Probe()` only does liveness/version/capability detection (see §4.5 for details). Selection rationale: needs rich interaction and supports ACP → `acp`; needs a structured stream → headless `stream-json`/JSONL; has a stable serve/app-server and needs high concurrency/session reuse → `server`; otherwise headless `text`.
+- The real hard constraints are **coverage** (claude/codex have no ACP) and **the implementation cost of Harbor as a client**, not "ACP can only be stdio/editor".
+- **The implementation order follows "coverage + cost"**: v1 uses stream-json/exec to first cover all four → v2 uses ACP to converge and unify (only for CLIs that support it). Both serverized paths of codebuddy are already implemented: `--serve` (`server_protocol: acp`) and `--acp --acp-transport streamable-http` (`server_protocol: acp-streamable-http`), which use the same ACP-over-HTTP client.
+- ACP is the only **cross-CLI standardized** integration protocol, and in the long run it is indeed the optimal convergence point; but "long-term unification" does not equal "short-term priority". (The various HTTP `app-server`/`serve` implementations also differ from one another and are not standardized, so ACP remains the long-term goal.)
+- **ACP is already implemented along this path (stdio)**, and `opencode acp` passes end-to-end in real-machine testing. Coverage: the single-turn lifecycle of `initialize` → `session/new` → `session/prompt`, the streaming mapping of `session/update` (`agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update`), and the bridging of `session/request_permission` → A2A `input-required` (the answer being the selected `optionId`). `fs/*` and `terminal/*` are **neither declared nor implemented**: real-machine testing shows opencode uses its own tools and does not call back to these methods, so method-not-found is returned only for undeclared capabilities. Cross-task session resumption (`session/load`) is **already implemented**: each task still corresponds to one process/session lifecycle, but when a request carries a `sessionId` (recorded by the executor per `contextId` from an `EventSession`), after `initialize` it switches to `session/load` to load that session (falling back to `session/new` if the CLI does not support it), and reports an `EventSession` after startup so that subsequent tasks can resume.
 
-### 5.3 stream-json → 统一事件映射（示意）
+### 5.3 stream-json → Unified Event Mapping (illustrative)
 
 ```go
 // Input looks like {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
@@ -379,86 +379,90 @@ func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
 }
 ```
 
-> 本段为**简化示意**；完整实现以 **A.7** 为准（含 `stream_event` 嵌套与 thinking / tool_result）。
+> This section is a **simplified illustration**; the complete implementation is governed by **A.7** (including `stream_event` nesting and thinking / tool_result).
 >
-> **文本规则**：`stream_event` 增量优先——见过增量后，`assistant` 整段文本跳过（避免重复）；两者都没出现时，用 `result.result` 作**兜底**（`EventTextFinal`，由 Executor 写入）。解析器有状态，按任务各建一个实例（`NewParser`），避免并发任务互相干扰。
+> **Text rule**: `stream_event` increments take priority — once increments have been seen, the whole text of `assistant` is skipped (to avoid duplication); if neither appears, `result.result` is used as the **fallback** (`EventTextFinal`, written by the Executor). The parser is stateful; one instance is created per task (`NewParser`) to avoid interference between concurrent tasks.
 
-### 5.4 各 CLI 的启动参数与环境变量（落地值）
+### 5.4 Each CLI's Launch Arguments and Environment Variables (concrete values)
 
-Harbor **只以非交互模式**驱动 CLI：**凭据一律经环境变量注入**，Harbor 不运行登录命令、不处理 `/login`（见 §10.4）。下面是每个 CLI 的具体约定；`agents[].args` / `agents[].env` / `agents[].session` 可按此配置，未配置时取 profile 默认（§5）。
+Harbor drives the CLIs **only in non-interactive mode**: **credentials are always injected via environment variables**, and Harbor does not run login commands or handle `/login` (see §10.4). Below are the concrete conventions for each CLI; `agents[].args` / `agents[].env` / `agents[].session` can be configured accordingly, and when unset the profile defaults are used (§5).
 
-> **范围**：本节只列 **Harbor 驱动该 CLI 所依赖**的凭据 / 配置 / 网关变量与启动参数，**不是各 CLI 环境变量的全集**（各 CLI 另有大量遥测、UI、MCP、A2A 等与 Harbor 无关的变量；完整清单以各 CLI 官方文档为准，如 codebuddy <https://www.codebuddy.ai/docs/zh/cli/env-vars>）。
+> **Scope**: this section lists only the credential / configuration / gateway variables and launch arguments that **Harbor depends on to drive that CLI**; it is **not the complete set of each CLI's environment variables** (each CLI has many additional telemetry, UI, MCP, A2A, etc. variables unrelated to Harbor; for the complete list refer to each CLI's official documentation, e.g. codebuddy <https://www.codebuddy.ai/docs/zh/cli/env-vars>).
 
-**共同的环境基座**：隔离时把 CLI 的配置根重定向到 `sandbox.cli_home`（§10.3）——Unix 用 `HOME` / `XDG_CONFIG_HOME`，Windows 用 `USERPROFILE` / `APPDATA` / `LOCALAPPDATA`，再叠加各 CLI 的专用配置变量。
+**Common environment base**: when isolating, redirect the CLI's configuration root to `sandbox.cli_home` (§10.3) — on Unix use `HOME` / `XDG_CONFIG_HOME`, on Windows use `USERPROFILE` / `APPDATA` / `LOCALAPPDATA`, then layer each CLI's dedicated configuration variables on top.
 
 #### claude
 
-- **集成模式**：`stream-json`。
-- **启动参数**：`-p --output-format stream-json --verbose --input-format stream-json --include-partial-messages`（prompt 经 **stdin** 的 stream-json user message）。Harbor 追加 `--model <m>`、`--append-system-prompt <s>`；`allow_dangerous` → `--dangerously-skip-permissions`。
-- **会话续跑**：`--resume <id>` / `--session-id <uuid>` / `-c/--continue` / `--fork-session`。
-- **凭据变量**：`ANTHROPIC_API_KEY`（`X-Api-Key`；`-p` 下只要存在就用）、`ANTHROPIC_AUTH_TOKEN`（`Authorization: Bearer`）、`CLAUDE_CODE_OAUTH_TOKEN`（claude.ai OAuth，优先于 Keychain）。第三方后端各有变量：Bedrock `CLAUDE_CODE_USE_BEDROCK` + `AWS_BEARER_TOKEN_BEDROCK`、Vertex `CLAUDE_CODE_USE_VERTEX`、Foundry `CLAUDE_CODE_USE_FOUNDRY` + `ANTHROPIC_FOUNDRY_API_KEY`。
-- **配置根**：`CLAUDE_CONFIG_DIR`（默认 `~/.claude`）。
-- **自建网关**：`ANTHROPIC_BASE_URL`。
-- **隔离要点**：`--bare`（等价环境变量 `CLAUDE_CODE_SIMPLE=1`）跳过 Keychain 与 OAuth；此时 Anthropic 直连鉴权**严格取 `ANTHROPIC_API_KEY`**（或 `--settings` 的 apiKeyHelper），`ANTHROPIC_AUTH_TOKEN` 不适用——这是无头且隔离环境下最干净的模式。
+- **Integration mode**: `stream-json`.
+- **Launch arguments**: `-p --output-format stream-json --verbose --input-format stream-json --include-partial-messages` (the prompt is passed via a stream-json user message on **stdin**). Harbor appends `--model <m>` and `--append-system-prompt <s>`; `allow_dangerous` → `--dangerously-skip-permissions`.
+- **Session resumption**: `--resume <id>` / `--session-id <uuid>` / `-c/--continue` / `--fork-session`.
+- **Credential variables**: `ANTHROPIC_API_KEY` (`X-Api-Key`; under `-p` it is used as long as it exists), `ANTHROPIC_AUTH_TOKEN` (`Authorization: Bearer`), `CLAUDE_CODE_OAUTH_TOKEN` (claude.ai OAuth, taking precedence over Keychain). Third-party backends each have their own variables: Bedrock `CLAUDE_CODE_USE_BEDROCK` + `AWS_BEARER_TOKEN_BEDROCK`, Vertex `CLAUDE_CODE_USE_VERTEX`, Foundry `CLAUDE_CODE_USE_FOUNDRY` + `ANTHROPIC_FOUNDRY_API_KEY`.
+- **Configuration root**: `CLAUDE_CONFIG_DIR` (default `~/.claude`).
+- **Self-hosted gateway**: `ANTHROPIC_BASE_URL`.
+- **Isolation point**: `--bare` (equivalent to the environment variable `CLAUDE_CODE_SIMPLE=1`) skips Keychain and OAuth; in this case Anthropic direct authentication **strictly uses `ANTHROPIC_API_KEY`** (or the `apiKeyHelper` of `--settings`), and `ANTHROPIC_AUTH_TOKEN` does not apply — this is the cleanest mode in a headless and isolated environment.
 
 #### codebuddy
 
-- **集成模式**：`stream-json`（默认）/ `exec` / `acp` / `server`。
-- **启动参数**：`-p --input-format stream-json --output-format stream-json --include-partial-messages`（prompt 经 **stdin**）。Harbor 追加 `--model`、`--append-system-prompt`；`allow_dangerous` → `-y/--dangerously-skip-permissions`。
-- **server 模式**（`--serve`，含两种协议，`server_protocol` 选择）：Harbor spawn `codebuddy --serve --host 127.0.0.1 --auth none`，从 stdout 的 `Endpoint` 行解析监听 URL（或用 `server_url`）；所有请求带 `X-CodeBuddy-Request: 1`。
-  - `http`（默认）：`POST /api/v1/runs`（Gateway 消息体）+ `GET /api/v1/runs/:runId/stream`（SSE，回合级 `message` + `done`），`source.conversation.id` 维持多轮连续。
-  - `acp`：`/api/v1/acp`（ACP over HTTP/SSE，与 `--acp` 同一协议）——`connect` → 命令走 `POST`（响应/相关通知在该 POST 的 SSE 回复里流回）→ `GET` 收主动通知；复用 stdio ACP 的 `session/new`/`session/load`/`session/prompt`/`session/update`/`session/request_permission` 映射，能力与 `--acp` 一致（逐 token、工具轨迹、权限交互）。
-- **交互**（无头 `stream-json`）：权限经 `control_request`/`can_use_tool` 桥接到 `input-required`；提问（`AskUserQuestion`）同样经 `can_use_tool`，需 `sdk_capabilities: true` 在首个 prompt 前声明 `askUserQuestion` 能力，退化为 `InteractionQuestion`（见 §7.4）。
-- **会话续跑**：`--resume` / `--session-id` / `-c`（无头）；`server`+`http` 用 `source.conversation.id`；`server`+`acp` 用 ACP `session/load`（`session/new` 返回的 id 作为 `EventSession` 复用）。
-- **凭据变量**：`CODEBUDDY_API_KEY`（官方文档：非交互 `-p` 模式**始终使用**）、`CODEBUDDY_AUTH_TOKEN`、`ANTHROPIC_API_KEY`（走 Anthropic 协议的自建网关）。
-- **配置根 / 模型 / 网关**：`CODEBUDDY_CONFIG_DIR`（默认 `~/.codebuddy`）、`CODEBUDDY_MODEL`、`CODEBUDDY_BASE_URL`。
-- **dangerous 全通过**：`-y` **且**进程环境 `CODEBUDDY_IS_SANDBOX=1`（仅隔离沙箱）。
-- **其他可选**：`CODEBUDDY_INTERNET_ENVIRONMENT`（`internal`/`ioa` 版本）、`CODEBUDDY_STREAM_TIMEOUT_MS` / `CODEBUDDY_FIRST_TOKEN_TIMEOUT_MS`（流式静默上限）、`CODEBUDDY_CODE_MAX_TURNS`（轮次上限）、`DISABLE_TELEMETRY` / `DISABLE_AUTOUPDATER`。
-- **`--serve` 自身鉴权**：`--auth password|none`（默认 `password`；`none` 关闭鉴权，允许本机任意进程经该服务执行命令/读写文件）。Harbor spawn 时用 `--host 127.0.0.1 --auth none`（仅回环、不对外暴露；与 opencode server 的无鉴权回环姿态一致），并始终携带 `X-CodeBuddy-Request: 1`。这属于 serve 自身的 HTTP 鉴权，与 Harbor 的 A2A 鉴权（§9）无关。
-- **官方全集**：<https://www.codebuddy.ai/docs/zh/cli/env-vars>。
+- **Integration mode**: `stream-json` (default) / `exec` / `acp` / `server`.
+- **Launch arguments**: `-p --input-format stream-json --output-format stream-json --include-partial-messages` (the prompt is passed via **stdin**). Harbor appends `--model` and `--append-system-prompt`; `allow_dangerous` → `-y/--dangerously-skip-permissions`.
+- **server mode** (`--serve`, including two protocols selected by `server_protocol`): Harbor spawns `codebuddy --serve --host 127.0.0.1 --auth none`, parsing the listening URL from the `Endpoint` line of stdout (or using `server_url`); all requests carry `X-CodeBuddy-Request: 1`.
+  - `http` (default): `POST /api/v1/runs` (Gateway message body) + `GET /api/v1/runs/:runId/stream` (SSE, turn-level `message` + `done`), with `source.conversation.id` maintaining multi-turn continuity.
+  - `acp`: `/api/v1/acp` (ACP over HTTP/SSE, the same protocol as `--acp`) — `connect` → commands go through `POST` (responses/related notifications flow back in the SSE reply of that POST) → `GET` receives initiated notifications; reuses the stdio ACP mapping of `session/new`/`session/load`/`session/prompt`/`session/update`/`session/request_permission`, with capabilities matching `--acp` (per-token, tool trace, permission interaction).
+- **Interaction** (headless `stream-json`): permissions are bridged to `input-required` via `control_request`/`can_use_tool`; questions (`AskUserQuestion`) likewise go through `can_use_tool` and require `sdk_capabilities: true` to declare the `askUserQuestion` capability before the first prompt, degrading to `InteractionQuestion` (see §7.4).
+- **Session resumption**: `--resume` / `--session-id` / `-c` (headless); `server`+`http` uses `source.conversation.id`; `server`+`acp` uses ACP `session/load` (the id returned by `session/new` is reused as `EventSession`).
+- **Credential variables**: `CODEBUDDY_API_KEY` (official docs: **always used** in non-interactive `-p` mode), `CODEBUDDY_AUTH_TOKEN`, `ANTHROPIC_API_KEY` (for a self-hosted gateway speaking the Anthropic protocol).
+- **Configuration root / model / gateway**: `CODEBUDDY_CONFIG_DIR` (default `~/.codebuddy`), `CODEBUDDY_MODEL`, `CODEBUDDY_BASE_URL`.
+- **dangerous fully enabled**: `-y` **and** the process environment `CODEBUDDY_IS_SANDBOX=1` (isolated sandbox only).
+- **Other optional**: `CODEBUDDY_INTERNET_ENVIRONMENT` (`internal`/`ioa` builds), `CODEBUDDY_STREAM_TIMEOUT_MS` / `CODEBUDDY_FIRST_TOKEN_TIMEOUT_MS` (stream silence ceilings), `CODEBUDDY_CODE_MAX_TURNS` (turn limit), `DISABLE_TELEMETRY` / `DISABLE_AUTOUPDATER`.
+- **`--serve`'s own authentication**: `--auth password|none` (default `password`; `none` disables authentication, allowing any local process to execute commands/read/write files through that service). Harbor spawns with `--host 127.0.0.1 --auth none` (loopback only, not exposed externally; consistent with the unauthenticated loopback stance of the opencode server), and always carries `X-CodeBuddy-Request: 1`. This is serve's own HTTP authentication and is unrelated to Harbor's A2A authentication (§9).
+- **Official complete set**: <https://www.codebuddy.ai/docs/zh/cli/env-vars>.
 
 #### opencode
 
-- **集成模式**：`exec`（默认）/ `acp` / `server`。
-- **启动参数**：exec `run {{.Prompt}} -m {{.Model}}`（另 `--agent`、`--variant`、`-f/--file`、`--format json`）；acp `acp`；server `serve --hostname 127.0.0.1 --port 0`（`--port 0` 由内核分配，从 stdout 解析监听 URL）。
-- **会话续跑**：`-s/--session <id>` / `-c/--continue` / `--fork`。
-- **凭据变量**：provider key（`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` 等，或 `OPENCODE_API_KEY`）；或凭据文件 `~/.local/share/opencode/auth.json`（`opencode providers login` 写入），无头注入可用 `OPENCODE_AUTH_CONTENT`（内联 auth.json 内容；源码/二进制确认，官方文档未列）。
-- **配置根**：`OPENCODE_CONFIG`（自定义配置文件）、`OPENCODE_CONFIG_DIR`（自定义配置目录）、`OPENCODE_CONFIG_CONTENT`（内联 JSON，优先级最高）；默认 `~/.config/opencode`，遵循 `XDG_CONFIG_HOME`。
-- **`serve`/`web` 的 HTTP 鉴权**：`OPENCODE_SERVER_PASSWORD`（+ `OPENCODE_SERVER_USERNAME`，默认 `opencode`）——仅作用于常驻服务，与 Harbor A2A 鉴权无关。
-- **dangerous**：`--auto`。
+- **Integration mode**: `exec` (default) / `acp` / `server`.
+- **Launch arguments**: exec `run {{.Prompt}} -m {{.Model}}` (also `--agent`, `--variant`, `-f/--file`, `--format json`); acp `acp`; server `serve --hostname 127.0.0.1 --port 0` (`--port 0` is assigned by the kernel; the listening URL is parsed from stdout).
+- **Session resumption**: `-s/--session <id>` / `-c/--continue` / `--fork`.
+- **Credential variables**: provider key (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY`, etc., or `OPENCODE_API_KEY`); or the credential file `~/.local/share/opencode/auth.json` (written by `opencode providers login`), and headless injection can use `OPENCODE_AUTH_CONTENT` (inline auth.json content; confirmed from source/binary, not listed in official docs).
+- **Configuration root**: `OPENCODE_CONFIG` (custom config file), `OPENCODE_CONFIG_DIR` (custom config directory), `OPENCODE_CONFIG_CONTENT` (inline JSON, highest priority); default `~/.config/opencode`, following `XDG_CONFIG_HOME`.
+- **HTTP authentication of `serve`/`web`**: `OPENCODE_SERVER_PASSWORD` (+ `OPENCODE_SERVER_USERNAME`, default `opencode`) — applies only to the long-running service and is unrelated to Harbor A2A authentication.
+- **dangerous**: `--auto`.
 
 #### codex
 
-- **集成模式**：`exec`（默认）/ `server`。
-- **启动参数**：exec `exec --json --skip-git-repo-check {{.Prompt}}`（另 `-m/--model`、`-s/--sandbox`、`-a/--ask-for-approval`、`-C/--cd`、`--output-schema`、`-o/--output-last-message`）；server `app-server`（默认 `--listen stdio://`；`thread/start` 带 `cwd`、`approvalPolicy:"never"`）。
-- **会话续跑**：`exec resume --last` / `exec resume <id>`。
-- **凭据变量**：`OPENAI_API_KEY`（`codex login --with-api-key` 从 stdin 读入）、`CODEX_API_KEY`（**非交互** `exec`/`review`/SDK 直接使用）、`CODEX_ACCESS_TOKEN`（可信自动化；`login --with-access-token`）。
-- **配置根**：`CODEX_HOME`（默认 `~/.codex`），配置在 `config.toml`。
-- **自建网关 / 自定义 provider**：经 `config.toml` 的 `openai_base_url`，或 `model_providers.<id>.base_url`（+ `env_key`）。官方 env 文档未列 base-url 变量（二进制含 `OPENAI_BASE_URL` 字符串但未证实生效，以 `config.toml` 为准）。
-- **dangerous**：`--dangerously-bypass-approvals-and-sandbox`。
+- **Integration mode**: `exec` (default) / `server`.
+- **Launch arguments**: exec `exec --json --skip-git-repo-check {{.Prompt}}` (also `-m/--model`, `-s/--sandbox`, `-a/--ask-for-approval`, `-C/--cd`, `--output-schema`, `-o/--output-last-message`); server `app-server` (with the default `--listen stdio://`; `thread/start` carries `cwd` and `approvalPolicy:"never"`).
+- **Session resumption**: `exec resume --last` / `exec resume <id>`.
+- **Credential variables**: `OPENAI_API_KEY` (read from stdin by `codex login --with-api-key`), `CODEX_API_KEY` (used directly by **non-interactive** `exec`/`review`/SDK), `CODEX_ACCESS_TOKEN` (trusted automation; `login --with-access-token`).
+- **Configuration root**: `CODEX_HOME` (default `~/.codex`), with configuration in `config.toml`.
+- **Self-hosted gateway / custom provider**: via `openai_base_url` in `config.toml`, or `model_providers.<id>.base_url` (+ `env_key`). The official env docs do not list a base-url variable (the binary contains the string `OPENAI_BASE_URL` but this is not confirmed to take effect; `config.toml` is authoritative).
+- **dangerous**: `--dangerously-bypass-approvals-and-sandbox`.
 
-#### 跨 CLI 说明
+#### Cross-CLI Notes
 
-- **prompt 传递**：claude / codebuddy 经 `--input-format stream-json` 从 **stdin** 传首条 user message（Session 因此双向，可原生应答权限/澄清）；opencode / codex 用参数模板 `{{.Prompt}}`。
-- **模型 / 系统提示**：claude / codebuddy 由 Harbor 追加 `--model` / `--append-system-prompt`；opencode / codex 走各自模板（如 `-m {{.Model}}`）。
-- **配置根隔离**：各 CLI 从 **cwd** 加载项目级配置（`opencode.json`/`.opencode`、`.codebuddy`、`.claude`、`.codex` 等），Harbor 只把 cwd 设为任务工作目录并可选重定向配置根（§10.3、§6.7）。
-- **权限模式**：`allow_dangerous` 映射到各 CLI 的危险参数（见上）；codebuddy 另需 `CODEBUDDY_IS_SANDBOX=1`。
-- **结构化输出 / 提问**：请求带 `harbor.outputSchema` 时 stream-json 追加 `--json-schema`，结果作为 `result` DataPart（§6.8）；`sdk_capabilities: true` 声明 `askUserQuestion`，使 agent 的提问走 `input-required`（§7.4）。
+- **Prompt passing**: claude / codebuddy pass the first user message via `--input-format stream-json` on **stdin** (the Session is therefore bidirectional and can natively answer permissions/clarifications); opencode / codex use the argument template `{{.Prompt}}`.
+- **Model / system prompt**: claude / codebuddy have `--model` / `--append-system-prompt` appended by Harbor; opencode / codex go through their own templates (e.g. `-m {{.Model}}`).
+- **Configuration-root isolation**: each CLI loads project-level configuration from **cwd** (`opencode.json`/`.opencode`, `.codebuddy`, `.claude`, `.codex`, etc.); Harbor only sets cwd to the task workdir and optionally redirects the configuration root (§10.3, §6.7).
+- **Permission mode**: `allow_dangerous` maps to each CLI's dangerous argument (see above); codebuddy additionally requires `CODEBUDDY_IS_SANDBOX=1`.
+- **Structured output / questions**: when the request carries `harbor.outputSchema`, stream-json appends `--json-schema` and the result becomes a `result` DataPart (§6.8); `sdk_capabilities: true` declares `askUserQuestion`, causing the agent's questions to go through `input-required` (§7.4).
 
 ---
 
-## 6. A2A 映射设计
+## 6. A2A Mapping Design
 
-### 6.1 AgentCard（发现与协商）
+### 6.1 AgentCard (Discovery and Negotiation)
 
-每个 agent 生成一张卡片；`stream-json`/`server` 模式声明流式能力。
+Each agent generates a card; `stream-json`/`server` modes declare streaming capability.
 
 ```go
 func CardFor(a agent.Launcher, info agent.Info, endpoint string) *a2a.AgentCard {
     caps := a.Capabilities() // effective capabilities, projected onto the card
+    desc := info.Description // agents[].description override
+    if desc == "" {
+        desc = "Remote A2A wrapper for the " + a.Name() + " coding agent CLI"
+    }
     return &a2a.AgentCard{
         Name:        "Harbor/" + a.Name(),
-        Description: "Remote A2A wrapper for the " + a.Name() + " coding agent CLI",
+        Description: desc,
         Version:     info.Version,
         SupportedInterfaces: []*a2a.AgentInterface{
             {
@@ -476,32 +480,38 @@ func CardFor(a agent.Launcher, info agent.Info, endpoint string) *a2a.AgentCard 
         // Auth is part of the A2A surface; only declared when the server enforces it.
         SecuritySchemes:      cardSecuritySchemes(),      // nil when auth is none
         SecurityRequirements: cardSecurityRequirements(), // nil when auth is none
-        Skills: []a2a.AgentSkill{{
-            ID: a.Name(), Name: a.Name(),
-            Description: "Run a coding task with " + a.Name(),
-            Tags:        []string{"coding", "cli", a.Name()},
-            Examples:    []string{"fix the failing test in ./pkg", "review this diff"},
-        }},
+        // Skills advertise the agent's abilities to callers; they come from
+        // agents[].skills (operator-configured). When none are set the card
+        // advertises an empty skills list (the A2A field is still present).
+        Skills: cardSkills(info.Skills),
     }
 }
 ```
 
-> 鉴权在传输层：HTTP 中间件校验 `Authorization: Bearer`，`a2asrv.NewCallContext` 注入 `CallContext.User`；handler 侧用 `CallContextFrom(ctx)` 读取用户做审计/配额。（`a2a` 安全类型字段以实际 SDK 为准。）
+> Card override: `agents[].description` replaces the description text and
+> `agents[].skills` lists the advertised skills (`display_name`/`version`
+> likewise shape `name`/`version`). Each `AgentSkill` requires `id`, `name`, and
+> `description` (A2A 1.0 §4.4.5; `tags` is part of the spec, emitted as an empty
+> array when unset). Skills are operator-authored and describe what the agent can
+> do for a caller; Harbor does not infer them from the CLI (its tools/subagents
+> are internal and not reliably exposed).
 
-暴露方式（a2a-go）：
+> Authentication is at the transport layer: an HTTP middleware validates `Authorization: Bearer`, `a2asrv.NewCallContext` injects `CallContext.User`; the handler side reads the user with `CallContextFrom(ctx)` for auditing/quota. (The exact `a2a` security type fields are subject to the actual SDK.)
 
-- `a2asrv.NewStaticAgentCardHandler(card)` 挂在 `/.well-known/agent-card.json`；
-- 多 agent：`/agents/{id}/.well-known/agent-card.json` + `/agents/{id}/`（JSON-RPC handler，**带尾斜杠**，与卡片 url 一致）；
-- **传输**：JSON-RPC（默认）、HTTP+JSON（A2A REST，`a2asrv.NewRESTHandler`，挂载于 `<agent>/rest/`）与 gRPC（`a2agrpc.NewHandler`，按 `agents[].grpc_listen` 各起一个监听）。三种绑定均在 AgentCard 的 `supportedInterfaces` 声明。
-- **协议版本固定 A2A v1.0**（`ProtocolVersion: a2a.Version`）：`A2A-Version` 不匹配时返回 `ErrVersionNotSupported`。
+Exposure methods (a2a-go):
 
-#### 6.1.1 兼容发现端点（codebuddy）
+- `a2asrv.NewStaticAgentCardHandler(card)` mounted at `/.well-known/agent-card.json`;
+- Multiple agents: `/agents/{id}/.well-known/agent-card.json` + `/agents/{id}/` (JSON-RPC handler, **with a trailing slash**, consistent with the card url);
+- **Transports**: JSON-RPC (default), HTTP+JSON (A2A REST, `a2asrv.NewRESTHandler`, mounted at `<agent>/rest/`), and gRPC (`a2agrpc.NewHandler`, with one listener per `agents[].grpc_listen`). All three bindings are declared in the AgentCard's `supportedInterfaces`.
+- **Protocol version fixed to A2A v1.0** (`ProtocolVersion: a2a.Version`): when `A2A-Version` does not match, `ErrVersionNotSupported` is returned.
 
-codebuddy 自带 A2A 客户端，其远程发现 `CODEBUDDY_REMOTE_AGENTS_URL` 期望**卡片数组**（顶层 `[]AgentCard` 或 `{"cards":[...]}`），而 A2A 标准的 well-known 路径只返回**单卡对象**。因此新增一个**追加式、非标准**端点：
+#### 6.1.1 Compatibility Discovery Endpoint (codebuddy)
 
-- `GET /.well-known/agents.json`（**始终提供**）→ 返回**所有 agent 的 card 数组** `[]*a2a.AgentCard`；每张卡的 `supportedInterfaces[].url` 指向各自 `/agents/{id}/`（带尾斜杠）。
-- 该端点**不改动 A2A v1.0 语义**，仅为兼容层；标准单卡路径依旧保留。
-- **卡片与发现端点公开**（不含 RPC）：即使 `auth.mode=bearer`，也不要求 token（见 §9）。
+codebuddy ships with its own A2A client, whose remote discovery `CODEBUDDY_REMOTE_AGENTS_URL` expects an **array of cards** (top-level `[]AgentCard` or `{"cards":[...]}`), whereas the A2A standard well-known path returns only a **single card object**. Therefore an **additive, non-standard** endpoint is added:
+
+- `GET /.well-known/agents.json` (**always provided**) → returns an **array of all agents' cards** `[]*a2a.AgentCard`; each card's `supportedInterfaces[].url` points to its own `/agents/{id}/` (with trailing slash).
+- This endpoint **does not alter A2A v1.0 semantics**; it is only a compatibility layer; the standard single-card path is still retained.
+- **Cards and the discovery endpoint are public** (RPC excluded): even when `auth.mode=bearer`, no token is required (see §9).
 
 ```go
 // Aggregate discovery (additive compatibility endpoint): returns the built card
@@ -516,31 +526,31 @@ func NewCardsHandler(cards []*a2a.AgentCard, cors ...string) http.Handler {
 }
 ```
 
-> 端点的 `url` 由 `endpointURL(baseURL, r, id)` 生成：**`BaseURL` 优先，为空则按请求 origin（识别 `X-Forwarded-Proto/Host`）**，返回带尾斜杠的 `/agents/{id}/`。参考实现：`go-agent-sdk/a2a/server/server.go`（`DiscoveryPath`/`cardsHandler`，裸数组；codebuddy 亦接受 `{"cards":[...]}`）。
+> The endpoint's `url` is generated by `endpointURL(baseURL, r, id)`: **`BaseURL` takes priority; when empty, the request origin is used (recognizing `X-Forwarded-Proto/Host`)**, returning `/agents/{id}/` with a trailing slash. Reference implementation: `go-agent-sdk/a2a/server/server.go` (`DiscoveryPath`/`cardsHandler`, a bare array; codebuddy also accepts `{"cards":[...]}`).
 
-### 6.2 事件映射表（CLI → A2A）
+### 6.2 Event Mapping Table (CLI → A2A)
 
-| 内部事件 | A2A 事件 | 说明 |
+| Internal event | A2A event | Description |
 |---|---|---|
-| 请求到达 | `NewSubmittedTask` + `TaskStateSubmitted` | 首次无 `StoredTask` 时发出。 |
-| 进程启动 | `NewStatusUpdateEvent(Working)` | |
-| `EventTextDelta` | `NewArtifactEvent`（首个）/ `NewArtifactUpdateEvent`（后续） | 增量追加到同一 artifact；**按此做实时输出**。 |
-| `EventThinking` | `NewStatusUpdateEvent(Working, msg)` 或独立 artifact | 推理/思考增量；默认折叠为状态或单独 artifact，避免噪声。 |
-| `EventToolCall` | `NewArtifactUpdateEvent`（`application/json` metadata）或状态消息 | 默认作为 artifact metadata，可配置为独立 artifact。 |
-| `EventToolResult` | `NewArtifactUpdateEvent`（metadata） | 工具结果，便于观测进度。 |
-| `EventPermissionRequest` | `NewStatusUpdateEvent(TaskStateInputRequired, msg)` | **关键**：暂停任务等客户端回传。 |
-| `EventError` | `NewStatusUpdateEvent(TaskStateFailed, msg)` | 首个事件后不再返回 error，用状态表达。 |
+| Request arrival | `NewSubmittedTask` + `TaskStateSubmitted` | Emitted when there is no `StoredTask` for the first time. |
+| Process start | `NewStatusUpdateEvent(Working)` | |
+| `EventTextDelta` | `NewArtifactEvent` (first) / `NewArtifactUpdateEvent` (subsequent) | Incrementally appended to the same artifact; **this is how real-time output is done**. |
+| `EventThinking` | `NewStatusUpdateEvent(Working, msg)` or a separate artifact | Reasoning/thinking increments; by default collapsed into a status or a separate artifact to avoid noise. |
+| `EventToolCall` | `NewArtifactUpdateEvent` (`application/json` metadata) or a status message | By default used as artifact metadata; configurable as a separate artifact. |
+| `EventToolResult` | `NewArtifactUpdateEvent` (metadata) | Tool result, convenient for observing progress. |
+| `EventPermissionRequest` | `NewStatusUpdateEvent(TaskStateInputRequired, msg)` | **Key**: pauses the task and waits for the client to reply. |
+| `EventError` | `NewStatusUpdateEvent(TaskStateFailed, msg)` | After the first event, no error is returned; state is used instead. |
 | `EventDone` | `NewStatusUpdateEvent(TaskStateCompleted)` | |
-| 任务终态 | 先发**代码变更 artifact**（§6.8），再 `Completed` | 代码改动作为 artifact 交付 |
-| 取消请求 | `Cancel()` → kill 进程组 → `TaskStateCanceled` | |
+| Task terminal state | First emit the **code-change artifact** (§6.8), then `Completed` | Code changes are delivered as an artifact |
+| Cancel request | `Cancel()` → kill process group → `TaskStateCanceled` | |
 
-> **实时性要求**：默认**逐 token 输出**（claude/codebuddy 加 `--include-partial-messages`），避免“半天没反应”。逐 token 会对 `TaskArtifactUpdateEvent` 做**合并节流**（每 ~50–100ms 或累计 N 字符 flush 一次），既尽快看到首字、又不刷爆 SSE。无 partial 能力的 CLI（opencode `run` / codex `exec`）用 `Working` 状态与工具事件作为 activity 心跳。
+> **Real-time requirement**: by default output is **per-token** (claude/codebuddy add `--include-partial-messages`), avoiding "no response for ages". Per-token output applies **coalescing throttling** to `TaskArtifactUpdateEvent` (flush once every ~50–100ms or after N accumulated characters), so the first character is seen as early as possible without flooding SSE. CLIs without partial capability (opencode `run` / codex `exec`) use the `Working` state and tool events as activity heartbeats.
 >
-> 上表所有事件均已落地：`EventThinking / EventToolCall / EventToolResult / EventUsage` 作为工具/推理轨迹事件（默认折叠进 artifact metadata，见 §6.3）。
+> All events in the table above are already implemented: `EventThinking / EventToolCall / EventToolResult / EventUsage` serve as tool/reasoning trace events (by default collapsed into artifact metadata, see §6.3).
 
-### 6.3 执行器骨架（Launcher/Session）
+### 6.3 Executor Skeleton (Launcher/Session)
 
-> M1 即采用 §4.5 的 `Launcher/Session` 契约（而非仅 line-based `Adapter`）；这样 duplex（`Send`）、逐 token 节流、`input-required` 恢复才有落点。
+> M1 already adopts the `Launcher/Session` contract of §4.5 (rather than only the line-based `Adapter`); this is what gives duplex (`Send`), per-token throttling, and `input-required` resumption a place to land.
 
 ```go
 type CLIExecutor struct {
@@ -622,38 +632,38 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 }
 ```
 
-要点：
+Key points:
 
-- **duplex 恢复**：任务在 `input-required` 时 a2a-go 会以**同一 `taskId`** 再次调用 `Execute`（`StoredTask != nil`）；此时**不重启进程**，而是 `sess.Send(answer)` 写回 stdin 继续。
-- **进程生命周期与 RPC 解耦**：进程的运行 ctx 由 Executor 以 `context.WithoutCancel` 派生、按 `taskID` 保存（叠加 `limits.timeout`），**不随 `Execute`/RPC 返回而取消**——否则 `input-required` 暂停时进程会被连带回收，`Send` 写到已关闭的 stdin（`file already closed`）。仅在**终态 / `CancelTask` / 超时**时取消。取舍：暂停计时（含等待答复）计入超时；未配置超时的暂停任务会一直存活，故交互任务应配置超时。
-- **live 会话表**：`taskID → Session`，供恢复与取消定位活进程；仅在终态删除。
-- **taskID 贯通**：Executor 把 `taskID` 经 ctx 交给 Launcher/Session（`agent.WithTaskID`）；line-based Launcher 用它对齐 `Runner.Start/Kill` 的 key，避免“cancel 找不到进程”。
-- **合并节流**：`coalescer` 按时间 / 字节 flush，避免逐 token 刷爆 SSE。
-- **单向 exec 模式**：`Session.Send` 为 no-op，且 Capabilities 声明不支持交互，故不会走到 `input-required`。
-- **pump 范围（已落地）**：处理 `EventSession / EventTextDelta / EventTextFinal / EventStructuredOutput / EventPermissionRequest / EventThinking / EventToolCall / EventToolResult / EventUsage / EventError / EventDone`；工具/推理/用量事件作为轨迹与用量记录。
-- **live TTL/reaper**：`live` 条目带最后活动时间与 TTL；客户端久不答复时到期自动 `Cancel` 并清理，避免进程/条目泄漏（与 §11 交互持久化呼应）。
+- **duplex resumption**: when a task is in `input-required`, a2a-go calls `Execute` again with the **same `taskId`** (`StoredTask != nil`); at this point the process is **not restarted**; instead `sess.Send(answer)` is written back to stdin to continue.
+- **Process lifecycle decoupled from RPC**: the process's run ctx is derived by the Executor with `context.WithoutCancel` and stored by `taskID` (layered with `limits.timeout`); it **is not cancelled when `Execute`/RPC returns** — otherwise, when paused at `input-required`, the process would be reclaimed along with it and `Send` would write to an already-closed stdin (`file already closed`). It is cancelled only on **terminal state / `CancelTask` / timeout**. Trade-off: pause time (including waiting for an answer) counts toward the timeout; a paused task with no timeout configured lives forever, so interactive tasks should configure a timeout.
+- **live session table**: `taskID → Session`, used by resumption and cancellation to locate the live process; deleted only on terminal state.
+- **taskID threading**: the Executor passes `taskID` to the Launcher/Session via ctx (`agent.WithTaskID`); the line-based Launcher uses it to align the keys of `Runner.Start/Kill`, avoiding "cancel cannot find the process".
+- **Coalescing throttling**: the `coalescer` flushes by time / bytes, avoiding flooding SSE per token.
+- **One-way exec mode**: `Session.Send` is a no-op, and Capabilities declares interaction unsupported, so `input-required` is never reached.
+- **pump scope (already implemented)**: handles `EventSession / EventTextDelta / EventTextFinal / EventStructuredOutput / EventPermissionRequest / EventThinking / EventToolCall / EventToolResult / EventUsage / EventError / EventDone`; tool/reasoning/usage events serve as trace and usage records.
+- **live TTL/reaper**: `live` entries carry a last-activity time and TTL; when the client does not reply for a long time, they expire and are automatically `Cancel`ed and cleaned up, avoiding process/entry leaks (echoing the interaction persistence of §11).
 
-### 6.4 会话与多轮续跑
+### 6.4 Sessions and Multi-turn Resumption
 
-- A2A `contextId` = 一条对话线程；`taskId` = 一次请求。
-- 首个任务从 CLI 输出解析出原生 `sessionId`，写入 `SessionStore：contextId → sessionId`。
-- 后续同 `contextId` 的请求，Adapter 自动附加 `--resume <sessionId>`（claude/codebuddy）或 `--session <id>` / `--continue`（opencode）。
-- **按调用方作用域**：`contextId` 由客户端提供，故 `contextId → CLI session` 与 `contextId → 工作树` 的绑定都加上**已鉴权用户**（key = `user + "\x00" + contextId`）；否则 A 复用 B 的 `contextId` 就能续到 B 的会话/工作树。未鉴权（无 user）时退化为仅按 `contextId`。
-- **fork（已落地）**：`--fork` / `--fork-session` 语义经 A2A 元数据 `harbor.fork`（`Message.Metadata`）选择“续写或分叉”；请求带 sessionId 时在 resume 之后追加 `agents[].session.fork_flag`（profile 默认：claude/codebuddy `--fork-session`、opencode `--fork`），新会话 id 由 CLI 回报并顶替。
+- A2A `contextId` = a conversation thread; `taskId` = a single request.
+- The first task parses the native `sessionId` from the CLI output and writes `SessionStore: contextId → sessionId`.
+- For subsequent requests with the same `contextId`, the Adapter automatically appends `--resume <sessionId>` (claude/codebuddy) or `--session <id>` / `--continue` (opencode).
+- **Scoped by caller**: since `contextId` is supplied by the client, both the `contextId → CLI session` and `contextId → working tree` bindings add the **authenticated user** (key = `user + "\x00" + contextId`); otherwise A could reuse B's `contextId` to continue into B's session/working tree. When unauthenticated (no user), it degrades to being keyed by `contextId` alone.
+- **fork (already implemented)**: the `--fork` / `--fork-session` semantics select "continue writing or fork" via the A2A metadata `harbor.fork` (`Message.Metadata`); when the request carries a sessionId, `agents[].session.fork_flag` is appended after resume (profile defaults: claude/codebuddy `--fork-session`, opencode `--fork`), and the new session id is reported by the CLI and replaces the old one.
 
-### 6.5 权限/澄清交互（input-required）
+### 6.5 Permission/Clarification Interaction (input-required)
 
-这是封装 coding agent 的难点（完整的能力对齐模型见 **§7**，交互规范化见 **§7.4**）：CLI 会询问“是否允许执行该命令？”。设计：
+This is the difficulty in wrapping a coding agent (the complete capability-alignment model is in **§7**, and interaction normalization in **§7.4**): the CLI will ask "is it allowed to run this command?". Design:
 
-1. Parser 识别权限请求事件；
-2. 执行器发 `TaskStateInputRequired` + 一条包含问题与选项的 Message；
-3. 客户端用同一 `taskId` 再次 `message/send` 提交答复；
-4. 执行器以 **duplex 模式**（`--input-format stream-json`）把答复写回原进程 stdin；
-5. 任务恢复 `Working`。
+1. The Parser recognizes a permission-request event;
+2. The executor emits `TaskStateInputRequired` + a Message containing the question and options;
+3. The client submits the answer with another `message/send` using the same `taskId`;
+4. The executor, in **duplex mode** (`--input-format stream-json`), writes the answer back to the original process stdin;
+5. The task resumes `Working`.
 
-**M1 落地**：claude/codebuddy 走**原生 duplex**（原进程挂起，答复经 `Session.Send` 写回 stdin，见 §6.3），无需降级；opencode(exec) 等无交互能力的 CLI 启用“无交互模式”：配置 `--auto` / 预置 `--allowedTools` 或沙箱内预授权，**永不发** `input-required`，并在 Card 如实声明不支持。完整降级矩阵见 §7.4。
+**M1 implementation**: claude/codebuddy use **native duplex** (the original process suspends and the answer is written back to stdin via `Session.Send`, see §6.3) with no degradation; CLIs without interaction capability such as opencode(exec) enable "non-interactive mode": configure `--auto` / preset `--allowedTools` or pre-authorize within the sandbox, **never emit** `input-required`, and truthfully declare unsupported in the Card. See §7.4 for the complete degradation matrix.
 
-### 6.6 流式与推送
+### 6.6 Streaming and Push
 
 ```go
 handler := a2asrv.NewHandler(executor,
@@ -664,88 +674,88 @@ handler := a2asrv.NewHandler(executor,
 mux.Handle("/agents/codebuddy/", a2asrv.NewJSONRPCHandler(handler))
 ```
 
-- 流式：客户端调用 `message/stream`，Harbor 通过 SSE 推送 `TaskArtifactUpdateEvent`。
-- 推送：超长任务（编译、测试）走 push notification，客户端可离线。
+- Streaming: the client calls `message/stream`, and Harbor pushes `TaskArtifactUpdateEvent` over SSE.
+- Push: very long tasks (compilation, tests) go through push notification so the client can be offline.
 
-### 6.7 工作目录与工作区隔离
+### 6.7 Workdir and Workspace Isolation
 
-Coding agent 只有在**真实代码库**里才有意义，所以工作目录不是“随便建个子目录”的问题，必须与业务和会话绑定：
+A coding agent only makes sense inside a **real codebase**, so the workdir is not a matter of "just creating some subdirectory"; it must be bound to the business and the session:
 
-- **来源**：调用方通过 A2A `Message.Metadata`（约定键 `harbor.workDir`）指定；`sandbox.workdir_root` 是唯一允许的根。
-- **校验（安全前提）**：对请求路径与 `workdir_root` 都取 realpath，按**路径分量**做前缀判断；**拒绝** `..` 穿越与 symlink 逃逸；`allow_outside=false` 时越界直接拒绝（fail fast，不启动 CLI）。
-- **绑定 `contextId`**：工作目录与 A2A `contextId` 绑定。同一 context 的后续任务（含 `--resume`）**必须复用同一工作树**，否则 CLI 会话与文件改动错位。
-- **未指定时**：先看 `agents[].workdir`（每个 agent 可选的默认项目目录，受 `workdir_root` 约束）；仍未配置则按 context 分配 scratch 目录（仅适合无需既有代码的任务）。这是"把某 CLI 固定到某个项目"的唯一手段——因为 CLI 以 cwd 为项目根，从这里加载 `opencode.json`/`.opencode`/`.codebuddy`/`.claude`/`.codex` 等项目级配置、技能与子 agent。
-- **scratch 命名安全**：`contextId` 客户端可控，**不可直接拼进路径**——取其 hash 或白名单字符，拒绝 `..` 与路径分隔符。
-- **隔离策略**（配置，决定并发安全）：
-  - `shared`：直接在指定目录运行（最快；同目录并发会互相干扰，需按**工作目录加锁串行化**）。
-  - `worktree`（推荐，M2）：目标为 git 仓库时，为**每个 context** 建 `git worktree`，实现隔离与并发；`--fork` → 新 worktree。
-  - `copy`：非 git 目录做整目录拷贝。
-- **附加目录**：`--add-dir` 等额外可写目录同样必须通过上述校验。
-- **cwd 与 `PWD`**：子进程以工作目录为 **cwd** 启动，并同步把 **`PWD`** 设为该目录——`exec` 只改内核 cwd、不会更新继承来的 `PWD`，而部分 CLI（如 opencode）以 `PWD` 判定会话/项目目录，不同步会导致它读写到 Harbor 的 cwd。
+- **Source**: the caller specifies it via A2A `Message.Metadata` (conventional key `harbor.workDir`); `sandbox.workdir_root` is the only allowed root.
+- **Validation (security precondition)**: take the realpath of both the request path and `workdir_root`, and perform a prefix check by **path components**; **reject** `..` traversal and symlink escape; when `allow_outside=false`, out-of-bounds is rejected outright (fail fast, the CLI is not started).
+- **Binding to `contextId`**: the workdir is bound to the A2A `contextId`. Subsequent tasks of the same context (including `--resume`) **must reuse the same working tree**, otherwise the CLI session and file changes become misaligned.
+- **When unspecified**: first look at `agents[].workdir` (each agent's optional default project directory, constrained by `workdir_root`); if still unconfigured, allocate a scratch directory per context (suitable only for tasks that do not need an existing codebase). This is the only way to "pin a CLI to a project" — because the CLI treats cwd as the project root and loads project-level configuration, skills, and sub-agents such as `opencode.json`/`.opencode`/`.codebuddy`/`.claude`/`.codex` from there.
+- **Scratch naming safety**: `contextId` is client-controllable and **must not be concatenated directly into the path** — take its hash or whitelist characters, and reject `..` and path separators.
+- **Isolation strategy** (configuration, determines concurrency safety):
+  - `shared`: run directly in the specified directory (fastest; concurrent runs in the same directory interfere with each other and require **lock-serialization by workdir**).
+  - `worktree` (recommended, M2): when the target is a git repository, create a `git worktree` for **each context** to achieve isolation and concurrency; `--fork` → a new worktree.
+  - `copy`: for non-git directories, copy the entire directory.
+- **Additional directories**: extra writable directories such as `--add-dir` must also pass the above validation.
+- **cwd and `PWD`**: the child process is started with the workdir as **cwd**, and **`PWD`** is set to that directory in sync — `exec` only changes the kernel cwd and does not update the inherited `PWD`, while some CLIs (e.g. opencode) determine the session/project directory from `PWD`; if not synchronized, they read and write Harbor's cwd.
 
-> 结论：**不是二选一**——`harbor.workDir` 元数据是主来源并绑定 context；“每 context 一个子目录”只是未指定时的 fallback；并发隔离由 `worktree` / 目录锁策略负责。
+> Conclusion: **it is not an either-or** — the `harbor.workDir` metadata is the primary source and is bound to the context; "one subdirectory per context" is only the fallback when unspecified; concurrent isolation is the responsibility of the `worktree` / directory-lock strategy.
 
-### 6.8 代码变更的采集与 artifact 表达
+### 6.8 Collecting Code Changes and Expressing Them as Artifacts
 
-coding agent 的核心产出是**代码改动**，必须作为 artifact 交付，而非只给最终文本。
+The core output of a coding agent is **code changes**, which must be delivered as an artifact rather than only as final text.
 
-- **基线快照**：任务开始时记录基线——git 仓库取 `HEAD` + `git status --porcelain`；非 git 目录记录 `workDir` 内文件哈希。
-- **产出 diff**：终态（或工具报告编辑后）计算变更：git 用 `git diff <base>`（含已跟踪）+ 未跟踪文件；非 git 与基线哈希对比生成 unified diff。
-- **artifact 形态**：
-  - **diff artifact**：`Name="changes"`，`TextPart`（mime `text/x-diff`）或大改动走 `FilePart`(URL，由 Harbor 提供)；
-  - **逐文件 artifact（已落地，可选）**：`sandbox.file_artifacts: true` 时，除 diff 外每个变更文件各发一个 `FilePart`（按扩展名定 MIME，单文件 ≤1MiB，图片不重复）；
-  - `Artifact.Metadata = {"agent","base","files":[...],"truncated":bool}`。
-- **流式 vs 收尾**：默认**收尾一次性**交付（稳定）；若 CLI 能报告逐文件编辑（tool_result 带 path），可增量为每文件发 `ArtifactUpdateEvent`。
-- **边界**：只采集 `workDir`（及允许的 `--add-dir`）内变更；超长 diff 裁剪并标 `truncated`；二进制只报路径。
-- 与 §6.7 配合：`worktree` 模式下 diff 相对该 context 基线。
-- **并发影响 diff 可靠性**：`shared` 模式下同目录并发会混入他人改动 → diff 不可靠；生产应使用 `worktree` 或按目录加锁（§6.7）。
+- **Baseline snapshot**: record a baseline at task start — for a git repository take `HEAD` + `git status --porcelain`; for a non-git directory record the hashes of files within `workDir`.
+- **Produce the diff**: at terminal state (or after a tool reports an edit), compute the changes: for git use `git diff <base>` (including tracked) + untracked files; for non-git compare against the baseline hashes to generate a unified diff.
+- **artifact form**:
+  - **diff artifact**: `Name="changes"`, `TextPart` (mime `text/x-diff`) or, for large changes, `FilePart` (URL, served by Harbor);
+  - **per-file artifact (already implemented, optional)**: when `sandbox.file_artifacts: true`, in addition to the diff, each changed file is emitted as its own `FilePart` (MIME determined by extension, single file ≤1MiB, images not duplicated);
+  - `Artifact.Metadata = {"agent","base","files":[...],"truncated":bool}`.
+- **Streaming vs finalization**: by default it is delivered **once at finalization** (stable); if the CLI can report per-file edits (tool_result carrying a path), `ArtifactUpdateEvent` can be emitted incrementally per file.
+- **Boundary**: only collect changes within `workDir` (and the allowed `--add-dir`); very long diffs are trimmed and marked `truncated`; binaries report only paths.
+- In coordination with §6.7: in `worktree` mode the diff is relative to that context's baseline.
+- **Concurrency affects diff reliability**: in `shared` mode, concurrent runs in the same directory mix in others' changes → the diff is unreliable; production should use `worktree` or lock by directory (§6.7).
 
-### 6.9 请求元数据与错误码契约
+### 6.9 Request Metadata and Error-Code Contract
 
-**元数据键**（`Message.Metadata`，统一 `harbor.` 前缀）：
+**Metadata keys** (`Message.Metadata`, uniformly prefixed with `harbor.`):
 
-| 键 | 类型 | 含义 |
+| Key | Type | Meaning |
 |---|---|---|
-| `harbor.workDir` | string | 工作目录（相对 `workdir_root`），见 §6.7 |
-| `harbor.model` | string | 模型（透传 Adapter） |
-| `harbor.agent` | string | CLI 内部 agent 名 |
-| `harbor.systemPrompt` | string | 追加系统提示 |
-| `harbor.fork` | bool | 分叉会话而非续写 |
-| `harbor.maxTurns` | int | 最大轮次 |
-| `harbor.continue` | bool | 无 sessionId 时续用最近会话（`--continue`） |
-| `harbor.outputSchema` | object | JSON Schema：要求 CLI 产出结构化结果，作为 `result` DataPart artifact 返回（stream-json：`--json-schema`，见 §7.6） |
-| `harbor.interactionId` | string | 回答 `input-required` 时回带的交互 id（§7.4） |
+| `harbor.workDir` | string | Workdir (relative to `workdir_root`), see §6.7 |
+| `harbor.model` | string | Model (passed through to the Adapter) |
+| `harbor.agent` | string | CLI-internal agent name |
+| `harbor.systemPrompt` | string | Appended system prompt |
+| `harbor.fork` | bool | Fork the session instead of continuing |
+| `harbor.maxTurns` | int | Maximum turns |
+| `harbor.continue` | bool | Continue the most recent session when there is no sessionId (`--continue`) |
+| `harbor.outputSchema` | object | JSON Schema: requires the CLI to produce a structured result, returned as a `result` DataPart artifact (stream-json: `--json-schema`, see §7.6) |
+| `harbor.interactionId` | string | The interaction id to be echoed back when answering `input-required` (§7.4) |
 
-**错误码**（失败时置于 `TaskStatus.Message.Metadata["harbor.errorCode"]`，值域固定）：
+**Error codes** (on failure placed in `TaskStatus.Message.Metadata["harbor.errorCode"]`, with a fixed value domain):
 
-| code | 触发 |
+| code | Trigger |
 |---|---|
-| `unsupported_content` | 请求能力不在生效能力内（§7.5） |
-| `workdir_denied` | 工作目录越界 / 校验失败（§6.7） |
-| `auth_required` | CLI provider 未登录 / 鉴权失效（§10.5）。保留值域；当前由 CLI 自身错误呈现（未主动发出） |
-| `cli_not_found` | 二进制缺失或不可执行 |
-| `agent_unavailable` | agent 熔断（连续失败）或未启用，快速失败（§11.2） |
-| `timeout` | 总 / 空闲超时 |
-| `parse_error` | 输出无法解析 |
-| `internal` | 其它 |
+| `unsupported_content` | The requested capability is not within the effective capabilities (§7.5) |
+| `workdir_denied` | Workdir out of bounds / validation failed (§6.7) |
+| `auth_required` | CLI provider not logged in / authentication invalid (§10.5). Value domain reserved; currently surfaced by the CLI's own error (not actively emitted) |
+| `cli_not_found` | Binary missing or not executable |
+| `agent_unavailable` | agent circuit-broken (consecutive failures) or not enabled; fast-fail (§11.2) |
+| `timeout` | Total / idle timeout |
+| `parse_error` | Output cannot be parsed |
+| `internal` | Other |
 
-> 客户端据 `errorCode` 做机器化处理（重登 / 换 agent / 降级），而非解析自然语言。
+> The client performs machine-level handling (re-login / switch agent / degrade) based on `errorCode`, rather than parsing natural language.
 
 ---
 
-## 7. 能力对齐模型（Capability Alignment）
+## 7. Capability Alignment Model
 
-> 这是本设计**最核心的难点**：A2A 定义了一套通用能力面（输入/输出 MIME、流式、`input-required`、扩展），而各 CLI 的真实能力是**异构子集**——有的支持图片输入、有的有独立的“结构化提问”工具、有的权限模型完全不同。取“最小公分母”会浪费能力，强行统一又会造假。原则：**声明真实能力 + 规范化投影 + 显式降级**。
+> This is the **most central difficulty** of this design: A2A defines a general capability surface (input/output MIME, streaming, `input-required`, extensions), while each CLI's real capabilities are a **heterogeneous subset** — some support image input, some have a separate "structured question" tool, and some have a completely different permission model. Taking the "least common denominator" wastes capability, while forcing uniformity fabricates it. Principle: **declare real capabilities + normalize via projection + degrade explicitly**.
 
-### 7.1 三层能力面
+### 7.1 Three Layers of Capability Surface
 
-| 层 | 谁定义 | 例子 |
+| Layer | Who defines it | Examples |
 |---|---|---|
-| CLI 原生能力 | 各 CLI | claude 的图片输入 / `AskUserQuestion` / `--permission-mode`；opencode 的 `--auto`（权限系统）；codebuddy 的文生图模型 |
-| Harbor 规范能力（Canonical） | 本设计 | 比 A2A 更细的内部能力描述符 `Capabilities` |
-| A2A 暴露能力 | A2A 规范 | AgentCard 的 `DefaultInputModes`/`DefaultOutputModes`、`Capabilities`、`Extensions` |
+| CLI native capabilities | each CLI | claude's image input / `AskUserQuestion` / `--permission-mode`; opencode's `--auto` (permission system); codebuddy's text-to-image model |
+| Harbor canonical capabilities | this design | An internal capability descriptor `Capabilities` finer-grained than A2A |
+| A2A exposed capabilities | A2A spec | The AgentCard's `DefaultInputModes`/`DefaultOutputModes`, `Capabilities`, `Extensions` |
 
-对齐 = **投影**：Canonical → A2A 字段（对外，保真度可损失）；同时 Canonical 作为**请求期校验**依据（对内，拒绝不支持的能力）。二者缺一不可。
+Alignment = **projection**: Canonical → A2A fields (externally, fidelity may be lost); at the same time Canonical serves as the basis for **request-time validation** (internally, rejecting unsupported capabilities). Neither can be missing.
 
 ### 7.2 Canonical Capability Descriptor
 
@@ -777,25 +787,25 @@ type Capabilities struct {
 }
 ```
 
-`Probe()` 产出**生效能力**：静态声明 + `--version`/`--help` 探测 + 配置覆盖。它同时驱动 AgentCard、请求校验和降级策略，是“单一事实来源”。
+`Probe()` produces the **effective capabilities**: static declaration + `--version`/`--help` probing + configuration overrides. It simultaneously drives the AgentCard, request validation, and degradation strategy, and is the "single source of truth".
 
-### 7.3 投影到 A2A（Canonical → Card）
+### 7.3 Projection to A2A (Canonical → Card)
 
-| Canonical | A2A 字段 |
+| Canonical | A2A field |
 |---|---|
-| `InputText` / `InputImage` / `InputFile` / `InputData` | `DefaultInputModes`（`text/plain`、`image/png`、`application/pdf`、`application/json`…） |
+| `InputText` / `InputImage` / `InputFile` / `InputData` | `DefaultInputModes` (`text/plain`, `image/png`, `application/pdf`, `application/json`, …) |
 | `OutputText` / `OutputFile` / `OutputData` | `DefaultOutputModes` |
 | `Streaming != none` | `Capabilities.Streaming` |
-| `ToolTrace` / 富交互 | `Capabilities.Extensions[]`（交互扩展，见下） |
-| `Permission` / `AskQuestion` / `PlanApproval` | 见 §7.4 交互规范化 |
+| `ToolTrace` / rich interaction | `Capabilities.Extensions[]` (interaction extension, see below) |
+| `Permission` / `AskQuestion` / `PlanApproval` | see §7.4 interaction normalization |
 
-> A2A 只认 MIME，表达不了“只接受图片**路径**还是 raw bytes”。入参**形态**（raw / URL / 本地路径）通过扩展参数补充。
+> A2A only understands MIME and cannot express "only accepts an image **path** or raw bytes". The **form** of the input (raw / URL / local path) is supplemented through extension parameters.
 >
-> **交互扩展 URI**：`https://github.com/jiaweisky/harbor/extensions/interaction/v1`（仓库内 `extensions/interaction.md` 给 JSON schema）。仅当 `Permission==interactive || AskQuestion || PlanApproval` 时在 Card 声明；不支持该扩展的客户端退回文本问答。
+> **Interaction extension URI**: `https://github.com/jiaweisky/harbor/extensions/interaction/v1` (`extensions/interaction.md` in the repo provides the JSON schema). It is declared in the Card only when `Permission==interactive || AskQuestion || PlanApproval`; clients that do not support the extension fall back to text Q&A.
 
-### 7.4 交互规范化（权限 / ask question / plan）
+### 7.4 Interaction Normalization (permission / ask question / plan)
 
-三种“提问”语义不同，统一为带 `kind` 的**交互描述**，用 A2A `input-required` + `DataPart` 承载：
+The three kinds of "questions" have different semantics; they are unified into an **interaction description** carrying a `kind`, conveyed via A2A `input-required` + `DataPart`:
 
 ```json
 {
@@ -809,97 +819,97 @@ type Capabilities struct {
 }
 ```
 
-- `permission`：**安全门**（approve / deny / allow-always）。映射 claude `--permission-mode`/`--allowedTools`、opencode `--auto`、codebuddy `-y`。
-- `question`：Agent 的**主动澄清**（如 claude `AskUserQuestion`），选项 + 自由文本。
-- `plan_approval`：计划模式确认。
+- `permission`: a **security gate** (approve / deny / allow-always). Maps claude `--permission-mode`/`--allowedTools`, opencode `--auto`, codebuddy `-y`.
+- `question`: the Agent's **proactive clarification** (e.g. claude `AskUserQuestion`), with options + free text.
+- `plan_approval`: plan-mode confirmation.
 
-**答复编码**：客户端回一个 `Message`，内含 `DataPart{kind,id,answer}`；Harbor 校验 `id` 与当前 `input-required` 匹配，防止串台。
+**Answer encoding**: the client replies with a `Message` containing `DataPart{kind,id,answer}`; Harbor validates that `id` matches the current `input-required` to prevent cross-talk.
 
-**降级策略（关键）**：
+**Degradation strategy (key)**:
 
-| CLI 能力 | 行为 |
+| CLI capability | Behavior |
 |---|---|
-| 支持交互且 `InputRequiredResume` | 完整 `input-required`，**原进程挂起**等待 stdin 答复（duplex）。**claude/codebuddy 走此路**（`--input-format stream-json` + stdin，见 §5）。 |
-| 支持交互但不支持挂起续答 | 登记 CLI 会话 ID，**重新以 `--resume` 启动**并注入答复（有损，可能重放/丢上下文）。 |
-| 不支持交互 | 由配置策略决定（预授权 / 自动拒绝 / bypass），**永不发** `input-required`；Card 声明不支持。 |
-| 客户端只会发文本 | 问题以文本 + 选项列表呈现；结构化答复仅对支持扩展的客户端可用。 |
+| Supports interaction and `InputRequiredResume` | Full `input-required`, with the **original process suspended** waiting for the stdin answer (duplex). **claude/codebuddy take this path** (`--input-format stream-json` + stdin, see §5). |
+| Supports interaction but not suspend-and-resume | Register the CLI session ID and **restart with `--resume`** to inject the answer (lossy; may replay/lose context). |
+| Does not support interaction | Determined by configuration policy (pre-authorize / auto-deny / bypass); **never emits** `input-required`; the Card declares unsupported. |
+| Client can only send text | The question is presented as text + an option list; structured answers are available only to clients supporting the extension. |
 
-**已落地**：交互规范化在 **ACP** 与 **stream-json** 两条路径实现——`input-required` 消息同时携带人可读 `TextPart` 与结构化 `DataPart`（`{kind,id,action,target,risk,options,resume}`）；答复可用同构 `DataPart`（Harbor 校验 `id`，不匹配则拒绝）或纯文本兜底；Card 在存在交互能力时声明扩展 `https://github.com/jiaweisky/harbor/extensions/interaction/v1`（schema 见 `extensions/interaction.md`）。
+**Already implemented**: interaction normalization is implemented on both the **ACP** and **stream-json** paths — the `input-required` message carries both a human-readable `TextPart` and a structured `DataPart` (`{kind,id,action,target,risk,options,resume}`); the answer may use an isomorphic `DataPart` (Harbor validates `id`, rejecting a mismatch) or plain text as a fallback; the Card declares the extension `https://github.com/jiaweisky/harbor/extensions/interaction/v1` (schema in `extensions/interaction.md`) when interaction capability exists.
 
-- **ACP**：`session/request_permission` → `input-required`（optionId 作答）。
-- **stream-json**：`control_request` 且 `request.subtype="can_use_tool"`（claude/codebuddy 无头模式的实际权限/提问通道），按 `tool_name` 分流：
-  - 默认 → `InteractionPermission`（`id`=`request_id`，选项 `allow`/`deny`）；答复编码为 `control_response`（`response.response` 同时带 codebuddy 的 `allowed` 与 claude 的 `behavior`，两种 CLI 通用）。
-  - `AskUserQuestion` → `InteractionQuestion`（`id`=`request_id`，`target`=第一个问题文本，`options`=其选项 label，`questions` 列出**全部**问题及其选项）；答复编码为 `control_response` 的 `updatedInput.answers{问题: 选择}` 注入——多问题时客户端用 `DataPart{id,content:{问题:选择,...}}` 一次性回答所有问题。因该工具需客户端先声明能力，`agents[].sdk_capabilities: true` 会在首个 prompt 前发送 `initialize` 声明 `askUserQuestion`（见 §5.4）；未开启时 CLI 不暴露该工具。
-  - `request.subtype="elicitation_create"`（**表单**）→ `InteractionQuestion`（`action:"form"`，`schema` 携带 `requestedSchema`，单字段 enum 时 `options` 直接列出）；客户端以 `DataPart{id,content}` 作答，答复编码为 `control_response` `{action:"accept",content:{...}}`（无 content 则 `decline`）。需 `sdk_capabilities: true` 声明 `elicitation.form`。
-  - `tool_name="ExitPlanMode"`（plan 模式）→ `InteractionPlanApproval`（选项 allow/deny），答复同权限（`control_response` 的 `allowed`）。
-  - 以上情形**原进程挂起**等待 stdin，无需重启。实测 codebuddy：权限（暂停→`allow`→Bash 执行→完成）、`AskUserQuestion` 提问（暂停→选择 `Blue`→完成）、表单 elicitation（暂停→提交 `content`→完成）、plan approval（`ExitPlanMode`→暂停）均通过。
+- **ACP**: `session/request_permission` → `input-required` (answered with an optionId).
+- **stream-json**: `control_request` with `request.subtype="can_use_tool"` (the actual permission/question channel in claude/codebuddy headless mode), dispatched by `tool_name`:
+  - Default → `InteractionPermission` (`id`=`request_id`, options `allow`/`deny`); the answer is encoded as `control_response` (`response.response` carries both codebuddy's `allowed` and claude's `behavior`, common to both CLIs).
+  - `AskUserQuestion` → `InteractionQuestion` (`id`=`request_id`, `target`=the first question's text, `options`=its option labels, `questions` listing **all** questions and their options); the answer is encoded as `control_response` injecting `updatedInput.answers{question: choice}` — for multiple questions the client answers them all at once with `DataPart{id,content:{question:choice,...}}`. Because this tool requires the client to declare the capability first, `agents[].sdk_capabilities: true` sends `initialize` before the first prompt to declare `askUserQuestion` (see §5.4); when not enabled the CLI does not expose the tool.
+  - `request.subtype="elicitation_create"` (**form**) → `InteractionQuestion` (`action:"form"`, with `schema` carrying `requestedSchema`, and `options` listed directly for a single-field enum); the client answers with `DataPart{id,content}`, and the answer is encoded as `control_response` `{action:"accept",content:{...}}` (`decline` if no content). Requires `sdk_capabilities: true` to declare `elicitation.form`.
+  - `tool_name="ExitPlanMode"` (plan mode) → `InteractionPlanApproval` (options allow/deny), answered the same as permission (the `allowed` of `control_response`).
+  - In all the above cases the **original process suspends** waiting on stdin; no restart is needed. Real-machine testing with codebuddy: permission (pause → `allow` → Bash executes → complete), `AskUserQuestion` question (pause → choose `Blue` → complete), form elicitation (pause → submit `content` → complete), and plan approval (`ExitPlanMode` → pause) all pass.
 
-**活进程丢失恢复（有损）**：`input-required` 消息元数据记录 CLI 会话 id（`harbor.sessionId`，来自 `EventSession`）。当答复到达而活进程已不存在（典型为 Harbor 重启后 `runs`/`live` 已清空）时，若该会话 id 存在且 CLI `SessionResume` 能力为真，则**以 `--resume <id>` 重启**并把答复文本作为下一个 prompt 注入（`resumeFresh`）；否则以 `internal` 失败并提示重发。注入是有损的：CLI 重启、可能重放上下文，且工作目录取自答复消息的 `harbor.workDir`（缺省回退）。ACP 未上报会话 id，故重启后走此路会因缺少 id 而失败。
+**Live-process-lost recovery (lossy)**: the `input-required` message metadata records the CLI session id (`harbor.sessionId`, from `EventSession`). When an answer arrives but the live process no longer exists (typically because after a Harbor restart `runs`/`live` have been cleared), if that session id exists and the CLI's `SessionResume` capability is true, it **restarts with `--resume <id>`** and injects the answer text as the next prompt (`resumeFresh`); otherwise it fails with `internal` and prompts a resend. The injection is lossy: the CLI restarts, context may be replayed, and the workdir is taken from the `harbor.workDir` of the answer message (falling back to the default). ACP does not report a session id, so after a restart this path fails for lack of an id.
 
-### 7.5 媒体类型对齐
+### 7.5 Media Type Alignment
 
-| 请求 Part | 通用处理 | 各 CLI 落地（示例） |
+| Request Part | Generic handling | Per-CLI implementation (example) |
 |---|---|---|
-| `TextPart` | 拼 prompt | 全部 |
-| `FilePart`(raw/URL) | 图片：native image block（`InlineImages`）或经 `image_args`（`{{.Image}}`）落盘附加；其余且配置 `file_args` → 落盘并经参数附加（`{{.File}}`）；否则 → 落盘并在 prompt 提示路径 | codebuddy：图片经 image block（已落地）；opencode：`-f {{.File}}`（已落地，实测）；codex：`-i {{.Image}}`（已落地，假 CLI 覆盖）；claude stream-json 不支持图片 |
-| `DataPart` | 每个 part 一个内容块 | stream-json：`TextPart`/`DataPart` 各成独立 `text` content block（DataPart 为 JSON 块）；exec：序列化并入 prompt。**结构化输出**另见 §6.8/§7.6。 |
-| 输出文件/图片 | 监听工作目录变更 | 无标准接口：以 git diff / 新增文件生成 `FilePart` artifact；codebuddy 文生图结果按图片 artifact 输出 |
+| `TextPart` | concatenated into the prompt | all |
+| `FilePart`(raw/URL) | Images: native image block (`InlineImages`) or persisted via `image_args` (`{{.Image}}`) and attached; otherwise, with `file_args` configured → persist and attach via arguments (`{{.File}}`); otherwise → persist and indicate the path in the prompt | codebuddy: images via image block (implemented); opencode: `-f {{.File}}` (implemented, real-machine tested); codex: `-i {{.Image}}` (implemented, covered by a fake CLI); claude stream-json does not support images |
+| `DataPart` | one content block per part | stream-json: `TextPart`/`DataPart` each become an independent `text` content block (DataPart as a JSON block); exec: serialized and merged into the prompt. **Structured output** see also §6.8/§7.6. |
+| Output files/images | monitor workdir changes | No standard interface: generate `FilePart` artifacts from git diff / newly added files; codebuddy text-to-image results are output as image artifacts |
 
-要点：**能力校验前置**——请求中的媒体类型/交互若不在生效能力内，立即以 `ErrUnsupportedContentType` / 拒绝态返回，**不要**启动 CLI 后再失败。
+Key point: **capability validation up front** — if the media type/interaction in the request is not within the effective capabilities, immediately return with `ErrUnsupportedContentType` / a rejected state, and **do not** start the CLI and fail afterward.
 
-**已落地**：Executor 按 part 类型拼装输入——每个 `TextPart`/`DataPart`（后者为 JSON）在 stream-json 下成为**独立 content block**（`EncodeStreamJSONBlocks`），exec 下并入 prompt 文本；`FilePart(raw)` 落到 `<workDir>/.harbor/uploads/` 并**经 `agents[].file_args` 附加**（`{{.File}}` → 路径；opencode profile 默认 `-f {{.File}}`，实测把文件内容交给模型）——未配置 `file_args` 时退回“prompt 中给出路径”；`FilePart(URL)` 直接引用 URL。**能力校验前置**：图片 MIME 不在 `InputImage` 内、或文件而无 `InputFile` 时，返回 `unsupported_content` 且不启动 CLI；`InputModes()` 在 `InputFile` 时投影 `application/octet-stream`。
+**Already implemented**: the Executor assembles the input by part type — each `TextPart`/`DataPart` (the latter as JSON) becomes an **independent content block** under stream-json (`EncodeStreamJSONBlocks`) and is merged into the prompt text under exec; `FilePart(raw)` is persisted to `<workDir>/.harbor/uploads/` and **attached via `agents[].file_args`** (`{{.File}}` → path; the opencode profile defaults to `-f {{.File}}`, which real-machine testing shows passes the file content to the model) — when `file_args` is unconfigured it falls back to "giving the path in the prompt"; `FilePart(URL)` directly references the URL. **Capability validation up front**: when an image MIME is not within `InputImage`, or a file is sent without `InputFile`, it returns `unsupported_content` and does not start the CLI; `InputModes()` projects `application/octet-stream` when `InputFile`.
 
-**图片输入（已落地，codebuddy 的 stream-json）**：profile 的 `InputImage`（png/jpeg/gif/webp）声明后，`FilePart(raw)` 的图片**不再落盘**，而是作为 native **image content block**（base64）随首条 user message 经 stdin 发送，模型直接看到像素；URL 图片仍按引用处理。实测 codebuddy：发送纯红 PNG → 回答 `Red`。claude 的 stream-json 输入对图片返回 `[Unsupported Image]`，故**不**为其声明 `InputImage`（图片回落为落盘 + 路径引用）。
+**Image input (already implemented, codebuddy's stream-json)**: once the profile's `InputImage` (png/jpeg/gif/webp) is declared, images in `FilePart(raw)` are **no longer persisted** but sent as a native **image content block** (base64) with the first user message over stdin, so the model sees the pixels directly; URL images are still handled by reference. Real-machine testing with codebuddy: sending a pure red PNG → answered `Red`. claude's stream-json input returns `[Unsupported Image]` for images, so `InputImage` is **not** declared for it (images fall back to persisting + path reference).
 
-**图片输出（已落地）**：任务结束时 `emitChanges` 在既有 diff 之外，把工作目录内**新增/变更的图片文件**（按扩展名 png/jpg/jpeg/gif/webp，单个 ≤8MiB）作为 **raw image artifact**（`FilePart`，带 `MediaType`/`Filename`/`path` 元数据）发出——文生图结果（如 codebuddy `--text-to-image-model` 落盘的图片）因此以图片而非仅 diff 行到达客户端。`Profile.OutputImage` 声明可产出的图片 MIME，经 `Capabilities.OutputImage` 投影到卡片的 `defaultOutputModes`（codebuddy 已声明）。注：机制是通用的工作目录监听，不绑定具体 CLI。
+**Image output (already implemented)**: at task end, in addition to the existing diff, `emitChanges` emits **newly added/changed image files** in the workdir (by extension png/jpg/jpeg/gif/webp, each ≤8MiB) as **raw image artifacts** (`FilePart`, with `MediaType`/`Filename`/`path` metadata) — so text-to-image results (e.g. images persisted by codebuddy `--text-to-image-model`) reach the client as images rather than merely as diff lines. `Profile.OutputImage` declares the producible image MIME, projected via `Capabilities.OutputImage` into the card's `defaultOutputModes` (already declared for codebuddy). Note: the mechanism is generic workdir monitoring and is not bound to a specific CLI.
 
-**结构化输出（已落地）**：
-- **stream-json**：请求元数据 `harbor.outputSchema` 提供 JSON Schema 时，Harbor 追加 `--json-schema`，CLI 的 `structured_output` 解析为 `EventStructuredOutput` 并作为 `result` DataPart artifact 返回（claude/codebuddy 实测通过）。
-- **exec**：`agents[].output_schema_args`（codex profile 默认 `["--output-schema","{{.SchemaFile}}"]`）在请求带 schema 时把 schema 写入临时文件并追加参数（`{{.SchemaFile}}`/`{{.Schema}}`）；因 exec CLI 无显式结构化事件，Harbor 在任务完成时把**最终文本**尝试解析为 JSON object 并作为 `result` DataPart（未配置 schema 或文本非 JSON 时不触发）。codex 本机未登录，仅假 CLI 覆盖。
+**Structured output (already implemented)**:
+- **stream-json**: when the request metadata `harbor.outputSchema` provides a JSON Schema, Harbor appends `--json-schema`, and the CLI's `structured_output` is parsed into `EventStructuredOutput` and returned as a `result` DataPart artifact (real-machine tested with claude/codebuddy).
+- **exec**: `agents[].output_schema_args` (codex profile defaults to `["--output-schema","{{.SchemaFile}}"]`) writes the schema to a temporary file and appends the argument when the request carries a schema (`{{.SchemaFile}}`/`{{.Schema}}`); since exec CLIs have no explicit structured event, on task completion Harbor attempts to parse the **final text** as a JSON object and returns it as a `result` DataPart (not triggered when no schema is configured or the text is not JSON). codex is not logged in on the local machine, so this is covered only by a fake CLI.
 
-**图片/附件参数（已落地，codex）**：`agents[].image_args`（codex profile 默认 `["-i","{{.Image}}"]`）让 CLI 以参数方式接收图片——图片落盘（保留/补全扩展名）后按 `{{.Image}}` 追加，`InputImage` 声明后图片被接受且投影为输入 MIME；`add_dir` 等其余参数可直接写入 `agents[].args`（模板含 `{{.WorkDir}}`）。codex 本机未登录，仅假 CLI 覆盖。
+**Image/attachment arguments (already implemented, codex)**: `agents[].image_args` (codex profile defaults to `["-i","{{.Image}}"]`) lets the CLI receive images as arguments — the image is persisted (extension preserved/completed) and appended per `{{.Image}}`; once `InputImage` is declared the image is accepted and projected as an input MIME; other arguments such as `add_dir` can be written directly into `agents[].args` (the template contains `{{.WorkDir}}`). codex is not logged in on the local machine, so this is covered only by a fake CLI.
 
-### 7.6 功能支持矩阵（依据本机 `-h` 实测）
+### 7.6 Feature Support Matrix (based on real-machine `-h` testing)
 
-依据：用户提供并本机实测的 `opencode -h` / `codebuddy -h` / `claude -h` / `codex -h` 及 `codex exec -h`。
+Basis: the user-provided, locally-tested `opencode -h` / `codebuddy -h` / `claude -h` / `codex -h` and `codex exec -h`.
 
-| 功能 \ Agent | claude | codebuddy | opencode | codex | generic |
+| Feature \ Agent | claude | codebuddy | opencode | codex | generic |
 |---|---|---|---|---|---|
-| 文本输入/输出 | ✅ | ✅ | ✅ | ✅（`exec`） | ✅ |
-| 图片输入 | ✅（交互内置读取；stream-json 不支持） | ✅（已落地，stream-json native image block） | ✗ | ✅（已落地，`image_args` → `-i`；本机未登录，假 CLI 覆盖） | 配置 |
-| 图片输出 | ✗ | ✅（`--text-to-image-model`） | ✗ | ✗ | 配置 |
-| 文件/补丁输出 | ✅（内置） | ✅（内置） | ✅（内置） | ✅（内置 + `apply`） | 配置 |
-| 结构化输出（`--json-schema`/`--output-schema`） | ✅（已落地，`harbor.outputSchema`→DataPart） | ✅（同左） | ✗ | ✅（已落地，`output_schema_args`；本机 codex 未登录，假 CLI 覆盖） | 配置 |
-| 结构化输入（`--input-format stream-json`） | ✅ | ✅ | ✗ | ✗（prompt 走参数/stdin） | 配置 |
-| 流式粒度 | token（`stream-json` + `--include-partial-messages`） | token（同上） | turn（`run`）；可通过 `serve` 走 SSE | JSONL 事件流（`exec --json`）；`app-server` 可流式 | 配置 |
-| 权限交互 | ✅（`--permission-mode` / `--allowedTools` / `--permission-prompts`） | ✅（同左 + `--subagent-permission-mode`） | ✅（`--auto`；权限系统） | ✅（`-a/--ask-for-approval`、`--approve-for-me`） | 配置 |
-| 计划审批 | ✅（`plan` 模式） | ✅（`plan` 模式） | ✗ | ✗ | 配置 |
-| 主动澄清（`--brief` / ask） | ✅（`--brief`） | ✅（`--brief`） | ✗ | ✗ | — |
-| 会话续跑 / fork | ✅（`--resume` / `--fork-session`） | ✅（`--resume` / `--fork-session`） | ✅（`--session` / `--fork`） | ✅（`resume` / `fork` / `queue`） | 配置 |
-| 子 Agent | ✅（`--agents`） | ✅（`--agents`，另有 `--swarm`） | ✅（`opencode agent` / `--agent`） | ✗ | — |
-| MCP 配置 | ✅（`--mcp-config`） | ✅（`--mcp-config`） | ✅（`opencode mcp`） | ✅（`codex mcp`） | 配置 |
-| 常驻 Server | ✗ | ✅（`--serve`，HTTP） | ✅（`serve` / `web`） | ✅（`app-server` / `exec-server`） | 配置 |
-| 沙箱策略 | ✅（`--restricted`） | ✅（`--sandbox`） | ✗ | ✅（`-s/--sandbox`：read-only/workspace-write/danger-full-access） | 配置 |
-| ACP 模式 | ✗（`-h` 未暴露） | ✅（`--acp`；`--acp-transport` stdio/streamable-http） | ✅（`acp`，stdio） | ✗（用 `app-server`，非 ACP） | 配置 |
+| Text input/output | ✅ | ✅ | ✅ | ✅ (`exec`) | ✅ |
+| Image input | ✅ (interactive built-in reading; stream-json unsupported) | ✅ (implemented, stream-json native image block) | ✗ | ✅ (implemented, `image_args` → `-i`; local machine not logged in, covered by fake CLI) | config |
+| Image output | ✗ | ✅ (`--text-to-image-model`) | ✗ | ✗ | config |
+| File/patch output | ✅ (built-in) | ✅ (built-in) | ✅ (built-in) | ✅ (built-in + `apply`) | config |
+| Structured output (`--json-schema`/`--output-schema`) | ✅ (implemented, `harbor.outputSchema`→DataPart) | ✅ (same as left) | ✗ | ✅ (implemented, `output_schema_args`; local codex not logged in, covered by fake CLI) | config |
+| Structured input (`--input-format stream-json`) | ✅ | ✅ | ✗ | ✗ (prompt goes via arguments/stdin) | config |
+| Streaming granularity | token (`stream-json` + `--include-partial-messages`) | token (same as above) | turn (`run`); can use SSE via `serve` | JSONL event stream (`exec --json`); `app-server` supports streaming | config |
+| Permission interaction | ✅ (`--permission-mode` / `--allowedTools` / `--permission-prompts`) | ✅ (same as left + `--subagent-permission-mode`) | ✅ (`--auto`; permission system) | ✅ (`-a/--ask-for-approval`, `--approve-for-me`) | config |
+| Plan approval | ✅ (`plan` mode) | ✅ (`plan` mode) | ✗ | ✗ | config |
+| Proactive clarification (`--brief` / ask) | ✅ (`--brief`) | ✅ (`--brief`) | ✗ | ✗ | — |
+| Session resumption / fork | ✅ (`--resume` / `--fork-session`) | ✅ (`--resume` / `--fork-session`) | ✅ (`--session` / `--fork`) | ✅ (`resume` / `fork` / `queue`) | config |
+| Sub-agents | ✅ (`--agents`) | ✅ (`--agents`, plus `--swarm`) | ✅ (`opencode agent` / `--agent`) | ✗ | — |
+| MCP configuration | ✅ (`--mcp-config`) | ✅ (`--mcp-config`) | ✅ (`opencode mcp`) | ✅ (`codex mcp`) | config |
+| Long-running Server | ✗ | ✅ (`--serve`, HTTP) | ✅ (`serve` / `web`) | ✅ (`app-server` / `exec-server`) | config |
+| Sandbox policy | ✅ (`--restricted`) | ✅ (`--sandbox`) | ✗ | ✅ (`-s/--sandbox`: read-only/workspace-write/danger-full-access) | config |
+| ACP mode | ✗ (not exposed by `-h`) | ✅ (`--acp`; `--acp-transport` stdio/streamable-http) | ✅ (`acp`, stdio) | ✗ (uses `app-server`, not ACP) | config |
 
-图例：`✅` = 本机 `-h` 明确可见或 CLI 内置能力；`✗` = `-h` 未暴露、无明确依据；`配置` = 由 Adapter 模板决定。矩阵是 Adapter 声明、Card 投影与降级策略的依据。
+Legend: `✅` = clearly visible in the local `-h` or a built-in CLI capability; `✗` = not exposed by `-h`, no clear basis; `config` = determined by the Adapter template. The matrix is the basis for Adapter declaration, Card projection, and degradation strategy.
 
-### 7.7 为什么“对齐”不能一刀切
+### 7.7 Why "Alignment" Cannot Be One-Size-Fits-All
 
-- **不取最小公分母**：否则图片、结构化输出、交互等高级能力永远用不上 → 每个 agent 暴露**真实**能力集。
-- **不假装统一**：CLI 语义迥异（安全门 ≠ 主动澄清），用 `kind` 区分，而非硬塞进同一个 `input-required`。
-- **可协商**：客户端据 Card 选 agent / 降级；不支持就明确拒绝，而非静默失败。
-- **可演进**：新能力先进入 Canonical，再补投影，A2A 层与 Adapter 层无需大改。
+- **Do not take the least common denominator**: otherwise advanced capabilities such as images, structured output, and interaction can never be used → each agent exposes its **real** capability set.
+- **Do not pretend to be uniform**: CLI semantics differ greatly (a security gate ≠ proactive clarification); distinguish them with `kind` rather than forcing them into the same `input-required`.
+- **Negotiable**: the client chooses an agent / degrades based on the Card; unsupported is explicitly rejected rather than silently failing.
+- **Evolvable**: new capabilities first enter Canonical, then the projection is filled in; the A2A layer and Adapter layer need no major changes.
 
 ---
 
-## 8. 扩展机制（重点需求）
+## 8. Extension Mechanism (Key Requirement)
 
-设计 **三级扩展**，覆盖从“零代码”到“完全自定义”：
+Design **three levels of extension**, covering everything from "zero code" to "fully custom":
 
-### 级别 1：纯配置扩展（推荐，覆盖 80% CLI）
+### Level 1: Pure Configuration Extension (recommended, covers 80% of CLIs)
 
-在 `agents.yaml` 增加一条即可。内置解析器：`stream-json`、`text`、`regex`。
+Just add an entry in `agents.yaml`. Built-in parsers: `stream-json`, `text`, `regex`.
 
 ```yaml
 agents:
@@ -921,9 +931,9 @@ agents:
       max_turns: 100
 ```
 
-### 级别 2：自定义 Parser（少量 Go 代码）— **已落地**
+### Level 2: Custom Parser (a little Go code) — **already implemented**
 
-实现 `Parser` 接口并注册，用于输出格式奇特但仍是子进程的 CLI。解析器按名字注册（`internal/parser.RegisterParser`），新增格式 = **新建一个文件 + `init()` 注册**，不改中央 switch；内置 `text`/`stream-json`/`codex`/`regex` 均以此注册。
+Implement and register the `Parser` interface for CLIs whose output format is unusual but which are still child processes. Parsers are registered by name (`internal/parser.RegisterParser`); adding a format = **creating one file + registering in `init()`**, without touching a central switch; the built-in `text`/`stream-json`/`codex`/`regex` are all registered this way.
 
 ```go
 // internal/parser/mine.go
@@ -932,9 +942,9 @@ func init() {
 }
 ```
 
-### 级别 3：完整 Adapter（复杂 CLI）— **已落地（编译期注册）**
+### Level 3: Full Adapter (complex CLI) — **already implemented (compile-time registration)**
 
-实现并注册一个 **AdapterBuilder**，用于需要握手、多次 stdin 往返、专用传输的 CLI。注册按 **CLI 二进制基名**：`integration.New` 在该名字有注册时优先调用它；builder 返回 `agent.ErrUnhandled` 表示该集成不归它管，回退到内建的通用装配（`stream-json`/`exec`）。新增一个复杂 CLI = **新建一个包 + `init()` 注册**，不改中心 switch。
+Implement and register an **AdapterBuilder** for CLIs requiring a handshake, multiple stdin round-trips, or a dedicated transport. Registration is by **CLI binary base name**: `integration.New` preferentially calls it when there is a registration for that name; a builder returning `agent.ErrUnhandled` means that integration is not its concern, falling back to the built-in generic assembly (`stream-json`/`exec`). Adding a complex CLI = **creating one package + registering in `init()`**, without touching a central switch.
 
 ```go
 func init() {
@@ -945,63 +955,63 @@ func init() {
 }
 ```
 
-**加载方式**：
+**Loading methods**:
 
-- **编译期注册**（采用）：`agent.RegisterAdapter`（`internal/agent/adapter.go`）维护 `二进制名 → AdapterBuilder` 的注册表。首方适配器（`opencode`/`codebuddy`/`codex` 的 `acp`/`server`）在 `internal/integration/adapters.go` 的 `init()` 注册；外部/新增 CLI 在其自身包的 `init()` 注册（由编译期 import 触发）。
-- **Go plugin（`plugin` 包）**：可运行时加载 `.so`（**已落地**，实验性）：`plugins: ["/path/x.so"]` 在启动时打开每个插件并调用其导出的 `Register()`（内部用 `agent.RegisterAdapter` 注册适配器）。受 CGO/平台限制——仅在 `cgo` 且 linux/darwin/freebsd 可用（`internal/plugins` 按 build tag 提供实现与降级）。
-- 统一通过注册表暴露，HTTP 层与 A2A 层完全不感知具体 CLI。config 仍校验**配置形状**（集成取值、profile 版本、参数模板），adapter 构建只发生在 `integration.New`。
-
----
-
-## 9. 安全设计
-
-> 这些 CLI 具备读写文件、执行命令的能力，安全是首要约束。
-
-1. **鉴权（M1 必做，不做无鉴权版）**：这些 CLI 能执行任意代码，**可达的无鉴权 A2A 端点＝远程 RCE**，不能作为默认。M1 即实现：
-   - HTTP 中间件校验 `Authorization: Bearer <token>`（静态 token 表），经 `a2asrv.NewCallContext` 注入 `CallContext.User`，贯穿审计/多租户；
-   - AgentCard 声明 `securitySchemes`（HTTP bearer）+ `securityRequirements`（见 §6.1）；
-   - **安全联锁**：`listen` 非 loopback 且**没有鉴权**（`auth.mode == none`）时**拒绝启动**，除非显式 `allow_insecure: true`（用于反代/网格已鉴权的场景）；任何非 `none` 的鉴权方式都放行。loopback 默认无需鉴权。
-   - **作用域**：Bearer 中间件**只包 JSON-RPC 端点**；卡片与发现端点（`/.well-known/agent-card.json`、`/.well-known/agents.json`、`/agents/{id}/.well-known/agent-card.json`）**公开**——客户端需先取卡才知道鉴权 scheme，且 codebuddy 拉卡时不带 token。
-   **不计划支持** OAuth2 / mTLS / 令牌内省 / 细粒度授权（YAGNI）。按调用方凭据（§10.2 模型 B）不实现；如需按用户额度/计费，起多个 Harbor 实例各用不同 OS 用户。
-2. **上游凭据与登录**：见 **§10**（CLI 自身的 provider 登录/凭据隔离，与本条的服务鉴权是两件事）。
-3. **工作目录沙箱**：所有任务限定在 `sandbox.workdir_root` 内；`allow_outside` 默认 `false`；realpath/前缀校验拒绝 `..` 与 symlink 逃逸（详见 §6.7）。
-4. **环境变量**：**默认继承启动用户环境**（不少 CLI 依赖它）；`sandbox.inherit_env: false` 时仅注入白名单（`PATH`/`HOME`/`LANG`/`LC_ALL`/`TERM`/`TMPDIR`）+ `agents[].env`，以减少凭据暴露。
-5. **危险开关显式化**：`--dangerously-skip-permissions`/`-y`/`bypassPermissions` 只能由部署方在配置（`agents[].allow_dangerous`，默认 `false`）中开启，**无环境变量旁路**，并在启动日志高亮告警。加固（已落地，可选）：`sandbox.require_container_for_dangerous: true` 时，任何 `allow_dangerous` agent 必须在配置了 `sandbox.container` 时才允许启动，否则 `config.Load` 报错拒启。
-6. **可选容器沙箱（已落地）**：`sandbox.container: {image, network, runtime}` 开启后，每个 CLI 进程以 `<runtime> run --rm -i --network <network>` 启动（`Runner`，覆盖 exec/stream-json/acp 及 server 的常驻进程）。**沙箱根**（`workdir_root`、`isolation_root`、`cli_home`）按**宿主原路径**绑定挂载（`-v <path>:<path>`），任务工作目录经 `-w` 指定，故 `PWD` 与各 CLI 配置根在容器内仍有效；环境经 `--env` 逐条转发（含 `inherit_env`/`cli_home` 的结果）。`network` 默认 `none`，`runtime` 默认 `docker`（可设 `podman`）。镜像须自带对应 CLI。取舍：容器内路径与宿主一致，不重写 `inv.Bin`；镜像选择与凭据注入由部署方负责。
-7. **资源限制**：并发上限、CPU/内存（`ulimit`/cgroup）、单任务超时与最大轮次，防止失控循环。
-8. **审计日志**：记录 `user → agent → prompt 摘要 → taskId → 结果状态`，敏感内容可脱敏。
-9. **网络**：CORS 仅允许受信域；AgentCard 可公开但调用接口需鉴权。
+- **Compile-time registration** (adopted): `agent.RegisterAdapter` (`internal/agent/adapter.go`) maintains a `binary name → AdapterBuilder` registry. First-party adapters (the `acp`/`server` of `opencode`/`codebuddy`/`codex`) are registered in the `init()` of `internal/integration/adapters.go`; external/new CLIs register in their own package's `init()` (triggered by a compile-time import).
+- **Go plugin (the `plugin` package)**: `.so` files can be loaded at runtime (**already implemented**, experimental): `plugins: ["/path/x.so"]` opens each plugin at startup and calls its exported `Register()` (which internally uses `agent.RegisterAdapter` to register adapters). Subject to CGO/platform restrictions — available only under `cgo` on linux/darwin/freebsd (`internal/plugins` provides the implementation and degradation via build tags).
+- Everything is exposed uniformly through the registry; the HTTP layer and A2A layer are completely unaware of the specific CLI. config still validates the **configuration shape** (integration value, profile version, argument templates); adapter construction only happens in `integration.New`.
 
 ---
 
-## 10. 上游凭据与 CLI 登录（CLI Auth）
+## 9. Security Design
 
-> 这是被低估的**真正难点**：这些 CLI 要连各自的模型服务，多数需要先登录；且**能力随登录状态变化**（登录后才有完整模型 / agent / 额度）。Harbor 必须把“CLI 的认证”当作一等公民，而不是假定 CLI 已就绪。
+> These CLIs have the ability to read/write files and execute commands; security is the primary constraint.
 
-### 10.1 问题拆解
+1. **Authentication (mandatory in M1; no unauthenticated version)**: these CLIs can execute arbitrary code, so a **reachable unauthenticated A2A endpoint = remote RCE** and cannot be the default. M1 implements:
+   - An HTTP middleware validates `Authorization: Bearer <token>` (static token table) and injects `CallContext.User` via `a2asrv.NewCallContext`, threading through auditing/multi-tenancy;
+   - The AgentCard declares `securitySchemes` (HTTP bearer) + `securityRequirements` (see §6.1);
+   - **Security interlock**: when `listen` is non-loopback **and there is no authentication** (`auth.mode == none`), **refuse to start** unless `allow_insecure: true` is explicitly set (for scenarios where a reverse proxy/mesh already authenticates); any non-`none` authentication method is allowed through. loopback requires no authentication by default.
+   - **Scope**: the Bearer middleware **wraps only the JSON-RPC endpoints**; cards and discovery endpoints (`/.well-known/agent-card.json`, `/.well-known/agents.json`, `/agents/{id}/.well-known/agent-card.json`) are **public** — a client needs the card first to learn the auth scheme, and codebuddy does not carry a token when fetching cards.
+   **Not planned to support** OAuth2 / mTLS / token introspection / fine-grained authorization (YAGNI). Per-caller credentials (model B in §10.2) are not implemented; if per-user quota/billing is needed, start multiple Harbor instances each with a different OS user.
+2. **Upstream credentials and login**: see **§10** (the CLI's own provider login/credential isolation, a separate matter from this item's service authentication).
+3. **Workdir sandbox**: all tasks are confined within `sandbox.workdir_root`; `allow_outside` defaults to `false`; realpath/prefix validation rejects `..` and symlink escape (see §6.7 for details).
+4. **Environment variables**: **by default the launching user's environment is inherited** (many CLIs depend on it); when `sandbox.inherit_env: false`, only a whitelist (`PATH`/`HOME`/`LANG`/`LC_ALL`/`TERM`/`TMPDIR`) + `agents[].env` are injected, to reduce credential exposure.
+5. **Dangerous switches made explicit**: `--dangerously-skip-permissions`/`-y`/`bypassPermissions` can only be enabled by the deployer in the configuration (`agents[].allow_dangerous`, default `false`), with **no environment-variable bypass**, and are highlighted with warnings in the startup log. Hardening (already implemented, optional): when `sandbox.require_container_for_dangerous: true`, any `allow_dangerous` agent may only start if `sandbox.container` is configured; otherwise `config.Load` errors out and refuses to start.
+6. **Optional container sandbox (already implemented)**: when `sandbox.container: {image, network, runtime}` is enabled, each CLI process starts with `<runtime> run --rm -i --network <network>` (the `Runner`, covering exec/stream-json/acp and the long-running process of server). The **sandbox roots** (`workdir_root`, `isolation_root`, `cli_home`) are bind-mounted at their **host original paths** (`-v <path>:<path>`), and the task workdir is specified via `-w`, so `PWD` and each CLI's configuration root remain valid inside the container; the environment is forwarded entry by entry via `--env` (including the results of `inherit_env`/`cli_home`). `network` defaults to `none`, `runtime` to `docker` (can be set to `podman`). The image must ship the corresponding CLI. Trade-off: in-container paths match the host, so `inv.Bin` is not rewritten; image selection and credential injection are the deployer's responsibility.
+7. **Resource limits**: concurrency cap, CPU/memory (`ulimit`/cgroup), per-task timeout and maximum turns, to prevent runaway loops.
+8. **Audit log**: record `user → agent → prompt summary → taskId → result status`, with sensitive content redactable.
+9. **Network**: CORS allows trusted domains only; the AgentCard may be public but the invocation interface requires authentication.
 
-- 凭据形态不同：环境变量（`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`…）、CLI 配置/家目录（`~/.claude`、`$CODEX_HOME`、`~/.config/opencode`、`~/.codebuddy`）、macOS Keychain、长效 token（`claude setup-token`）。
-- 登录方式不同：浏览器 OAuth、设备码、API key。**headless 服务器无法完成浏览器 OAuth**。
-- 凭据会过期/失效 → 需刷新/重登。
-- 多租户下“用谁的账号/额度”。
+---
 
-### 10.2 凭据归属模型（二选一，可混合）
+## 10. Upstream Credentials and CLI Login (CLI Auth)
 
-| 模型 | 说明 | 适用 |
+> This is the underappreciated **real difficulty**: these CLIs must connect to their respective model services, and most require a login first; moreover, **capabilities vary with login state** (the full set of models / agents / quota is available only after login). Harbor must treat "CLI authentication" as a first-class citizen, rather than assuming the CLI is ready.
+
+### 10.1 Problem Breakdown
+
+- Credential forms differ: environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …), CLI configuration/home directories (`~/.claude`, `$CODEX_HOME`, `~/.config/opencode`, `~/.codebuddy`), macOS Keychain, long-lived tokens (`claude setup-token`).
+- Login methods differ: browser OAuth, device code, API key. **A headless server cannot complete browser OAuth**.
+- Credentials expire/become invalid → refresh/re-login is needed.
+- Multi-tenancy: "whose account/quota to use".
+
+### 10.2 Credential Ownership Model (choose one, can be mixed)
+
+| Model | Description | Applicable |
 |---|---|---|
-| **A. 服务级凭据** | Harbor 以某个 OS 用户运行，**每个 CLI 一份**登录票据；所有通过 A2A 鉴权的调用方共享。调用方之间的区分靠鉴权 + 会话（`contextId`）。 | **本项目采用**；多份凭据 → 多个 Harbor 实例（各用不同 OS 用户） |
-| **B. 按调用方凭据** | 每个 A2A 用户用自己的 provider key / 登录态；Harbor 按用户隔离存储或按请求注入。 | **不实现**（见下）；如需按用户额度/计费，用多实例而非进程内多凭据 |
+| **A. Service-level credentials** | Harbor runs as some OS user, with **one login ticket per CLI**; all callers authenticated via A2A share it. Callers are distinguished by authentication + session (`contextId`). | **Adopted by this project**; multiple credentials → multiple Harbor instances (each with a different OS user) |
+| **B. Per-caller credentials** | Each A2A user uses their own provider key / login state; Harbor stores it isolated per user or injects it per request. | **Not implemented** (see below); for per-user quota/billing, use multiple instances rather than in-process multi-credentials |
 
-### 10.3 关键机制：隔离 CLI 的 config/home
+### 10.3 Key Mechanism: Isolating the CLI's config/home
 
-建议让子进程的 CLI config/home 落在 Harbor 管理的目录而非直接读写服务器的真实 `~`（可重定向时；其中 `~` 用 `HOME`/`XDG_*` 等覆盖，Keychain 不可重定向）。主机制是把 CLI 的 config/home 根重定向到 `sandbox.cli_home`（本项目单凭据，一份即可），再按 CLI 叠加专用变量做精确覆盖；默认继承启动用户环境（`inherit_env: true`），设为 `false` 时只注入白名单 + `agents[].env`。
+It is recommended that the child process's CLI config/home live in a Harbor-managed directory rather than directly reading/writing the server's real `~` (when it can be redirected; `~` is overridden with `HOME`/`XDG_*` etc., while Keychain cannot be redirected). The main mechanism is to redirect the CLI's config/home root to `sandbox.cli_home` (single credential for this project, so one suffices), then layer CLI-specific variables on top for precise overrides; by default the launching user's environment is inherited (`inherit_env: true`), and when set to `false` only the whitelist + `agents[].env` are injected.
 
-| CLI | 默认配置根 | 覆盖变量 | 依据 |
+| CLI | Default config root | Override variable | Basis |
 |---|---|---|---|
-| claude | `~/.claude` | `HOME`；`CLAUDE_CONFIG_DIR`；凭据 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | ✅ 二进制变量表确认 |
-| codebuddy | `~/.codebuddy` | `HOME`；`CODEBUDDY_CONFIG_DIR`；凭据 `CODEBUDDY_API_KEY` | ✅ 官方 env-vars 文档 |
-| opencode | `~/.config/opencode` | `HOME` / `XDG_CONFIG_HOME`；`OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` | ✅ 二进制变量表确认 |
-| codex | `$CODEX_HOME`（默认 `~/.codex`） | `CODEX_HOME` | ✅ 由 `codex -h` 确认 |
+| claude | `~/.claude` | `HOME`; `CLAUDE_CONFIG_DIR`; credentials `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | ✅ confirmed by the binary's variable table |
+| codebuddy | `~/.codebuddy` | `HOME`; `CODEBUDDY_CONFIG_DIR`; credential `CODEBUDDY_API_KEY` | ✅ official env-vars docs |
+| opencode | `~/.config/opencode` | `HOME` / `XDG_CONFIG_HOME`; `OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` | ✅ confirmed by the binary's variable table |
+| codex | `$CODEX_HOME` (default `~/.codex`) | `CODEX_HOME` | ✅ confirmed by `codex -h` |
 
 ```
 HOME=<cli_home>
@@ -1014,128 +1024,128 @@ USERPROFILE=<cli_home>               # Windows root
 APPDATA=<cli_home>/AppData/Roaming
 ```
 
-> 优先用 `HOME`（对所有 CLI 生效），专用变量仅作精确覆盖；各 CLI 的启动参数与凭据变量汇总见 §5.4。
+> Prefer `HOME` (effective for all CLIs); dedicated variables are only for precise overrides; see §5.4 for a summary of each CLI's launch arguments and credential variables.
 
-**跨平台（Linux / macOS / Windows）**：隔离**策略**与平台无关，但需三处平台 shim：
+**Cross-platform (Linux / macOS / Windows)**: the isolation **strategy** is platform-independent, but three platform shims are needed:
 
-1. **覆盖的根环境变量不同**：Unix 用 `HOME` + `XDG_*`；Windows 用 `USERPROFILE` + `APPDATA`/`LOCALAPPDATA`。覆盖这些根变量后，CLI 会**在 Harbor 沙箱目录内**自行解析出平台正确的子路径（`~/.claude`、`%APPDATA%\…`）——**不要硬编码绝对路径**。
-2. **OS 凭据库不可重定向**：macOS Keychain / Windows Credential Manager / Linux libsecret 按用户存储，**无法用环境变量隔离**。设计上**回避**依赖它们：优先 env 注入 API key / CLI 专用配置目录，并使用能跳过 Keychain 的模式（如 claude `--bare` 强制 `ANTHROPIC_API_KEY`、不读 Keychain/OAuth）。
-3. **进程控制平台相关**：Unix 用进程组（`Setpgid` + `kill(-pgid)`），Windows 用 Job Object / `taskkill /T`；Runner 以 build tag 分实现（见 §4.4）。
+1. **The root environment variables to override differ**: Unix uses `HOME` + `XDG_*`; Windows uses `USERPROFILE` + `APPDATA`/`LOCALAPPDATA`. After overriding these root variables, the CLI resolves the platform-correct subpaths (`~/.claude`, `%APPDATA%\…`) **inside the Harbor sandbox directory** — **do not hardcode absolute paths**.
+2. **OS credential stores cannot be redirected**: macOS Keychain / Windows Credential Manager / Linux libsecret store per user and **cannot be isolated with environment variables**. The design **avoids** depending on them: prefer env injection of API keys / CLI-specific config directories, and use modes that can skip Keychain (e.g. claude `--bare` forcing `ANTHROPIC_API_KEY` and not reading Keychain/OAuth).
+3. **Process control is platform-specific**: Unix uses process groups (`Setpgid` + `kill(-pgid)`), while Windows uses a Job Object / `taskkill /T`; the Runner implements this by build tag (see §4.4).
 
-> 结论：**架构不依赖平台差异**，差异收敛为“根环境变量 shim + 回避 Keychain + 进程控制 build tag”；部署上建议**每个 agent 固定运行平台**（如 Linux 容器），不追求同一 CLI 跨平台行为一致。
+> Conclusion: **the architecture does not depend on platform differences**; the differences are reduced to "a root environment variable shim + avoiding Keychain + process-control build tags"; for deployment it is recommended to **pin each agent to a fixed platform** (e.g. a Linux container), without pursuing cross-platform behavioral consistency for the same CLI.
 
-### 10.4 凭据注入：非交互模式 + 环境变量
+### 10.4 Credential Injection: Non-interactive Mode + Environment Variables
 
-Harbor 只以**非交互模式**启动 CLI，凭据通过**环境变量**注入（不由 Harbor 运行任何登录命令、不处理 `/login`）。各 CLI 均提供 env 或专用配置根来设置票据（完整启动参数、配置根与网关/模型变量见 **§5.4**）：
+Harbor only starts CLIs in **non-interactive mode**, and credentials are injected via **environment variables** (Harbor does not run any login command or handle `/login`). Each CLI provides an env or dedicated config root for setting the ticket (see **§5.4** for the complete launch arguments, config roots, and gateway/model variables):
 
-| CLI | 主要环境变量 | 配置根 |
+| CLI | Main environment variables | Config root |
 |---|---|---|
-| claude | `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN` | `CLAUDE_CONFIG_DIR`（`--bare`= `CLAUDE_CODE_SIMPLE=1`：不读 Keychain/OAuth，直连鉴权严格取 `ANTHROPIC_API_KEY`） |
-| codebuddy | `CODEBUDDY_API_KEY`（非交互模式 `-p` 始终使用）、`CODEBUDDY_AUTH_TOKEN`、`ANTHROPIC_API_KEY` | `CODEBUDDY_CONFIG_DIR`；`CODEBUDDY_BASE_URL` 可指向自建网关 |
-| opencode | provider key（`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 等）、`OPENCODE_API_KEY`、`OPENCODE_AUTH_CONTENT` | `OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` / `OPENCODE_CONFIG_CONTENT` |
-| codex | `OPENAI_API_KEY`、`CODEX_API_KEY`（非交互 exec/review/SDK）、`CODEX_ACCESS_TOKEN` | `CODEX_HOME`；自建网关只能改 `config.toml`（无 base-url env） |
+| claude | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` | `CLAUDE_CONFIG_DIR` (`--bare` = `CLAUDE_CODE_SIMPLE=1`: does not read Keychain/OAuth, direct authentication strictly uses `ANTHROPIC_API_KEY`) |
+| codebuddy | `CODEBUDDY_API_KEY` (always used in non-interactive `-p` mode), `CODEBUDDY_AUTH_TOKEN`, `ANTHROPIC_API_KEY` | `CODEBUDDY_CONFIG_DIR`; `CODEBUDDY_BASE_URL` can point to a self-hosted gateway |
+| opencode | provider key (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, etc.), `OPENCODE_API_KEY`, `OPENCODE_AUTH_CONTENT` | `OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` / `OPENCODE_CONFIG_CONTENT` |
+| codex | `OPENAI_API_KEY`, `CODEX_API_KEY` (non-interactive exec/review/SDK), `CODEX_ACCESS_TOKEN` | `CODEX_HOME`; a self-hosted gateway can only be changed via `config.toml` (no base-url env) |
 
-- **预置（推荐）**：在带浏览器的机器上完成登录 / 生成 key，把结果以 **secret** 挂载为上述 env 或配置目录；Harbor 不负责交互登录。
-- **BYO（不实现）**：调用方按请求携带 provider key、只注入当次子进程 env——本项目采用单凭据（模型 A），不实现。
-- 明确**不追求**在 headless 上跑浏览器 OAuth 回调。
+- **Pre-provisioned (recommended)**: complete the login / generate the key on a machine with a browser, then mount the result as a **secret** into the above env or config directory; Harbor is not responsible for interactive login.
+- **BYO (not implemented)**: the caller carries the provider key per request and it is injected only into that invocation's child-process env — this project adopts a single credential (model A) and does not implement it.
+- It is explicitly **not a goal** to run browser OAuth callbacks on a headless machine.
 
-### 10.5 登录状态 = 能力状态
+### 10.5 Login State = Capability State
 
-- **实现取舍（重要）**：Harbor **不以票据状态禁用/降级 agent**，也不在启动时按自己的判断跑登录。原因：CLI 的凭据解析是"项目级(cwd) → 主机级 → Keychain → env"的多级过程，Harbor 无法准确复刻；自行猜测会与 CLI 不一致，出现"单独能起 CLI、Harbor 却报错"。因此把 CLI 当权威：任务照常交给 CLI，`.opencode`/`opencode.json` 等项目级配置由 CLI 从工作目录自带解析。
-- `/readyz` 的 `auth` 字段来自 CLI 自身状态命令（claude/codex；opencode/codebuddy 无状态命令则恒真），**仅信息展示**，不影响就绪。
-- 运行中鉴权失效：由 CLI 在任务里报错（当前映射为通用失败；若要精确，可在 adapter 里识别该 CLI 的鉴权错误并映射 `auth_required`）。重新取票由部署方更新注入的 env/secret 完成。
+- **Implementation trade-off (important)**: Harbor **does not disable/degrade agents based on ticket state**, nor does it run logins at startup by its own judgment. Reason: the CLI's credential resolution is a multi-level process of "project-level (cwd) → host-level → Keychain → env", which Harbor cannot accurately replicate; guessing on its own would be inconsistent with the CLI, producing "the CLI starts fine on its own but Harbor errors". Therefore the CLI is treated as authoritative: tasks are handed to the CLI as usual, and project-level configuration such as `.opencode`/`opencode.json` is resolved by the CLI itself from the workdir.
+- The `auth` field of `/readyz` comes from the CLI's own status command (claude/codex; opencode/codebuddy have no status command, so it is always true), and **is for information only**, not affecting readiness.
+- Authentication invalid during runtime: reported by the CLI as an error within the task (currently mapped to a generic failure; for precision, the adapter can recognize that CLI's authentication error and map it to `auth_required`). Re-fetching the ticket is done by the deployer updating the injected env/secret.
 
-### 10.6 凭据存储与生命周期
+### 10.6 Credential Storage and Lifecycle
 
-- 存储：优先**外部 secret（挂载 / KMS / Vault）**；自管理时用主密钥加密落盘；**不依赖服务器 Keychain**。
-- 轮换/删除：支持更新与吊销；登录态目录可整目录清除。
-- 最小暴露：凭据不进日志 / artifact / push；错误信息脱敏。
-- 审计：记录“哪个 user 用哪个 agent 执行了哪个任务”（单凭据模型）。
+- Storage: prefer **external secrets (mount / KMS / Vault)**; when self-managed, encrypt to disk with a master key; **do not depend on the server Keychain**.
+- Rotation/deletion: support update and revocation; the login-state directory can be cleared in its entirety.
+- Minimal exposure: credentials do not enter logs / artifacts / push; error messages are redacted.
+- Auditing: record "which user ran which task with which agent" (single-credential model).
 
-### 10.7 辨析：两个“OAuth2”别混为一谈
+### 10.7 Clarification: Do Not Confuse the Two "OAuth2"s
 
-| | 层 | 作用 | 本项目取舍 |
+| | Layer | Role | This project's choice |
 |---|---|---|---|
-| **Harbor 鉴权** | A2A 客户端 ↔ Harbor | 谁可以调用 Harbor | **只用 Bearer**；不做 OAuth2 资源服务器（§9） |
-| **CLI 登录** | CLI ↔ 模型 provider | CLI 获取 provider 凭据 | 常为 OAuth2 / 设备码 / API key，但**由 CLI 自己完成**；Harbor 不实现 OAuth |
+| **Harbor authentication** | A2A client ↔ Harbor | Who may call Harbor | **Bearer only**; not an OAuth2 resource server (§9) |
+| **CLI login** | CLI ↔ model provider | The CLI obtains provider credentials | Often OAuth2 / device code / API key, but **performed by the CLI itself**; Harbor does not implement OAuth |
 
-- “不支持 OAuth2”**仅指前者**：Harbor 自身不做 OAuth2 资源服务器。
-- Harbor **无需实现 OAuth 客户端**：CLI 以非交互模式运行，凭据由部署方通过 env/secret 注入（§10.4）；token 刷新/生命周期归 CLI（Harbor 只隔离/轮换其 config 目录）。
+- "OAuth2 not supported" **refers only to the former**: Harbor itself is not an OAuth2 resource server.
+- Harbor **need not implement an OAuth client**: the CLI runs in non-interactive mode and credentials are injected by the deployer via env/secret (§10.4); token refresh/lifecycle belongs to the CLI (Harbor only isolates/rotates its config directory).
 
-> M1 范围：**服务级凭据（模型 A）+ CLI home 隔离 + `Probe` 认证探测 + 鉴权失效类型化错误**。按调用方凭据（模型 B）留后续。
+> M1 scope: **service-level credentials (model A) + CLI home isolation + `Probe` auth detection + typed authentication-invalid errors**. Per-caller credentials (model B) are left for later.
 
-**已落地（模型 A，单凭据）**：Harbor 以某个操作系统用户运行，**每个 CLI 只在该系统用户下维护一份登录票据**，所有通过 A2A 鉴权的调用方共用它；调用方之间的区分靠**鉴权（谁能调）+ 会话（`contextId`）**，不做按调用方的凭据隔离。（如需多份凭据，直接起多个 Harbor 实例、各自用不同系统用户。）
+**Already implemented (model A, single credential)**: Harbor runs as some OS user and **maintains only one login ticket per CLI under that OS user**, shared by all A2A-authenticated callers; callers are distinguished by **authentication (who can call) + session (`contextId`)**, with no per-caller credential isolation. (If multiple credentials are needed, simply start multiple Harbor instances, each with a different OS user.)
 
-认证逻辑抽象为 `agent.Authenticator` 接口（`LoggedIn(home, env)` / `StatusArgs` / `LoggedInStatus`），每个 CLI 在 `internal/adapters/` 用自己的文件实现，按二进制名注册（`adapters.AuthFor(binary, version)`）。工厂接收**探得的版本号**，因此当某版本改了状态/输出格式时，只需在**那一个 adapter 文件**里按版本号加兼容分支（`Factory(version)`），不预先构建变体框架、不动其它包。机制：
+The authentication logic is abstracted into the `agent.Authenticator` interface (`LoggedIn(home, env)` / `StatusArgs` / `LoggedInStatus`), implemented by each CLI in its own file under `internal/adapters/`, registered by binary name (`adapters.AuthFor(binary, version)`). The factory receives the **probed version number**, so when a version changes the status/output format, a compatibility branch keyed by version number is added in **that one adapter file** (`Factory(version)`), without pre-building a variants framework or touching other packages. Mechanism:
 
-- **Harbor 不对票据设门槛（关键）**：CLI 才是权威。Harbor **不**在启动时探测票据、**不**自动跑登录（也就不会因 Harbor 自己的判断而"CLI 能起、Harbor 报错"）、**不**因未登录禁用 agent。任务照常交给 CLI，由 CLI 自行决定能否运行（它遵循自己的项目级(cwd)/主机级/Keychain/env 解析）。`integration.Build` 只探测二进制与版本。
+- **Harbor imposes no threshold on tickets (key)**: the CLI is authoritative. Harbor does **not** detect tickets at startup, **does not** automatically run logins (so it will not, based on Harbor's own judgment, produce "CLI starts but Harbor errors"), and **does not** disable an agent because of not being logged in. Tasks are handed to the CLI as usual, and the CLI decides for itself whether it can run (following its own project-level (cwd)/host-level/Keychain/env resolution). `integration.Build` only probes the binary and version.
 
-- **票据定位**：`sandbox.cli_home` 可选——设置时把 **Unix 根** `HOME`/`XDG_*`、**Windows 根** `USERPROFILE`/`APPDATA`/`LOCALAPPDATA` 及 CLI 专用 `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`CODEBUDDY_CONFIG_DIR`/`OPENCODE_CONFIG_DIR` 重定向到该目录；未设置则用系统用户的真实 home/keychain。**项目级配置**由 CLI 从任务工作目录(cwd)读取（`agents[].workdir` 可给默认项目目录，见 §6.7）。
-- **`/readyz`**：就绪 = 熔断关闭；`AuthReady`（CLI 自身状态命令，claude/codex；无状态命令的 opencode/codebuddy 恒真）仅作**信息展示**，不影响就绪判定。
-- **不重复 CLI 的解析逻辑**：Harbor 不建"凭据文件/env 猜测"（那会与 CLI 的项目级/主机级解析不一致，导致误判）。CLI 若确实无法运行，会在任务里报错。
+- **Ticket location**: `sandbox.cli_home` is optional — when set, redirect the **Unix roots** `HOME`/`XDG_*`, the **Windows roots** `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`, and the CLI-specific `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`CODEBUDDY_CONFIG_DIR`/`OPENCODE_CONFIG_DIR` to that directory; when unset, the OS user's real home/keychain is used. **Project-level configuration** is read by the CLI from the task workdir (cwd) (`agents[].workdir` can give a default project directory, see §6.7).
+- **`/readyz`**: ready = breaker closed; `AuthReady` (the CLI's own status command, claude/codex; always true for opencode/codebuddy which have no status command) is **for information only** and does not affect the readiness determination.
+- **Do not duplicate the CLI's resolution logic**: Harbor does not build "credential file/env guessing" (which would be inconsistent with the CLI's project-level/host-level resolution and cause misjudgment). If the CLI truly cannot run, it reports the error within the task.
 
-**刻意不做**：Harbor 不运行任何登录命令、不处理 `/login`——CLI 以非交互模式启动，凭据由部署方通过 env/secret 注入（§10.4）。
+**Deliberately not done**: Harbor does not run any login command and does not handle `/login` — the CLI is started in non-interactive mode and credentials are injected by the deployer via env/secret (§10.4).
 
 ---
 
-## 11. 并发、生命周期与可靠性
+## 11. Concurrency, Lifecycle, and Reliability
 
-| 关注点 | 方案 |
+| Concern | Approach |
 |---|---|
-| 并发 | 每 agent `max_concurrent` 信号量；`a2asrv.WithConcurrencyConfig` 限制总并发。 |
-| 进程清理 | 进程组 kill + `defer`；服务退出时遍历 `procs` 全部回收。 |
-| 崩溃恢复 | TaskStore 持久化；重启后 `GetTask`/`SubscribeToTask` 仍可用；孤儿进程由启动时清理。 |
-| 交互持久化 | **已落地（durable interaction）**：`input-required` 的交互随 TaskStore 持久化，重启后从存储的 input-required 消息**重建交互**（无需内存态），答复优先在原进程写回；进程已失则按 §7.4 降级为 `--resume` 注入答复（有损）。配合 `server.session_store_dir` 持久化 CLI 会话 id，跨重启续跑亦可用。 |
-| 幂等 | **已落地**：按 `messageId` 去重；重复 `message/send` 不重复执行 CLI，而是**重放原 task 的 artifacts/状态**到新 task（新 task 元数据 `harbor.duplicateOf` 指向原 task）。另对已完成 task 的重复消息直接返回其结果。 |
-| 超时 | 空闲超时（无事件）+ 总超时；超时按 `TaskStateFailed` 处理。 |
-| 限流 | 按 (用户,agent) 的令牌桶（已落地）：`server.rate_limit: {per_minute, burst}`；bearer 以 token 哈希为键、匿名以客户端 IP 为键，作用于 JSON-RPC/REST/gRPC，超限 429 / `ResourceExhausted`。 |
-| 优雅停机 | 停止接收新任务 → 等待在途任务或超时强杀 → 关闭监听。 |
+| Concurrency | A `max_concurrent` semaphore per agent; `a2asrv.WithConcurrencyConfig` limits total concurrency. |
+| Process cleanup | Process-group kill + `defer`; on service exit, iterate `procs` and reclaim all. |
+| Crash recovery | TaskStore persistence; after restart `GetTask`/`SubscribeToTask` still work; orphan processes are cleaned up at startup. |
+| Interaction persistence | **Already implemented (durable interaction)**: the `input-required` interaction is persisted with the TaskStore, and after restart is **rebuilt from the stored input-required message** (no in-memory state needed); the answer is preferentially written back to the original process; if the process is gone, it degrades per §7.4 to injecting the answer via `--resume` (lossy). Together with `server.session_store_dir` persisting the CLI session id, resumption across restarts also works. |
+| Idempotency | **Already implemented**: deduplicate by `messageId`; a repeated `message/send` does not re-run the CLI, but instead **replays the original task's artifacts/state** into a new task (the new task metadata `harbor.duplicateOf` points to the original task). A repeated message for an already-completed task also directly returns its result. |
+| Timeouts | Idle timeout (no events) + total timeout; timeouts are handled as `TaskStateFailed`. |
+| Rate limiting | A token bucket per (user, agent) (already implemented): `server.rate_limit: {per_minute, burst}`; the bearer key is the token hash, the anonymous key is the client IP, applied to JSON-RPC/REST/gRPC, with 429 / `ResourceExhausted` on exceeding the limit. |
+| Graceful shutdown | Stop accepting new tasks → wait for in-flight tasks or force-kill on timeout → close listeners. |
 
-### 11.1 失败模式与处理
+### 11.1 Failure Modes and Handling
 
-| 失败 | 检测 | 处理 |
+| Failure | Detection | Handling |
 |---|---|---|
-| 启动时二进制缺失 | `Probe`（**带超时**） | 该 agent 禁用 + WARN；**全部不可用则拒绝启动**（A.9） |
-| 运行时二进制消失 / 不可执行 | `exec.Start()` 返回 errno | `ENOENT`→`cli_not_found`；`EACCES`→`internal`（附 errno）；任务 Failed |
-| 启动即崩溃（缺库 / 架构不符） | 首事件前退出 | Failed + **截断 stderr**（脱敏） |
-| 运行中崩溃（信号 / 非零退出） | `cmd.Wait()` 的 exit/signal | Failed `internal`；**但若已发出 `result`/`Done` 则视为 Completed**（非零退出不覆盖成功结果） |
-| CLI 挂起无输出 | 空闲超时（`limits.idle_timeout`，无事件即触发） | Failed `timeout`；取消 run → 杀进程组 |
-| **用户取消后进程退出** | — | **必须抑制取消后的 `EventError`**（canceled 标志），否则会覆盖 `Canceled` |
-| 反复崩溃 | 连续失败计数 | agent 标记 unhealthy / 熔断，`/readyz` 失败并停止接单 |
-| Harbor 崩溃留孤儿 | 启动扫描（已落地） | `Runner` 把每进程的**进程组**记到 `<state_dir>/procs`（`sandbox.state_dir`，默认临时目录）；进程退出即移除。启动时 `SweepOrphans` 读取记录，**仅当该组命令仍匹配记录的二进制**才杀（防 PID 复用），再清空记录。Windows 不校验故不清理。 |
+| Binary missing at startup | `Probe` (**with timeout**) | The agent is disabled + WARN; **if all are unavailable, refuse to start** (A.9) |
+| Binary disappears / not executable at runtime | `exec.Start()` returns errno | `ENOENT`→`cli_not_found`; `EACCES`→`internal` (with errno); task Failed |
+| Crashes immediately on start (missing library / architecture mismatch) | Exits before the first event | Failed + **truncated stderr** (redacted) |
+| Crashes during run (signal / non-zero exit) | exit/signal from `cmd.Wait()` | Failed `internal`; **but if `result`/`Done` has already been emitted, it is treated as Completed** (non-zero exit does not override a successful result) |
+| CLI hangs with no output | Idle timeout (`limits.idle_timeout`, triggered when there are no events) | Failed `timeout`; cancel the run → kill the process group |
+| **Process exits after user cancellation** | — | **The post-cancel `EventError` must be suppressed** (canceled flag), otherwise it would override `Canceled` |
+| Repeated crashes | Consecutive failure count | The agent is marked unhealthy / circuit-broken; `/readyz` fails and it stops accepting requests |
+| Harbor crashes leaving orphans | Startup scan (already implemented) | The `Runner` records each process's **process group** in `<state_dir>/procs` (`sandbox.state_dir`, default temporary directory); the record is removed when the process exits. At startup `SweepOrphans` reads the records and kills **only when that group's command still matches the recorded binary** (to prevent PID reuse), then clears the records. Windows does not verify and therefore does not clean up. |
 
-要点：
+Key points:
 
-- **errno 分类**：`exec.Start` 的 errno 要映射到 §6.9 错误码，不能一律 `internal`。
-- **取消抑制**：`Runner`/`Session` 维护 `canceled` 标志；`pump` 在取消后不再发 Failed/Completed（避免竞态覆盖）。
-- **部分产出保留**：失败时已产出的 artifact 保留；`TaskStatus.Message` 带 `harbor.errorCode` + 截断 stderr（脱敏）。
-- **熔断纳入健康检查**：unhealthy 状态进 `/readyz`（§10.5、§13）。
+- **errno classification**: the errno from `exec.Start` must be mapped to the §6.9 error codes; it must not all be `internal`.
+- **Cancellation suppression**: the `Runner`/`Session` maintains a `canceled` flag; after cancellation `pump` no longer emits Failed/Completed (to avoid a race overriding the result).
+- **Partial output retention**: on failure, artifacts already produced are retained; `TaskStatus.Message` carries `harbor.errorCode` + truncated stderr (redacted).
+- **Breaker included in health check**: the unhealthy state enters `/readyz` (§10.5, §13).
 
-### 11.2 熔断、退避与健康
+### 11.2 Circuit Breaking, Backoff, and Health
 
-**状态机（每 agent 独立）**：`closed → open → half-open → closed`
+**State machine (independent per agent)**: `closed → open → half-open → closed`
 
 ```
-closed    正常接单；连续失败计数 ++
-open      快速失败（拒绝新任务），持续 cooldown；到期 → half-open
-half-open 放行 1 个探测请求；成功 → closed（计数清零）；失败 → open（cooldown 翻倍，封顶 max）
+closed    accepting normally; consecutive failure count ++
+open      fast-fail (reject new tasks), lasts for cooldown; on expiry → half-open
+half-open allows 1 probe request; success → closed (count reset); failure → open (cooldown doubles, capped at max)
 ```
 
-**计数与阈值**（可配 `limits.breaker`）：
+**Counts and thresholds** (configurable via `limits.breaker`):
 
-- **计为失败**：`cli_not_found`、`internal`（崩溃/启动失败）、连续 `timeout`。
-- **不计**：用户取消（`canceled`）、`unsupported_content`、`workdir_denied`、`input-required` 暂停。
-- 默认：`threshold: 3`（时间窗内连续失败）、`window: 5m`、`cooldown: 30s`、`max_cooldown: 10m`。
+- **Counted as failure**: `cli_not_found`, `internal` (crash/startup failure), consecutive `timeout`.
+- **Not counted**: user cancellation (`canceled`), `unsupported_content`, `workdir_denied`, `input-required` pauses.
+- Defaults: `threshold: 3` (consecutive failures within a time window), `window: 5m`, `cooldown: 30s`, `max_cooldown: 10m`.
 
-**触发后的行为**：
+**Behavior after triggering**:
 
-- 新任务**立即**以 `TaskStateRejected` + `harbor.errorCode=agent_unavailable` 返回（不启动进程，快速失败）。
-- `/readyz` 将该 agent 标 `unhealthy`；**所有** agent 不可用则服务 `not ready`。
-- 熔断期间按 cooldown 后台 `Probe`（或 half-open 探测）自动恢复。
+- New tasks are **immediately** returned with `TaskStateRejected` + `harbor.errorCode=agent_unavailable` (the process is not started; fast-fail).
+- `/readyz` marks that agent `unhealthy`; if **all** agents are unavailable the service is `not ready`.
+- During the breaker period, background `Probe` (or half-open probing) runs according to the cooldown to auto-recover.
 
-**与启动禁用的区别**：启动 `Probe` 失败 = **永久 disabled**（直到配置/环境修复）；运行期熔断 = **临时 open**，可自动恢复。
+**Difference from startup disable**: a startup `Probe` failure = **permanently disabled** (until configuration/environment is fixed); a runtime breaker = **temporarily open**, recoverable automatically.
 
-**任务级隔离**：`a2asrv.WithExecutionPanicHandler` + executor `recover`，单个任务 panic 不影响服务；该任务按 `internal` 计一次失败。
+**Task-level isolation**: `a2asrv.WithExecutionPanicHandler` + executor `recover`, so a single task's panic does not affect the service; that task counts as one failure under `internal`.
 
 ```yaml
 limits:
@@ -1144,27 +1154,27 @@ limits:
 
 ---
 
-## 12. 持久化与状态存储
+## 12. Persistence and State Storage
 
-- **TaskStore**：默认内存；`server.task_store_file` 落盘 JSON。**durable interaction** 依赖它：`input-required` 的交互随 task 持久化，重启后从存储消息重建（§11）。
-- **SessionStore**：`contextId → cliSessionID`；`server.session_store_dir` 时每个 agent 落一份 `<dir>/<id>.json`，使 CLI 会话续跑跨重启可用。
-- **PushConfigStore / Sender**：`a2asrv.WithPushNotifications(store, sender)`；`sender` 为 HTTP webhook 投递（校验 URL 防 SSRF、失败重试）。**已落地**，Card `PushNotifications:true`。
-- **执行日志（已落地，可选）**：`sandbox.raw_stream_dir`（+ `raw_stream_compress`）时，每 task 的原始 stdout/stderr 落盘为 `<taskID>.out/.err(.gz)`，便于回放与排障。
+- **TaskStore**: in-memory by default; `server.task_store_file` persists JSON to disk. **durable interaction** depends on it: the `input-required` interaction is persisted with the task and rebuilt from the stored messages after restart (§11).
+- **SessionStore**: `contextId → cliSessionID`; with `server.session_store_dir`, one `<dir>/<id>.json` is persisted per agent, making CLI session resumption work across restarts.
+- **PushConfigStore / Sender**: `a2asrv.WithPushNotifications(store, sender)`; `sender` delivers an HTTP webhook (validating the URL against SSRF, with retry on failure). **Already implemented**, with Card `PushNotifications:true`.
+- **Execution log (already implemented, optional)**: with `sandbox.raw_stream_dir` (+ `raw_stream_compress`), each task's raw stdout/stderr is persisted as `<taskID>.out/.err(.gz)`, convenient for replay and troubleshooting.
 
 ---
 
-## 13. 可观测性
+## 13. Observability
 
-- **日志**：`log/slog` 结构化日志，`taskId`/`agentID`/`user` 作为字段。
-- **指标**：Prometheus —— 任务数、时长、失败率、每 agent 并发、**熔断状态**（§11.2）、token/费用（若 CLI 上报 usage）。
-- **追踪**：OpenTelemetry，A2A 请求 → CLI 子进程 span。
-- **健康检查**：`/healthz`（服务）、`/readyz`（各 CLI `Probe` + **认证状态**，见 §10.5）。
+- **Logs**: `log/slog` structured logging, with `taskId`/`agentID`/`user` as fields.
+- **Metrics**: Prometheus — task count, duration, failure rate, per-agent concurrency, **breaker state** (§11.2), tokens/cost (if the CLI reports usage).
+- **Tracing**: OpenTelemetry, A2A request → CLI child-process span.
+- **Health checks**: `/healthz` (service), `/readyz` (each CLI's `Probe` + **authentication state**, see §10.5).
 
-**已落地**：`/metrics` 以 Prometheus 文本格式暴露每 agent 的 `harbor_tasks_submitted_total`、`harbor_tasks_total{outcome}`、`harbor_tasks_active`、`harbor_breaker_state`、**任务时长直方图 `harbor_task_duration_seconds`（提交→终态，跨 resume）、`harbor_task_tokens_total{direction}` 与 `harbor_task_cost_usd_total`（由 CLI usage 事件累计）**；`/readyz` 返回 JSON（`{ready, agents{id:{breaker,auth,ready}}}`），agent 就绪 = 熔断关闭 **且** CLI 已认证（§10.5），全部不可用则 503；任务提交/终态经 `log/slog` 审计（`agent`/`task`/`user`/`outcome`）。
+**Already implemented**: `/metrics` exposes, in Prometheus text format, per-agent `harbor_tasks_submitted_total`, `harbor_tasks_total{outcome}`, `harbor_tasks_active`, `harbor_breaker_state`, **the task-duration histogram `harbor_task_duration_seconds` (submission→terminal, across resume), and `harbor_task_tokens_total{direction}` with `harbor_task_cost_usd_total` (accumulated from CLI usage events)**; `/readyz` returns JSON (`{ready, agents{id:{breaker,auth,ready}}}`), where agent readiness = breaker closed **and** CLI authenticated (§10.5), and all unavailable gives 503; task submission/terminal states are audited via `log/slog` (`agent`/`task`/`user`/`outcome`).
 
-**OpenTelemetry 追踪（已落地）**：`telemetry: {endpoint, insecure, service_name}` 配置 OTLP/gRPC 导出（缺省关闭，未配置时用 no-op provider，零开销）。每个 A2A 请求产生 `harbor.task` span（属性 `harbor.agent`/`harbor.task_id`/`harbor.user`，终态时置 `harbor.outcome`；取消走 `harbor.cancel`），CLI 子进程产生其子 span `harbor.cli`（属性 `process.executable.name`/`harbor.workdir`，随进程退出结束）。追踪经全局 `TracerProvider` 注入（`internal/telemetry`），主进程退出时 flush。**指标**：同一 `telemetry.endpoint` 亦导出 OTLP 指标（`harbor.tasks.submitted`/`harbor.tasks{outcome}`/`harbor.tasks.active`/`harbor.task.duration`/`harbor.task.tokens{direction}`/`harbor.task.cost`），与 Prometheus 文本端点并存。**跨进程上下文**：安装 W3C `tracecontext` 传播器，HTTP 中间件从 `traceparent` 头、gRPC 拦截器从 metadata 提取，使 `harbor.task` span 成为调用方 trace 的子 span。
+**OpenTelemetry tracing (already implemented)**: `telemetry: {endpoint, insecure, service_name}` configures OTLP/gRPC export (disabled by default; when unconfigured a no-op provider is used, with zero overhead). Each A2A request produces a `harbor.task` span (attributes `harbor.agent`/`harbor.task_id`/`harbor.user`, setting `harbor.outcome` on terminal state; cancellation goes through `harbor.cancel`), and the CLI child process produces its child span `harbor.cli` (attributes `process.executable.name`/`harbor.workdir`, ending when the process exits). Tracing is injected via the global `TracerProvider` (`internal/telemetry`) and flushed when the main process exits. **Metrics**: the same `telemetry.endpoint` also exports OTLP metrics (`harbor.tasks.submitted`/`harbor.tasks{outcome}`/`harbor.tasks.active`/`harbor.task.duration`/`harbor.task.tokens{direction}`/`harbor.task.cost`), coexisting with the Prometheus text endpoint. **Cross-process context**: the W3C `tracecontext` propagator is installed, extracted by the HTTP middleware from the `traceparent` header and by the gRPC interceptor from metadata, making the `harbor.task` span a child of the caller's trace.
 
-## 14. 目录结构
+## 14. Directory Structure
 
 ```
 harbor/
@@ -1210,7 +1220,7 @@ harbor/
 
 ---
 
-## 15. 配置示例（`agents.yaml`）
+## 15. Configuration Example (`agents.yaml`)
 
 ```yaml
 version: 1
@@ -1326,7 +1336,7 @@ agents:
 
 ---
 
-## 16. 客户端调用示例（验证设计）
+## 16. Client Invocation Example (validating the design)
 
 ```go
 card, _ := agentcard.DefaultResolver.Resolve(ctx, "https://harbor.example.com/agents/codebuddy")
@@ -1339,14 +1349,14 @@ for event, err := range stream {
 }
 ```
 
-命令行验证：
+Command-line validation:
 
 ```bash
 a2a discover https://harbor.example.com/agents/codebuddy
 a2a send https://harbor.example.com/agents/codebuddy "review the current diff"
 ```
 
-codebuddy 作为 A2A 客户端（走聚合发现端点，§6.1.1）：
+codebuddy as an A2A client (via the aggregate discovery endpoint, §6.1.1):
 
 ```sh
 CODEBUDDY_A2A_OUTBOUND_ENABLED=1 \
@@ -1356,89 +1366,89 @@ codebuddy
 
 ---
 
-## 17. 测试策略
+## 17. Testing Strategy
 
-- **假 CLI 夹具**：`testdata/fake-cli` 脚本按预设节奏输出 stream-json，确定性验证 Adapter/Parser/Executor。
-- **单元测试**：各 Parser 的 golden 测试（原始记录 → 期望事件）。
-- **集成测试**：httptest 起 A2A server + 假 CLI，端到端跑 `SendMessage`/`SendStreamingMessage`/`Cancel`/续跑/input-required。
-- **真实 CLI 测试**：build tag `//go:build integration`，本机存在二进制时执行（不进 CI 默认路径）。
-- **并发/取消测试**：注入慢输出，验证 cancel 真的杀掉进程组、任务进入 `Canceled`。
-
----
-
-## 18. 部署与运行
-
-- **单 agent 部署**：一个进程一个 CLI，一个端口一张卡，最简单。
-- **多 agent 部署**：一个进程挂载 `/agents/{id}`，便于统一鉴权、配额与运维；`base_url` 生成卡片 URL。
-- **打包**：静态编译 Go 二进制；CLI 二进制作为运行时依赖（镜像内预装或挂载）。
-- **容器**：推荐每个 agent 独立容器 + 受限文件系统，CLI 凭据以 secret 注入。
+- **Fake CLI fixtures**: the `testdata/fake-cli` scripts emit stream-json at a preset cadence, deterministically validating the Adapter/Parser/Executor.
+- **Unit tests**: golden tests for each Parser (raw record → expected events).
+- **Integration tests**: use httptest to stand up the A2A server + a fake CLI, running `SendMessage`/`SendStreamingMessage`/`Cancel`/resumption/input-required end to end.
+- **Real CLI tests**: build tag `//go:build integration`, executed when the binary exists locally (not on the default CI path).
+- **Concurrency/cancellation tests**: inject slow output to verify that cancel really kills the process group and the task enters `Canceled`.
 
 ---
 
-## 19. 里程碑
+## 18. Deployment and Operation
 
-| 阶段 | 交付 |
+- **Single-agent deployment**: one process per CLI, one port and one card, the simplest.
+- **Multi-agent deployment**: one process mounts `/agents/{id}` for unified authentication, quota, and operations; `base_url` generates the card URL.
+- **Packaging**: statically compile the Go binary; the CLI binaries are runtime dependencies (pre-installed in the image or mounted).
+- **Containers**: one dedicated container per agent with a restricted filesystem is recommended, with CLI credentials injected as secrets.
+
+---
+
+## 19. Milestones
+
+| Phase | Deliverables |
 |---|---|
-| **M1 骨架** | Go module、Adapter/Parser/Runner、Registry、A2A server 装配；**codebuddy（`stream-json`，证明完整架构）+ opencode（`exec`，能力受限）**；**Bearer 鉴权 + 安全联锁**；**CLI home 隔离 + `Probe` 认证探测**（§10）；逐 token 流式；工作目录校验绑定 context（§6.7）。 |
-| **M2 可靠性与测试** | 假 CLI 夹具 + golden 测试；并发配额 / 超时 / 取消；SSE 节流；崩溃恢复、孤儿清理、**熔断/健康**（§11.1/§11.2）。 |
-| **M3 多 Agent 宽度** | codex（独立 JSONL Parser）、generic 配置 Adapter、claude 顺带；多 agent 路由与多卡片。 |
-| **M4 产出与交互完善** | ~~代码变更 artifact（diff / 文件）~~、~~push notifications~~、~~交互规范化（Canonical interaction + `input-required` DataPart + Card 扩展）~~、~~完整交互降级矩阵（question / plan_approval / `--resume` 有损注入）~~、~~durable interaction~~（已落地）。 |
-| **M5 安全与运维** | ~~容器 / worktree 沙箱~~、~~指标~~（Prometheus 文本 + OTLP）、~~审计日志~~（slog）、~~持久化 TaskStore~~（JSON 文件）、~~限流~~、~~危险开关加固~~。 |
-| **M6 进阶** | ~~ACP 集成模式~~（已落地，stdio，含 codebuddy `streamable-http`）、~~server 集成模式（opencode `serve` / codebuddy `--serve` / codex `app-server`）~~（已落地）、~~服务级凭据（§10，模型 A）~~（已落地）、~~编译期 Adapter 注册表（§16 级别 3）~~（已落地）、~~Go plugin 扩展~~（已落地，实验性，§16）、~~REST/gRPC 传输、stdio ACP `session/load`、codex 附件参数、OTLP 指标/跨进程上下文~~（已落地，§7/§13）。 |
+| **M1 Skeleton** | Go module, Adapter/Parser/Runner, Registry, A2A server assembly; **codebuddy (`stream-json`, proving the complete architecture) + opencode (`exec`, capability-limited)**; **Bearer authentication + security interlock**; **CLI home isolation + `Probe` auth detection** (§10); per-token streaming; workdir validation bound to context (§6.7). |
+| **M2 Reliability and testing** | Fake CLI fixtures + golden tests; concurrency quota / timeout / cancellation; SSE throttling; crash recovery, orphan cleanup, **breaker/health** (§11.1/§11.2). |
+| **M3 Multi-agent breadth** | codex (standalone JSONL Parser), generic config Adapter, claude along the way; multi-agent routing and multiple cards. |
+| **M4 Output and interaction refinement** | ~~code-change artifact (diff / file)~~, ~~push notifications~~, ~~interaction normalization (Canonical interaction + `input-required` DataPart + Card extension)~~, ~~complete interaction degradation matrix (question / plan_approval / `--resume` lossy injection)~~, ~~durable interaction~~ (all implemented). |
+| **M5 Security and operations** | ~~container / worktree sandbox~~, ~~metrics~~ (Prometheus text + OTLP), ~~audit log~~ (slog), ~~persistent TaskStore~~ (JSON file), ~~rate limiting~~, ~~dangerous-switch hardening~~. |
+| **M6 Advanced** | ~~ACP integration mode~~ (implemented, stdio, including codebuddy `streamable-http`), ~~server integration mode (opencode `serve` / codebuddy `--serve` / codex `app-server`)~~ (implemented), ~~service-level credentials (§10, model A)~~ (implemented), ~~compile-time Adapter registry (§16 level 3)~~ (implemented), ~~Go plugin extension~~ (implemented, experimental, §16), ~~REST/gRPC transport, stdio ACP `session/load`, codex attachment arguments, OTLP metrics/cross-process context~~ (implemented, §7/§13). |
 
 ---
 
-## 20. 风险与权衡
+## 20. Risks and Trade-offs
 
-| 风险 | 影响 | 缓解 |
+| Risk | Impact | Mitigation |
 |---|---|---|
-| CLI 输出格式不稳定/版本升级 | Parser 解析失败 | 版本探测 + golden 测试 + 宽松解析（未知记录透传 raw）；优先 stream-json 官方格式。 |
-| 权限交互实现复杂 | 无法无人值守 | claude/codebuddy M1 **原生 duplex**；无交互 CLI 用 `--auto`/`allowedTools` 预授权（Card 声明不支持）。 |
-| 进程与凭据安全 | 远程命令执行风险 | 强制鉴权 + 沙箱 + 危险开关显式化。 |
-| `a2a-go` API 仍在演进 | 升级成本 | 用 `/v2` 语义化版本；A2A 层与 Adapter 层解耦，升级只动 `internal/a2a`。 |
-| 长任务与资源占用 | OOM / 失控 | 并发上限、超时、最大轮次、资源限制。 |
-| Go plugin 可移植性差 | 扩展受限 | 主推配置 + 编译期注册；plugin 仅实验。 |
+| CLI output format unstable / version upgrades | Parser parsing failure | Version probing + golden tests + lenient parsing (unknown records are passed through as raw); prefer the official stream-json format. |
+| Permission interaction is complex to implement | Cannot be unattended | claude/codebuddy M1 **native duplex**; non-interactive CLIs use `--auto`/`allowedTools` pre-authorization (the Card declares unsupported). |
+| Process and credential security | Remote command execution risk | Mandatory authentication + sandbox + explicit dangerous switches. |
+| `a2a-go` API still evolving | Upgrade cost | Use `/v2` semantic versioning; the A2A layer and Adapter layer are decoupled, so upgrades only touch `internal/a2a`. |
+| Long tasks and resource usage | OOM / runaway | Concurrency cap, timeout, maximum turns, resource limits. |
+| Poor Go plugin portability | Limited extensibility | Configuration + compile-time registration are the primary path; plugins are experimental only. |
 
 ---
 
-## 21. 结论
+## 21. Conclusion
 
-Harbor 用 **“Adapter 管怎么调、Parser 管怎么读、Runner 管怎么跑、CLIExecutor 管怎么翻译成 A2A”** 的分层，把任意 coding-agent CLI 变成标准 A2A Agent。核心价值在于：
+Harbor uses the layering of **"Adapter handles how to invoke, Parser handles how to read, Runner handles how to run, CLIExecutor handles how to translate into A2A"** to turn any coding-agent CLI into a standard A2A Agent. The core value lies in:
 
-1. **协议标准化**：远程系统通过 A2A 发现并调用专业 Agent，而非绑定某家 CLI。
-2. **可扩展**：新增 CLI 优先改 YAML，其次写 Parser，最后才写 Adapter。
-3. **语义完整**：充分利用 A2A 的流式、`contextId` 续跑、`input-required` 交互、取消与推送。
-4. **能力对齐**：以 Canonical 能力描述符 + 投影 + 显式降级（§7），如实暴露各 CLI 在媒体类型、权限确认、主动澄清等方面的异构能力，既不取最小公分母，也不假装统一。
-5. **边界可控**：机制内建、策略可配（§2.1）；沙箱、鉴权、危险开关均为可配置策略，危险能力 opt-in 且高亮告警。
+1. **Protocol standardization**: remote systems discover and invoke professional Agents through A2A, rather than binding to a particular CLI.
+2. **Extensibility**: adding a CLI prioritizes YAML changes, then a Parser, and only lastly an Adapter.
+3. **Semantic completeness**: fully leverages A2A's streaming, `contextId` resumption, `input-required` interaction, cancellation, and push.
+4. **Capability alignment**: with the Canonical capability descriptor + projection + explicit degradation (§7), it truthfully exposes each CLI's heterogeneous capabilities in media types, permission confirmation, proactive clarification, etc., neither taking the least common denominator nor pretending uniformity.
+5. **Controllable boundaries**: mechanisms built in, policies configurable (§2.1); sandboxing, authentication, and dangerous switches are all configurable policies, with dangerous capabilities opt-in and highlighted with warnings.
 
 ---
 
-## 附录 A：M1 骨架详细设计
+## Appendix A: M1 Skeleton Detailed Design
 
-> 本附录把 M1 落到“可直接开工”的粒度。关键决策已在 **A.12** 全部定案，可直接进入实现。
+> This appendix brings M1 down to a "ready-to-start" granularity. The key decisions are all finalized in **A.12**, so implementation can begin directly.
 
-### A.1 M1 范围与验收标准
+### A.1 M1 Scope and Acceptance Criteria
 
-**范围**：两个 agent —— **codebuddy（`stream-json`，证明完整架构：逐 token 流式 / 会话续跑 / duplex 交互）** + **opencode（`exec`，先打通，能力受限：无 token 流式、无原生 `input-required`）** → 一个可运行的 A2A server，具备流式、取消、contextId 续跑。claude 因与 codebuddy 共用 Parser，可顺带启用。
+**Scope**: two agents — **codebuddy (`stream-json`, proving the complete architecture: per-token streaming / session resumption / duplex interaction)** + **opencode (`exec`, first connectivity, capability-limited: no token streaming, no native `input-required`)** → a runnable A2A server with streaming, cancellation, and contextId resumption. claude can be enabled along the way since it shares the Parser with codebuddy.
 
-**验收清单**：
+**Acceptance checklist**:
 
-- [ ] `go build ./...` 通过；`go vet ./...` 无告警。
-- [ ] `harbor --config examples/agents.yaml` 启动；单个 agent 的 `binary` 不存在时降级为禁用并 WARN；**全部 agent 不可用（或未配置）时拒绝启动**。
-- [ ] `GET /agents/codebuddy/.well-known/agent-card.json` 返回合法 AgentCard（`supportedInterfaces[].url` 指向 `/agents/codebuddy/`（带尾斜杠）、`protocolVersion` 为 A2A v1.0；input/output modes 由 `Capabilities()` 投影）。
-- [ ] 协议版本：请求 `A2A-Version` 非 v1.0 时返回 `ErrVersionNotSupported`，不进入执行。
-- [ ] `GET /.well-known/agents.json` **始终**返回**卡片数组**（每个 agent 一张），且**无需 token**（codebuddy 兼容，§6.1.1）。
-- [ ] codebuddy：`message/send` 返回 `Task`，最终 artifact 含模型文本，状态 `completed`。
-- [ ] codebuddy：`message/stream` 通过 SSE 推送 `TaskArtifactUpdateEvent` 增量（逐 token）。
-- [ ] opencode（`exec`）：`message/send` 返回最终文本 artifact；Card 如实标注**仅 turn 级流式**（不支持 token）、无原生 `input-required`。
-- [ ] `tasks/cancel` 后子进程**进程组**被杀死，任务进入 `canceled`。
-- [ ] codebuddy：同一 `contextId` 第二次请求自动 `--resume <sessionId>`（可通过假 CLI 断言参数）。
-- [ ] `go test ./...` 全绿（依赖 `testdata/fake-cli`，不依赖真实 `codebuddy`/`opencode`）。
-- [ ] 并发超过 `max_concurrent` 时请求排队而非直接拒绝。
-- [ ] 鉴权联锁：非 loopback 且 `auth.mode=none` 时**拒绝启动**，除非 `allow_insecure: true`。
-- [ ] 鉴权作用域：卡片与 `/.well-known/agents.json` **无 token 可访问**；`/agents/{id}/` 的 RPC 无 token 返回 401、带 token 成功；`CallContext.User` 可读。
+- [ ] `go build ./...` passes; `go vet ./...` has no warnings.
+- [ ] `harbor --config examples/agents.yaml` starts; when a single agent's `binary` does not exist it degrades to disabled with WARN; **when all agents are unavailable (or unconfigured) it refuses to start**.
+- [ ] `GET /agents/codebuddy/.well-known/agent-card.json` returns a valid AgentCard (`supportedInterfaces[].url` points to `/agents/codebuddy/` (with trailing slash), `protocolVersion` is A2A v1.0; input/output modes are projected by `Capabilities()`).
+- [ ] Protocol version: when the request `A2A-Version` is not v1.0, `ErrVersionNotSupported` is returned without entering execution.
+- [ ] `GET /.well-known/agents.json` **always** returns a **card array** (one card per agent), and **requires no token** (codebuddy compatibility, §6.1.1).
+- [ ] codebuddy: `message/send` returns a `Task` whose final artifact contains the model text, with status `completed`.
+- [ ] codebuddy: `message/stream` pushes incremental `TaskArtifactUpdateEvent`s over SSE (per token).
+- [ ] opencode (`exec`): `message/send` returns the final text artifact; the Card truthfully states **turn-level streaming only** (no token support) and no native `input-required`.
+- [ ] After `tasks/cancel`, the child process's **process group** is killed and the task enters `canceled`.
+- [ ] codebuddy: a second request with the same `contextId` automatically does `--resume <sessionId>` (assertable via a fake CLI's arguments).
+- [ ] `go test ./...` is all green (depending on `testdata/fake-cli`, not on a real `codebuddy`/`opencode`).
+- [ ] When concurrency exceeds `max_concurrent`, requests queue rather than being rejected outright.
+- [ ] Auth interlock: when non-loopback and `auth.mode=none`, **refuse to start** unless `allow_insecure: true`.
+- [ ] Auth scope: cards and `/.well-known/agents.json` are **accessible without a token**; `/agents/{id}/` RPC returns 401 without a token and succeeds with one; `CallContext.User` is readable.
 
-### A.2 文件清单（M1 实际将创建）
+### A.2 File List (what M1 will actually create)
 
 ```
 harbor/
@@ -1483,7 +1493,7 @@ go 1.27
 require github.com/a2aproject/a2a-go/v2 v2.6.0
 ```
 
-### A.4 核心接口（M1 定稿）
+### A.4 Core Interfaces (M1 finalized)
 
 ```go
 package agent
@@ -1523,9 +1533,9 @@ func RegisterAdapter(id string, f func(cfg AdapterConfig) (Adapter, error))
 func NewAdapter(id string, cfg AdapterConfig) (Adapter, error)
 ```
 
-> 上表的 `Adapter/Parser` 是 **line-based 模式**的内部实现；M1 的**核心契约**是 §4.5 的 `Launcher.Start → Session{Events,Send,Cancel}`，Executor 只依赖后者（见 §6.3）。
+> The `Adapter/Parser` above are the internal implementation of the **line-based mode**; M1's **core contract** is the `Launcher.Start → Session{Events,Send,Cancel}` of §4.5, and the Executor depends only on the latter (see §6.3).
 
-### A.5 配置结构（M1 只需这些字段）
+### A.5 Configuration Structures (M1 needs only these fields)
 
 ```go
 package config
@@ -1598,8 +1608,20 @@ type AgentConfig struct {
     FileArgs         []string         `yaml:"file_args"`          // exec: file attachments ({{.File}})
     ImageArgs        []string         `yaml:"image_args"`         // exec: image attachments ({{.Image}}), e.g. codex ["-i","{{.Image}}"]
     InputImage       []string         `yaml:"input_image"`        // accepted image MIME types (default from the profile)
+    Description      string           `yaml:"description"`        // card description override (default template when empty)
+    Skills           []SkillConfig    `yaml:"skills"`             // card skills override (replace; generic single skill when empty)
     Session        SessionConfig     `yaml:"session"`
     Limits         LimitsConfig      `yaml:"limits"`
+}
+
+type SkillConfig struct {
+    ID          string   `yaml:"id"`           // required
+    Name        string   `yaml:"name"`         // required
+    Description string   `yaml:"description"`  // required
+    Tags        []string `yaml:"tags"`
+    Examples    []string `yaml:"examples"`
+    InputModes  []string `yaml:"input_modes"`
+    OutputModes []string `yaml:"output_modes"`
 }
 
 type SessionConfig struct {
@@ -1625,9 +1647,9 @@ type BreakerConfig struct {
 }
 ```
 
-> 与 §15 的 YAML 一一对应；`Defaults & validation` 在 `config.Load` 中完成（如 `isolation` 缺省 `shared`、非 loopback 必须有 `auth`）。
+> This corresponds one-to-one with the YAML of §15; `Defaults & validation` are performed in `config.Load` (e.g. `isolation` defaults to `shared`, and a non-loopback bind must have `auth`).
 
-### A.6 Runner 实现要点
+### A.6 Runner Implementation Points
 
 ```go
 type Process struct {
@@ -1709,9 +1731,9 @@ func (r *Runner) Stdin(taskID string) io.WriteCloser {
 }
 ```
 
-### A.6b line-based Launcher/Session 骨架
+### A.6b line-based Launcher/Session Skeleton
 
-`Session` 是 Executor 唯一依赖的契约；line-based 模式把它接到 Runner 的输出与进程 stdin。
+`Session` is the only contract the Executor depends on; the line-based mode wires it to the Runner's output and the process stdin.
 
 ```go
 type lineSession struct {
@@ -1743,7 +1765,7 @@ func (l *lineLauncher) Start(ctx context.Context, req *Request) (Session, error)
 }
 ```
 
-> 对应 `Adapter.Capabilities()` 中 `InputRequiredResume=true` 的 CLI（claude/codebuddy）；`exec` 单向模式的 `Send` 可直接返回 `ErrUnsupportedOperation`。
+> Corresponds to CLIs with `InputRequiredResume=true` in `Adapter.Capabilities()` (claude/codebuddy); for the one-way `exec` mode, `Send` can directly return `ErrUnsupportedOperation`.
 
 ### A.7 codebuddy Adapter + stream-json Parser
 
@@ -1778,7 +1800,7 @@ func (a *codebuddyAdapter) Invocation(req *Request) (*Invocation, error) {
 }
 ```
 
-> 对应 `Session.Send`：任务进行中把权限/澄清答复再编码为 stream-json 写入同一 stdin；`--input-format stream-json` 允许同一进程收发多轮。
+> Corresponds to `Session.Send`: during a task, permission/clarification answers are re-encoded as stream-json and written to the same stdin; `--input-format stream-json` allows the same process to send and receive multiple rounds.
 
 ```go
 // parser.go: recognizes stream-json events (shared by codebuddy/claude)
@@ -1834,11 +1856,11 @@ func (p *streamJSONParser) Parse(rec []byte, out func(Event)) error {
 }
 ```
 
-> 说明：`--include-partial-messages` 产生 `stream_event`/`content_block_delta` 逐 token 增量；M1 **默认开启**以保证实时体验（见 A.12-Q1），Parser 对增量做合并节流后发 `TaskArtifactUpdateEvent`。
+> Note: `--include-partial-messages` produces `stream_event`/`content_block_delta` per-token increments; M1 **enables it by default** for a real-time experience (see A.12-Q1), and the Parser coalesces/throttles the increments before emitting `TaskArtifactUpdateEvent`.
 
-### A.8 CLIExecutor 骨架
+### A.8 CLIExecutor Skeleton
 
-即正文 §6.3 的实现；M1 额外补充：
+This is the implementation of §6.3 in the main text; M1 additionally adds:
 
 ```go
 func (e *CLIExecutor) toRequest(ctx context.Context, ec *a2asrv.ExecutorContext) (*agent.Request, error) {
@@ -1859,11 +1881,11 @@ func (e *CLIExecutor) toRequest(ctx context.Context, ec *a2asrv.ExecutorContext)
 }
 ```
 
-> 元数据键统一见 **§6.9**。若任务已处于 `input-required`，`Execute` 走 `Session.Send(answerFrom(ec.Message))` 分支，不经此处。
+> Metadata keys are unified in **§6.9**. If the task is already in `input-required`, `Execute` takes the `Session.Send(answerFrom(ec.Message))` branch and does not go through here.
 
-任务 key：用 `execCtx.TaskID()` 关联 Runner 中的进程，供 `Cancel` 精确 kill。
+Task key: use `execCtx.TaskID()` to associate with the process in the Runner, so `Cancel` can kill it precisely.
 
-### A.9 server 装配（cmd/harbor/main.go）
+### A.9 server Assembly (cmd/harbor/main.go)
 
 ```go
 func main() {
@@ -1915,11 +1937,11 @@ func main() {
 }
 ```
 
-> 关键三点：**① 一次构建 `[]*AgentCard` 复用**（不再需要 `Launcher.Info()`）；**② 端点与卡片 url 都带尾斜杠 `/agents/{id}/`**（与参考实现一致，否则客户端 POST 会 404）；**③ 鉴权按路由施加**（只包 RPC），卡片与聚合端点公开。
+> Three key points: **① build `[]*AgentCard` once and reuse** (no longer needing `Launcher.Info()`); **② both the endpoint and the card url carry the trailing slash `/agents/{id}/`** (consistent with the reference implementation, otherwise a client POST gets a 404); **③ authentication is applied per route** (wrapping only RPC), with cards and the aggregate endpoint public.
 
-### A.10 假 CLI 与测试
+### A.10 Fake CLI and Tests
 
-`testdata/fake-cli/fake-codebuddy.sh`：解析参数（回显 `--resume` 是否存在）、按间隔输出 NDJSON：
+`testdata/fake-cli/fake-codebuddy.sh`: parses arguments (echoing whether `--resume` exists) and emits NDJSON at intervals:
 
 ```bash
 #!/usr/bin/env bash
@@ -1934,18 +1956,18 @@ echo '{"type":"result","subtype":"success","result":"Hello world","session_id":"
 
 `testdata/fake-cli/fake-opencode.sh` (exec/text, simulating chunked stdout).
 
-测试用例（`e2e_test.go`，用 httptest + 上述脚本，通过配置 `binary` 指向脚本）：
+Test cases (`e2e_test.go`, using httptest + the above scripts, with the `binary` configured to point at the scripts):
 
-- `TestSendMessage_codebuddy`：断言最终 artifact 文本为 `Hello world`，状态 `completed`。
-- `TestStreaming_codebuddy`：断言收到 ≥1 个 `TaskArtifactUpdateEvent`（逐 token）。
-- `TestSessionResume_codebuddy`：第一次后拿到 `sess-123`，第二次请求断言脚本收到 `--resume sess-123`（脚本把 argv 写入临时文件供断言）。
-- `TestSendMessage_opencode`：exec 模式最终文本 artifact 正确，Card 标注仅 turn 级流式、无 `input-required`。
-- `TestCancel`：脚本 `sleep 30`，调用 cancel，断言进程退出且状态 `canceled`。
-- `TestVersionMismatch`：请求带非 v1.0 的 `A2A-Version`，断言返回 `ErrVersionNotSupported` 且未启动 CLI。
-- `TestDiscoveryAggregate`：`GET /.well-known/agents.json` 返回数组（长度 = agent 数），**无 token 也 200**（codebuddy 兼容）。
-- `TestAuthScope`：Bearer 模式下，卡片与聚合端点无 token 返回 200，`/agents/{id}/` RPC 无 token 返回 401。
+- `TestSendMessage_codebuddy`: assert the final artifact text is `Hello world` and the status is `completed`.
+- `TestStreaming_codebuddy`: assert ≥1 `TaskArtifactUpdateEvent` is received (per token).
+- `TestSessionResume_codebuddy`: obtain `sess-123` after the first call, then assert on the second request that the script received `--resume sess-123` (the script writes argv to a temporary file for assertion).
+- `TestSendMessage_opencode`: in exec mode the final text artifact is correct, and the Card states turn-level streaming only and no `input-required`.
+- `TestCancel`: the script does `sleep 30`; call cancel and assert the process exits and the status is `canceled`.
+- `TestVersionMismatch`: a request with a non-v1.0 `A2A-Version` asserts that `ErrVersionNotSupported` is returned and no CLI is started.
+- `TestDiscoveryAggregate`: `GET /.well-known/agents.json` returns an array (length = number of agents), and is **200 even without a token** (codebuddy compatibility).
+- `TestAuthScope`: in Bearer mode, cards and the aggregate endpoint return 200 without a token, while `/agents/{id}/` RPC returns 401 without a token.
 
-### A.11 运行 / 验证命令
+### A.11 Run / Validation Commands
 
 ```bash
 go build ./...
@@ -1956,14 +1978,14 @@ a2a send http://localhost:8080/agents/codebuddy "say hello"
 a2a send http://localhost:8080/agents/opencode  "list files"
 ```
 
-### A.12 关键决策记录（已定）
+### A.12 Key Decision Record (finalized)
 
-1. **流式粒度（已定，M1）**：默认**逐 token 流式**（claude/codebuddy 加 `--include-partial-messages`），避免“半天没反应”；对增量 `TaskArtifactUpdateEvent` 做**合并节流**（~50–100ms 或每 N 字符 flush），既保实时又不刷爆 SSE；无 partial 能力的 CLI 用 status/工具事件做 activity 心跳。（原“先按轮次、M2 再 partial”的建议作废。）
-2. **prompt 传递方式（已定，M1）**：claude/codebuddy **直接用 `--input-format stream-json` + stdin**，prompt 作为首条 stream-json user message 写入 stdin，**不用位置参数**。理由：① 这是唯一能原生支持 `input-required`（权限/澄清）双向应答的形态，与 §4.5 的 `Session.Send` 契约一致；② 规避 argv 长度/转义限制，天然承载 §7.5 的结构化/多模态输入；③ 用位置参数＝一次性 Session，`Send` 无法实现，等于把 §7.4 的降级路径焊死、后期必返工。故**不因“简单”而选位置参数**。（仅当 CLI 无结构化输入能力时才退回文本，如 codex `exec` 经 stdin 传 prompt。）
-3. **工作目录（已定）**：以 `Message.Metadata["harbor.workDir"]` 为主来源，realpath 校验必须落在 `workdir_root` 内，并**绑定到 `contextId`**（`--resume` 复用同一工作树）；未指定时按 context 分配 scratch 子目录；并发隔离用 `worktree`/目录锁策略（详见 §6.7）。
-4. **鉴权（已定）**：M1 即实现 **Bearer 静态 token 中间件**（注入 `CallContext.User`），并加**安全联锁**：`listen` 非 loopback 且 `auth.mode=none` 时拒绝启动，除非显式 `allow_insecure: true`（反代/网格已鉴权）。**OAuth2 / mTLS / 细粒度授权明确不支持**（YAGNI）。CLI 自身的 provider 登录见 §10。理由：可达的无鉴权端点＝远程 RCE，不能作为默认，且 M1 完成 AgentCard 的 `securitySchemes`。
-5. **危险开关（已定）**：`allow_dangerous` 是**纯配置项**（`agents[].allow_dangerous`，默认 `false`），由部署方显式设置；**不提供环境变量旁路**（隐藏开关会破坏“显式 opt-in + 可审计”）。本地调试请用独立的 debug config 文件。加固（已落地）：`sandbox.require_container_for_dangerous: true` 时，`allow_dangerous: true` 要求同时开启容器沙箱，否则 `config.Load` 拒绝启动。
-6. **模块路径/命名（已定）**：`github.com/jiaweisky/harbor`（对应 repo `https://github.com/jiaweisky/harbor.git`）。
-7. **codex 适配（已定，M3）**：已确认非交互入口 `codex exec`、事件流 `--json`（JSONL）、结构化输出 `--output-schema`、常驻 `app-server`、续跑 `codex exec resume`。**为何需独立 Parser**：JSONL 只是分帧，codex 的 item/turn 事件 schema 与 claude 的 message/`content_block`  schema 不同，Parser 必须先归一化，配置/正则无法可靠映射嵌套事件（仅多注册一个 Parser，其余全部复用）。**为何不在 M1**：M1 追求“用最少的 adapter 打通链路”，codebuddy 的 stream-json 覆盖构造最全且与 claude 共用 Parser，投入即覆盖 2 个 agent；codex 只增宽度、不验证新架构点，故归 M3「多 Agent」。可按需提前到 M2。
-8. **能力模型落地范围（已定，M1）**：M1 即引入 `Capabilities` 类型与 `Adapter.Capabilities()`，由 AgentCard 投影读取；**只填 M1 用到的字段**（文本 in/out、逐 token 流式、会话续跑、权限模型），其余留默认零值。理由：能力从第一天就是单一事实来源（§7.2），避免 M2 返工；成本仅多一个结构体，非过度设计。
-9. **CLI 凭据模型（已定）**：采用**服务级凭据（模型 A）**——Harbor 以某个 OS 用户运行，每个 CLI 一份登录票据，所有鉴权通过的调用方共享；调用方隔离靠鉴权 + 会话（`contextId`）。**Harbor 不对票据设门槛**：不启动探测、不自动登录、不因未登录禁用 agent——CLI 是权威，其项目级/主机级/Keychain/env 解析由 CLI 自己完成（详见 §10.5）。凭据由部署方通过 env/secret 注入（§10.4）；Harbor 不运行登录命令。**不实现**按调用方凭据（模型 B）与按请求 BYO 注入；如需多份凭据，起多个 Harbor 实例各用不同 OS 用户。
+1. **Streaming granularity (finalized, M1)**: by default **per-token streaming** (claude/codebuddy add `--include-partial-messages`), avoiding "no response for ages"; incremental `TaskArtifactUpdateEvent`s are **coalesced/throttled** (~50–100ms or flush every N characters), preserving real-time behavior without flooding SSE; CLIs without partial capability use status/tool events as activity heartbeats. (The earlier suggestion of "turn-based first, partial in M2" is void.)
+2. **Prompt passing method (finalized, M1)**: claude/codebuddy **directly use `--input-format stream-json` + stdin**, with the prompt written to stdin as the first stream-json user message and **no positional arguments**. Reasons: ① this is the only form that natively supports `input-required` (permission/clarification) bidirectional answering, consistent with the `Session.Send` contract of §4.5; ② it avoids argv length/escaping limits and naturally carries the structured/multimodal input of §7.5; ③ using positional arguments = a one-shot Session, making `Send` impossible, which would weld shut the degradation path of §7.4 and force rework later. Therefore positional arguments are **not chosen for being "simpler"**. (Text is fallen back to only when the CLI has no structured-input capability, e.g. codex `exec` passing the prompt via stdin.)
+3. **Workdir (finalized)**: `Message.Metadata["harbor.workDir"]` is the primary source; the realpath validation must fall within `workdir_root`, and it is **bound to `contextId`** (`--resume` reuses the same working tree); when unspecified, a scratch subdirectory is allocated per context; concurrent isolation uses the `worktree`/directory-lock strategy (see §6.7 for details).
+4. **Authentication (finalized)**: M1 implements the **Bearer static token middleware** (injecting `CallContext.User`) and adds a **security interlock**: when `listen` is non-loopback and `auth.mode=none`, refuse to start unless `allow_insecure: true` is explicit (reverse proxy/mesh already authenticates). **OAuth2 / mTLS / fine-grained authorization are explicitly unsupported** (YAGNI). The CLI's own provider login is in §10. Reason: a reachable unauthenticated endpoint = remote RCE and cannot be the default, and M1 completes the AgentCard's `securitySchemes`.
+5. **Dangerous switch (finalized)**: `allow_dangerous` is a **pure configuration item** (`agents[].allow_dangerous`, default `false`), set explicitly by the deployer; **no environment-variable bypass is provided** (a hidden switch would break "explicit opt-in + auditable"). For local debugging, use a separate debug config file. Hardening (already implemented): when `sandbox.require_container_for_dangerous: true`, `allow_dangerous: true` requires the container sandbox to be enabled at the same time, otherwise `config.Load` refuses to start.
+6. **Module path/naming (finalized)**: `github.com/jiaweisky/harbor` (corresponding to the repo `https://github.com/jiaweisky/harbor.git`).
+7. **codex adaptation (finalized, M3)**: confirmed the non-interactive entry `codex exec`, event stream `--json` (JSONL), structured output `--output-schema`, long-running `app-server`, and resumption `codex exec resume`. **Why a standalone Parser is needed**: JSONL is only framing; codex's item/turn event schema differs from claude's message/`content_block` schema, so a Parser must first normalize it, and configuration/regex cannot reliably map nested events (only one more Parser is registered; everything else is reused). **Why not in M1**: M1 pursues "connecting the chain with the fewest adapters"; codebuddy's stream-json covers the most complete construction and shares the Parser with claude, so the effort covers 2 agents at once; codex only adds breadth and does not validate new architecture points, so it belongs to M3 "Multi-Agent". It can be moved up to M2 as needed.
+8. **Capability model adoption scope (finalized, M1)**: M1 introduces the `Capabilities` type and `Adapter.Capabilities()`, read by AgentCard projection; **only the fields used by M1 are filled** (text in/out, per-token streaming, session resumption, permission model), and the rest are left at default zero values. Reason: capabilities are the single source of truth from day one (§7.2), avoiding M2 rework; the cost is just one more struct, not over-engineering.
+9. **CLI credential model (finalized)**: adopt **service-level credentials (model A)** — Harbor runs as some OS user, with one login ticket per CLI, shared by all authenticated callers; caller isolation relies on authentication + session (`contextId`). **Harbor imposes no threshold on tickets**: no startup detection, no automatic login, no disabling an agent because of not being logged in — the CLI is authoritative, and its project-level/host-level/Keychain/env resolution is done by the CLI itself (see §10.5 for details). Credentials are injected by the deployer via env/secret (§10.4); Harbor does not run login commands. Per-caller credentials (model B) and per-request BYO injection are **not implemented**; if multiple credentials are needed, start multiple Harbor instances each with a different OS user.

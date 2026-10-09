@@ -1122,6 +1122,39 @@ func TestCardVersion(t *testing.T) {
 	}
 }
 
+// TestCardOverride verifies the configured description and skills appear on the
+// card.
+func TestCardOverride(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
+	info := agent.Info{
+		Name: "cb", DisplayName: "CodeBuddy", Description: "My CodeBuddy",
+		Skills: []agent.Skill{{
+			ID: "code-review", Name: "Code review", Description: "Review a diff for issues",
+			Tags: []string{"review", "quality"}, Examples: []string{"review this diff"},
+		}},
+	}
+	card := bridge.BuildCard(ln, info, "http://example/agents/cb/", false)
+	if card.Description != "My CodeBuddy" {
+		t.Fatalf("description = %q", card.Description)
+	}
+	if len(card.Skills) != 1 || card.Skills[0].ID != "code-review" || card.Skills[0].Name != "Code review" {
+		t.Fatalf("skills = %+v", card.Skills)
+	}
+	if card.Skills[0].Description != "Review a diff for issues" {
+		t.Fatalf("skill description = %q", card.Skills[0].Description)
+	}
+}
+
+// TestCardNoSkills verifies no skills are advertised when none are configured,
+// while the field itself stays present (non-nil, empty).
+func TestCardNoSkills(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
+	card := bridge.BuildCard(ln, agent.Info{Name: "cb", DisplayName: "CodeBuddy"}, "http://example/agents/cb/", false)
+	if card.Skills == nil || len(card.Skills) != 0 {
+		t.Fatalf("skills = %+v, want an empty (non-nil) slice", card.Skills)
+	}
+}
+
 func TestCardDeclaresInteractionExtension(t *testing.T) {
 	acpLn := newLauncher(t, scriptPath(t, "fake-acp.sh"), "acp", nil, nil)
 	acpCard := bridge.BuildCard(acpLn, acpLn.Probe(context.Background()), "http://example/agents/a/", false)
@@ -1708,9 +1741,6 @@ func TestCardUsesDisplayName(t *testing.T) {
 	card := bridge.BuildCard(ln, info, "http://example/agents/cb/", false)
 	if card.Name != "Harbor/CodeBuddy Pro" {
 		t.Fatalf("card name = %q", card.Name)
-	}
-	if len(card.Skills) != 1 || card.Skills[0].ID != ln.Name() {
-		t.Fatalf("skill id should stay the agent id: %+v", card.Skills)
 	}
 }
 

@@ -5,14 +5,28 @@ import (
 	"io"
 )
 
-// Info describes a probed CLI binary.
+// Info describes a probed CLI binary and the operator-supplied card overrides.
 type Info struct {
 	Name        string
 	DisplayName string
+	Description string // card description override; empty uses the default template
+	Skills      []Skill
 	Version     string
 	Path        string
 	Enabled     bool
 	Err         error
+}
+
+// Skill is one capability advertised on the agent card. It is configured by the
+// operator; Harbor does not infer skills from the CLI.
+type Skill struct {
+	ID          string
+	Name        string
+	Description string
+	Tags        []string
+	Examples    []string
+	InputModes  []string
+	OutputModes []string
 }
 
 // Request is a normalized invocation request (A2A -> adapter).

@@ -196,15 +196,33 @@ type AgentConfig struct {
 	// InputImage lists the image MIME types this agent accepts; unset uses the
 	// CLI profile's list. They are sent as native content blocks when the
 	// integration supports structured input, otherwise via ImageArgs.
-	InputImage []string      `yaml:"input_image"`
-	Version    string        `yaml:"version"` // optional card version override; skips probing
-	Session    SessionConfig `yaml:"session"`
-	Limits     LimitsConfig  `yaml:"limits"`
+	InputImage []string `yaml:"input_image"`
+	// Description overrides the agent card's description. Empty uses the default
+	// template ("Remote A2A wrapper for the <name> coding agent CLI").
+	Description string `yaml:"description"`
+	// Skills lists the skills advertised on the agent card. When empty, no
+	// skills are advertised (the A2A "skills" field is still present).
+	Skills  []SkillConfig `yaml:"skills"`
+	Version string        `yaml:"version"` // optional card version override; skips probing
+	Session SessionConfig `yaml:"session"`
+	Limits  LimitsConfig  `yaml:"limits"`
 }
 
 // RegexConfig configures the regex parser.
 type RegexConfig struct {
 	Text string `yaml:"text"`
+}
+
+// SkillConfig is one AgentSkill advertised on an agent's card. id, name, and
+// description are required; tags/examples/modes are optional.
+type SkillConfig struct {
+	ID          string   `yaml:"id"`
+	Name        string   `yaml:"name"`
+	Description string   `yaml:"description"`
+	Tags        []string `yaml:"tags"`
+	Examples    []string `yaml:"examples"`
+	InputModes  []string `yaml:"input_modes"`
+	OutputModes []string `yaml:"output_modes"`
 }
 
 // Profile describes a known coding-agent CLI: which integrations it supports,
@@ -499,6 +517,11 @@ func validateAgent(i int, a *AgentConfig) error {
 			"agent %q: server_protocol must be one of %q, %q, %q; got %q",
 			a.ID, ServerProtocolHTTP, ServerProtocolACP, ServerProtocolACPStreamableHTTP, a.ServerProtocol,
 		)
+	}
+	for j, s := range a.Skills {
+		if s.ID == "" || s.Name == "" || s.Description == "" {
+			return fmt.Errorf("agent %q: skills[%d] requires id, name, and description", a.ID, j)
+		}
 	}
 	return nil
 }
