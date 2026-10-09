@@ -33,7 +33,6 @@ const (
 	codeInternal           = "internal"
 	codeCLINotFound        = "cli_not_found"
 	codeUnsupportedContent = "unsupported_content"
-	codeWorkdirDenied      = "workdir_denied"
 	codeTimeout            = "timeout"
 	codeMaxTurns           = "max_turns"
 	codeAgentUnavailable   = "agent_unavailable"
@@ -416,7 +415,7 @@ func (e *CLIExecutor) resumeFresh(
 		yield(failedStatus(ec, codeInternal, "session lost"), nil)
 		return
 	}
-	dir, err := e.workspace.Resolve(contextKey(ec), metaString(mergeMetadata(ec), "harbor.workDir"))
+	dir, err := e.workspace.Resolve(contextKey(ec))
 	if err != nil {
 		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
 		return
@@ -775,7 +774,7 @@ func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emi
 	if !ok {
 		return
 	}
-	dir, err := e.workspace.Resolve(contextKey(ec), metaString(mergeMetadata(ec), "harbor.workDir"))
+	dir, err := e.workspace.Resolve(contextKey(ec))
 	if err != nil || dir == "" {
 		return
 	}
@@ -930,7 +929,7 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 // and request-level metadata (request-level wins).
 func (e *CLIExecutor) toRequest(ec *a2asrv.ExecutorContext) (*agent.Request, error) {
 	meta := mergeMetadata(ec)
-	dir, err := e.workspace.Resolve(contextKey(ec), metaString(meta, "harbor.workDir"))
+	dir, err := e.workspace.Resolve(contextKey(ec))
 	if err != nil {
 		return nil, err
 	}
@@ -1055,8 +1054,6 @@ func codeForRequestError(err error) string {
 	switch {
 	case errors.Is(err, errNoText), errors.Is(err, errUnsupportedContent):
 		return codeUnsupportedContent
-	case errors.Is(err, workspace.ErrDenied):
-		return codeWorkdirDenied
 	default:
 		return codeInternal
 	}

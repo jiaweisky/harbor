@@ -261,20 +261,19 @@ agents:
 	}
 }
 
-func TestWorkdirRootMustExist(t *testing.T) {
+func TestAgentWorkdirMustExist(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
-sandbox:
-  workdir_root: /no/such/harbor-dir-xyz
 agents:
   - id: oc
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    workdir: /no/such/harbor-dir-xyz
 `)
 	_, err := config.Load(path)
-	if err == nil || !strings.Contains(err.Error(), "workdir_root") {
-		t.Fatalf("expected a workdir_root error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "workdir") {
+		t.Fatalf("expected a workdir error, got %v", err)
 	}
 }
 

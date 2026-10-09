@@ -1,10 +1,10 @@
-// Package workspace resolves and confines the working directory of a task.
+// Package workspace resolves the working directory of a task and, optionally,
+// provides a per-context working copy for isolation.
 package workspace
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,10 +14,6 @@ import (
 	"sync"
 )
 
-// ErrDenied indicates a working directory failed validation (outside the root,
-// missing, or otherwise unusable).
-var ErrDenied = errors.New("workdir denied")
-
 // Isolation strategies.
 const (
 	IsolationShared   = "shared"
@@ -25,56 +21,48 @@ const (
 	IsolationCopy     = "copy"
 )
 
-// Resolver maps a requested working directory to a confined absolute path. A
-// resolver with an empty root performs no confinement.
+// Resolver returns the working directory for a task from the agent's configured
+// project directory. Under worktree/copy isolation each context gets its own
+// copy of that directory.
 type Resolver struct {
-	root         string
-	allowOutside bool
-	isolation    string
-	isoRoot      string
-	// defaultDir is used when a request does not name a working directory, so an
-	// agent can be pinned to a project (whose CLI config it then loads).
-	defaultDir string
+	// workdir is the configured project directory (the directory the CLI is
+	// started in). Empty means the CLI inherits Harbor's working directory.
+	workdir   string
+	isolation string
+	isoRoot   string
 
 	mu    sync.Mutex
 	bound map[string]string // contextID -> resolved directory
 	locks *lockSet
 }
 
-// NewResolver creates a resolver rooted at dir using shared isolation. When
-// allowOutside is true the root confinement is not enforced. An empty root
-// disables resolution.
-func NewResolver(root string, allowOutside bool) *Resolver {
-	return NewResolverWithIsolation(root, allowOutside, IsolationShared, "", "")
+// NewResolver creates a shared-isolation resolver for workdir.
+func NewResolver(workdir string) *Resolver {
+	return NewResolverWithIsolation(workdir, IsolationShared, "")
 }
 
 // NewResolverWithIsolation creates a resolver with an isolation strategy.
-// worktree/copy need isolationRoot (where per-context copies are created).
-// defaultDir, when set, is used for requests that name no working directory.
-func NewResolverWithIsolation(root string, allowOutside bool, isolation, isolationRoot, defaultDir string) *Resolver {
+// worktree/copy need isolationRoot, where per-context copies are created.
+func NewResolverWithIsolation(workdir, isolation, isolationRoot string) *Resolver {
 	if isolation == "" {
 		isolation = IsolationShared
 	}
 	return &Resolver{
-		root:         root,
-		allowOutside: allowOutside,
-		isolation:    isolation,
-		isoRoot:      isolationRoot,
-		defaultDir:   defaultDir,
-		bound:        map[string]string{},
-		locks:        newLockSet(),
+		workdir:   workdir,
+		isolation: isolation,
+		isoRoot:   isolationRoot,
+		bound:     map[string]string{},
+		locks:     newLockSet(),
 	}
 }
 
-// Resolve returns the absolute working directory for a context, resolved once
-// and reused so a resumed task keeps the same tree. Under worktree/copy
-// isolation each context gets its own directory. An empty requested path yields
-// a per-context scratch directory under the root.
-func (r *Resolver) Resolve(contextID, requested string) (string, error) {
-	if r == nil || r.root == "" {
-		return requested, nil
+// Resolve returns the working directory for a context: the configured workdir, or
+// (under worktree/copy isolation) a per-context copy of it. The result is
+// resolved once and reused, so a resumed task keeps the same tree.
+func (r *Resolver) Resolve(contextID string) (string, error) {
+	if r == nil || r.workdir == "" {
+		return "", nil
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -83,10 +71,13 @@ func (r *Resolver) Resolve(contextID, requested string) (string, error) {
 			return dir, nil
 		}
 	}
-
-	dir, err := r.resolveUnlocked(contextID, requested)
-	if err != nil {
-		return "", err
+	dir := r.workdir
+	if r.isolation == IsolationWorktree || r.isolation == IsolationCopy {
+		d, err := r.isolate(contextID)
+		if err != nil {
+			return "", err
+		}
+		dir = d
 	}
 	if contextID != "" {
 		r.bound[contextID] = dir
@@ -94,65 +85,29 @@ func (r *Resolver) Resolve(contextID, requested string) (string, error) {
 	return dir, nil
 }
 
-func (r *Resolver) resolveUnlocked(contextID, requested string) (string, error) {
-	root, err := filepath.EvalSymlinks(r.root)
-	if err != nil {
-		return "", fmt.Errorf("%w: workdir_root: %v", ErrDenied, err)
-	}
-
-	if requested == "" {
-		requested = r.defaultDir
-	}
-	if requested == "" {
-		dir := filepath.Join(root, scratchName(contextID))
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", fmt.Errorf("%w: scratch dir: %v", ErrDenied, err)
-		}
-		return dir, nil
-	}
-
-	source := requested
-	if !filepath.IsAbs(source) {
-		source = filepath.Join(root, source)
-	}
-	source, err = filepath.EvalSymlinks(source)
-	if err != nil {
-		return "", fmt.Errorf("%w: %q: %v", ErrDenied, requested, err)
-	}
-	if !r.allowOutside && !within(root, source) {
-		return "", fmt.Errorf("%w: %q is outside workdir_root %q", ErrDenied, requested, root)
-	}
-
-	if r.isolation == IsolationShared || r.isolation == "" {
-		return source, nil
-	}
-	return r.isolate(contextID, source)
-}
-
-// isolate creates a per-context working copy of source.
-func (r *Resolver) isolate(contextID, source string) (string, error) {
+// isolate creates a per-context working copy of the configured workdir.
+func (r *Resolver) isolate(contextID string) (string, error) {
 	if r.isoRoot == "" {
-		return "", fmt.Errorf("%w: isolation_root is required for %q", ErrDenied, r.isolation)
+		return "", fmt.Errorf("isolation_root is required for %q", r.isolation)
 	}
-	dst := filepath.Join(r.isoRoot, scratchName(contextID))
+	dst := filepath.Join(r.isoRoot, contextName(contextID))
 	if _, err := os.Stat(dst); err == nil {
 		return dst, nil // already provisioned for this context
 	}
 	if err := os.MkdirAll(r.isoRoot, 0o755); err != nil {
-		return "", fmt.Errorf("%w: %v", ErrDenied, err)
+		return "", err
 	}
-
 	switch r.isolation {
 	case IsolationWorktree:
-		if err := gitWorktree(source, dst); err != nil {
-			return "", fmt.Errorf("%w: worktree: %v", ErrDenied, err)
+		if err := gitWorktree(r.workdir, dst); err != nil {
+			return "", fmt.Errorf("worktree: %w", err)
 		}
 	case IsolationCopy:
-		if err := copyTree(source, dst); err != nil {
-			return "", fmt.Errorf("%w: copy: %v", ErrDenied, err)
+		if err := copyTree(r.workdir, dst); err != nil {
+			return "", fmt.Errorf("copy: %w", err)
 		}
 	default:
-		return "", fmt.Errorf("%w: unknown isolation %q", ErrDenied, r.isolation)
+		return "", fmt.Errorf("unknown isolation %q", r.isolation)
 	}
 	return dst, nil
 }
@@ -211,17 +166,8 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
-// within reports whether path is root or a descendant of root.
-func within(root, path string) bool {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return false
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
-}
-
-// scratchName derives a stable, filesystem-safe directory name from a context.
-func scratchName(contextID string) string {
+// contextName derives a stable, filesystem-safe directory name from a context.
+func contextName(contextID string) string {
 	if contextID == "" {
 		return "ctx-default"
 	}

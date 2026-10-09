@@ -155,41 +155,160 @@ start unless `server.allow_insecure: true`.
 
 ## Configuration
 
-`examples/agents.yaml` is a commented starting point. Main sections:
+`examples/agents.yaml` is a commented starting point; the tables below are the
+full reference. Durations use Go syntax (`30s`, `30m`, `1h`).
 
-- `server`: `listen`, `base_url`, `auth`, `cors_allowed_origins`, `rate_limit`,
-  `task_store_file` (durable tasks/interactions), `session_store_dir`
-  (persisted CLI session ids), `allow_insecure`.
-- `sandbox`: `workdir_root`/`allow_outside` (workspace confinement),
-  `isolation` (`shared`/`worktree`/`copy`), `inherit_env`, `cli_home`,
-  `container` (run each CLI in a container), `require_container_for_dangerous`,
-  `file_artifacts`, `raw_stream_dir`.
-- `telemetry`: OTLP/gRPC `endpoint`, `insecure`, `service_name` (traces + metrics).
-- `plugins`: Go plugin `.so` paths, each exporting `Register()`.
-- `agents[]`: `id`, `binary`, `integration`, `args`, `env`, `session`,
-  `limits`, plus integration-specific fields (`server_protocol`, `grpc_listen`,
-  `sdk_capabilities`, `output_schema_args`, `file_args`, `image_args`,
-  `input_image`, `allow_dangerous`).
-- `agents[].description` sets the card description text (otherwise a default
-  template is used). `agents[].skills` advertises capabilities to callers; when
-  omitted, no skills are advertised (the A2A `skills` field is still present).
-  Each skill requires `id`, `name`, and `description` and optionally `tags`,
-  `examples`, `input_modes`, `output_modes`. `display_name` and `version` likewise
-  shape the card. Skills are configured by the operator (not probed).
+### Top level
 
-  ```yaml
-  - id: codebuddy
-    binary: codebuddy
-    integration: stream-json
-    args: ["-p"]
-    description: "CodeBuddy is a helpful software-development assistant."
-    # Optional: advertise capabilities to callers.
-    # skills:
-    #   - id: code-review
-    #     name: Code review
-    #     description: Review a code change for bugs, style, and quality issues
-    #     tags: ["review", "quality"]
-  ```
+| key | type | required | default | meaning |
+|---|---|---|---|---|
+| `version` | int | no | — | config schema version (currently `1`) |
+| `server` | object | no | — | HTTP server, auth, discovery, limits |
+| `sandbox` | object | no | — | workspace/env/container constraints |
+| `telemetry` | object | no | — | OTLP traces/metrics export |
+| `plugins` | string[] | no | — | Go plugin `.so` paths, each exporting `Register()` |
+| `agents` | object[] | **yes** | — | at least one agent entry |
+
+### `server`
+
+| key | type | required | default | meaning |
+|---|---|---|---|---|
+| `listen` | string | no | `127.0.0.1:8080` | bind address |
+| `base_url` | string | no | — | externally reachable URL used in agent cards |
+| `allow_insecure` | bool | no | `false` | allow a non-loopback bind with `auth.mode: none` |
+| `push_allow_private_networks` | bool | no | `false` | disable the SSRF guard on push webhooks |
+| `task_store_file` | string | no | — | persist tasks (durable interactions) to this JSON file |
+| `session_store_dir` | string | no | — | persist CLI session ids per agent (`<dir>/<id>.json`) |
+| `auth.mode` | string | no | `none` | `none` \| `bearer` |
+| `auth.tokens` | string[] | no | — | bearer tokens (required when `mode: bearer`) |
+| `cors_allowed_origins` | string[] | no | — | allowed CORS origins |
+| `rate_limit.per_minute` | int | no | `0` (off) | sustained requests/min per (caller, agent) |
+| `rate_limit.burst` | int | no | `per_minute` | token-bucket capacity |
+
+### `sandbox`
+
+| key | type | required | default | meaning |
+|---|---|---|---|---|
+| `isolation` | string | no | `shared` | `shared` \| `worktree` \| `copy` (per-context working copies) |
+| `isolation_root` | string | for `worktree`/`copy` | — | base dir for per-context copies |
+| `inherit_env` | bool | no | `true` | inherit the parent env; `false` restricts to an allowlist |
+| `cli_home` | string | no | — | redirect the CLI's config/home here |
+| `state_dir` | string | no | temp dir `harbor` | runtime state (orphan-process records) |
+| `container` | object | no | — | run each CLI in a container (strong isolation) |
+| `require_container_for_dangerous` | bool | no | `false` | refuse `allow_dangerous` agents without a container |
+| `file_artifacts` | bool | no | `false` | emit a `FilePart` per changed file |
+| `raw_stream_dir` | string | no | — | write each task's raw stdout/stderr to this dir |
+| `raw_stream_compress` | bool | no | `false` | gzip the raw-stream files |
+
+`sandbox.container`:
+
+| key | type | required | default | meaning |
+|---|---|---|---|---|
+| `image` | string | **yes** | — | image providing the CLI |
+| `network` | string | no | `none` | `none` \| `bridge` |
+| `runtime` | string | no | `docker` | container runtime binary (e.g. `podman`) |
+
+### `telemetry`
+
+| key | type | required | default | meaning |
+|---|---|---|---|---|
+| `endpoint` | string | no | — | OTLP/gRPC collector `host:port` (traces + metrics); empty disables |
+| `insecure` | bool | no | `false` | send without TLS |
+| `service_name` | string | no | `harbor` | resource `service.name` |
+
+### `agents[]` (general)
+
+| key | type | required | default | meaning |
+|---|---|---|---|---|
+| `id` | string | **yes** | — | agent id (route/card/skill base) |
+| `binary` | string | **yes** | — | CLI executable (name or path) |
+| `integration` | string | for unknown binaries | profile default | `exec` \| `stream-json` \| `acp` \| `server` |
+| `display_name` | string | no | `id` | card `name` suffix and skill name |
+| `description` | string | no | template | card description text |
+| `version` | string | no | probed | card version (skips probing) |
+| `workdir` | string | no | Harbor cwd | project dir the CLI is started in (its project root); must exist |
+| `args` | string[] | exec/acp rules | — | launch args. `exec` must contain `{{.Prompt}}`; `acp` needs the ACP subcommand |
+| `env` | map | no | — | extra environment for the CLI |
+| `parser` | string | no | `text` | `exec` framing: `text` \| `codex` \| `regex` |
+| `regex.text` | string | for `parser: regex` | — | line regex with one capture group |
+| `server_url` | string | no | — | `server`: connect to an existing instance instead of spawning |
+| `server_protocol` | string | no | `http` | `server`: `http` \| `acp` \| `acp-streamable-http` |
+| `grpc_listen` | string | no | — | also serve this agent over gRPC at `host:port` |
+| `allow_dangerous` | bool | no | `false` | enable the CLI's dangerous/permission-bypass flag |
+| `sdk_capabilities` | bool | no | `false` | `stream-json`: declare `askUserQuestion` before the first prompt |
+| `output_schema_args` | string[] | no | profile | `exec` structured-output args (`{{.SchemaFile}}`/`{{.Schema}}`) |
+| `file_args` | string[] | no | profile | attach files via args (`{{.File}}`) |
+| `image_args` | string[] | no | profile | attach images via args (`{{.Image}}`) |
+| `input_image` | string[] | no | profile | accepted image MIME types |
+
+`agents[].session` (optional; profile defaults for known CLIs):
+
+| key | type | meaning |
+|---|---|---|
+| `id_flag` | string | flag to set a session id |
+| `resume_flag` | string | flag to resume a session (`--resume`) |
+| `continue_flag` | string | flag to continue the latest session |
+| `fork_flag` | string | flag to fork a session (used when `harbor.fork` is set) |
+
+`agents[].limits` (all optional; `0` disables):
+
+| key | type | meaning |
+|---|---|---|
+| `max_concurrent` | int | concurrent tasks for this agent (unbounded when `0`) |
+| `timeout` | duration | total task timeout |
+| `idle_timeout` | duration | fail a task with no events for this long |
+| `max_turns` | int | max turns (start + resumes) per task |
+| `breaker.threshold` | int | consecutive failures that open the circuit breaker |
+| `breaker.cooldown` | duration | open duration before a probe |
+| `breaker.max_cooldown` | duration | backoff cap |
+
+### `agents[].skills[]`
+
+Optional; when omitted, the card advertises an empty skills list.
+
+| key | type | required | meaning |
+|---|---|---|---|
+| `id` | string | **yes** | unique skill id |
+| `name` | string | **yes** | human-readable name |
+| `description` | string | **yes** | what the skill does |
+| `tags` | string[] | no | keywords (emitted as `[]` when unset) |
+| `examples` | string[] | no | example prompts |
+| `input_modes` | string[] | no | per-skill input MIME override |
+| `output_modes` | string[] | no | per-skill output MIME override |
+
+```yaml
+- id: codebuddy
+  binary: codebuddy
+  integration: stream-json
+  args: ["-p"]
+  description: "CodeBuddy is a helpful software-development assistant."
+  skills:
+    - id: code-review
+      name: Code review
+      description: Review a code change for bugs, style, and quality issues
+      tags: ["review", "quality"]
+```
+
+### Restricting an agent's tools
+
+Harbor passes tool/permission flags through `agents[].args` (or `agents[].env`);
+each CLI enforces its own rules. For a read-only codebuddy, pre-approve the
+read-only tools and deny the rest without prompting:
+
+```yaml
+- id: codebuddy-readonly
+  binary: codebuddy
+  integration: stream-json
+  args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json",
+         "--permission-mode", "dontAsk",
+         "--allowedTools", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "LSP"]
+```
+
+`--allowedTools` alone only pre-approves (other tools still prompt); pairing it
+with `--permission-mode dontAsk` denies them. Other CLIs: claude
+`--allowedTools`/`--disallowedTools`/`--permission-mode`; opencode `permission`
+rules in config (`OPENCODE_CONFIG_CONTENT` or a project `opencode.json`); codex
+`-s/--sandbox` and `-a/--ask-for-approval`.
 
 ## Testing with a codebuddy client
 

@@ -60,8 +60,6 @@ type AuthConfig struct {
 
 // SandboxConfig configures workspace and env constraints.
 type SandboxConfig struct {
-	WorkdirRoot   string           `yaml:"workdir_root"`
-	AllowOutside  bool             `yaml:"allow_outside"`
 	Isolation     string           `yaml:"isolation"`      // shared | worktree | copy
 	IsolationRoot string           `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
 	InheritEnv    *bool            `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
@@ -171,7 +169,7 @@ type AgentConfig struct {
 	ServerURL      string            `yaml:"server_url"`      // integration: server; connect instead of spawning
 	ServerProtocol string            `yaml:"server_protocol"` // "http" (default) | "acp" | "acp-streamable-http"
 	GRPCListen     string            `yaml:"grpc_listen"`     // optional A2A gRPC bind address
-	Workdir        string            `yaml:"workdir"`         // default working dir (under workdir_root)
+	Workdir        string            `yaml:"workdir"`         // project dir the CLI is started in (its project root)
 	Args           []string          `yaml:"args"`
 	Env            map[string]string `yaml:"env"`
 	AllowDangerous bool              `yaml:"allow_dangerous"`
@@ -435,12 +433,6 @@ func (c *Config) validateServer() error {
 }
 
 func (c *Config) validateSandbox() error {
-	if c.Sandbox.WorkdirRoot != "" {
-		info, err := os.Stat(c.Sandbox.WorkdirRoot)
-		if err != nil || !info.IsDir() {
-			return fmt.Errorf("sandbox.workdir_root %q is not a directory", c.Sandbox.WorkdirRoot)
-		}
-	}
 	switch c.Sandbox.Isolation {
 	case "shared":
 	case "worktree", "copy":
@@ -479,6 +471,12 @@ func validateAgent(i int, a *AgentConfig) error {
 	}
 	if a.Binary == "" {
 		return fmt.Errorf("agent %q: binary is required", a.ID)
+	}
+	if a.Workdir != "" {
+		info, err := os.Stat(a.Workdir)
+		if err != nil || !info.IsDir() {
+			return fmt.Errorf("agent %q: workdir %q is not a directory", a.ID, a.Workdir)
+		}
 	}
 	if p, ok := LookupProfile(a.Binary); ok {
 		if !p.Supports(a.Integration) {

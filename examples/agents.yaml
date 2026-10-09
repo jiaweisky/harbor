@@ -1,16 +1,22 @@
+# Harbor agent configuration.
+# Full reference: see the "Configuration" section of README.md.
 version: 1
 
 server:
-  listen: "127.0.0.1:8080"
-  base_url: "http://127.0.0.1:8080"
+  listen: "127.0.0.1:8080"            # bind address
+  base_url: "http://127.0.0.1:8080"   # externally reachable URL used in agent cards
   auth:
-    mode: none
+    mode: none                        # none | bearer (bearer protects the RPC/REST/gRPC endpoints)
     tokens: []
   # Optional per-(caller, agent) token-bucket rate limit (0 disables).
   # rate_limit: { per_minute: 120, burst: 20 }
-  # Persist tasks (durable interaction) and CLI session ids across restarts.
+  # Persist tasks (durable interactions) and CLI session ids across restarts.
   # task_store_file: "/var/lib/harbor/tasks.json"
   # session_store_dir: "/var/lib/harbor/sessions"
+  # Other server options:
+  # allow_insecure: false             # a non-loopback bind with auth.mode=none refuses to start unless true
+  # cors_allowed_origins: ["https://ops.example.com"]
+  # push_allow_private_networks: false
 
 # Optional OpenTelemetry export (OTLP/gRPC): traces and metrics. Empty endpoint
 # disables it.
@@ -23,14 +29,12 @@ server:
 # plugins: ["/opt/harbor/plugins/my-cli.so"]
 
 sandbox:
-  # workdir_root is required to confine tasks to a directory tree; the directory
-  # must already exist. Left unset, tasks run in Harbor's working directory.
-  # workdir_root: "/srv/workspaces"
-  allow_outside: false
-  inherit_env: true
-  # Optional strong isolation: run each CLI inside a container. The task working
-  # directory (and cli_home, when set) are bind-mounted at their host paths.
-  # The image must provide the CLI; network defaults to none.
+  inherit_env: true                  # false restricts the CLI env to an allowlist
+  # Optional per-context isolation for concurrent tasks on the same project.
+  # isolation: shared                # shared | worktree | copy
+  # isolation_root: "/srv/iso"       # required for worktree/copy
+  # cli_home: "/srv/harbor-cli-home" # redirect the CLI config/home here
+  # state_dir: "/var/lib/harbor"     # runtime state (orphan records); default is under the temp dir
   # container: { image: "harbor/claude:latest", network: none, runtime: docker }
   # require_container_for_dangerous: true   # refuse allow_dangerous without a container
   # file_artifacts: true                    # emit a FilePart per changed file
@@ -38,48 +42,44 @@ sandbox:
   # raw_stream_compress: true
 
 agents:
+  # CodeBuddy restricted to read-only tools. `--allowedTools` pre-approves the
+  # read-only tools; `--permission-mode dontAsk` denies every other tool without
+  # prompting, so it reads/searches but cannot edit files or run commands. Tool
+  # names are the CLI's own (see `codebuddy -h`); the CLI enforces it.
   - id: codebuddy
     display_name: "CodeBuddy"
     binary: codebuddy
     integration: stream-json
-    args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages"]
+    # workdir: "/srv/projects/my-project"   # project dir the CLI starts in (its project
+    #                                       # root); defaults to Harbor's working directory
+    args:
+      - "-p"
+      - "--input-format"
+      - "stream-json"
+      - "--output-format"
+      - "stream-json"
+      - "--include-partial-messages"
+      - "--permission-mode"
+      - "dontAsk"
+      - "--allowedTools"
+      - "Read"
+      - "Glob"
+      - "Grep"
+      - "WebFetch"
+      - "WebSearch"
+      - "LSP"
+      - "ListMcpResources"
+      - "ReadMcpResource"
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
     limits: { max_concurrent: 3, timeout: 30m, breaker: { threshold: 3, cooldown: 30s, max_cooldown: 10m } }
-    # Optional agent-card overrides. `description` replaces the card text.
-    # `skills` advertises capabilities to callers (each needs id/name/description,
-    # tags optional); when omitted, no skills are advertised.
-    description: "CodeBuddy is a helpful software-development assistant that can write, review, and fix code in your repository."
+    description: "CodeBuddy (read-only) answers questions about a codebase without modifying it."
 
+  # OpenCode with no tool restrictions: any tool its agent mode allows is usable.
   - id: opencode
     display_name: "OpenCode"
     binary: opencode
     integration: exec
-    args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]
+    args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]   # exec passes the prompt via {{.Prompt}}
     session: { id_flag: "--session", continue_flag: "--continue" }
     limits: { max_concurrent: 2 }
     description: "OpenCode is a helpful software-development assistant for reading, searching, and explaining a codebase."
-
-  - id: codex
-    display_name: "Codex"
-    binary: codex
-    integration: exec
-    args: ["exec", "--json", "--skip-git-repo-check", "{{.Prompt}}"]
-    # Images are passed as arguments; input_image declares the accepted types.
-    # image_args/top-level input_image default from the codex profile.
-    limits: { max_concurrent: 2 }
-    description: "Codex is a helpful software-development assistant that implements code changes and returns the diff."
-    # Optional A2A gRPC binding for this agent (host:port).
-    # grpc_listen: "127.0.0.1:50051"
-
-  # Zero-code custom CLI (template): point `binary` at your own executable, then
-  # uncomment. Unknown binaries need an explicit `integration` (and a `parser`
-  # for the exec mode). The binary below does not exist, so it stays disabled.
-  # - id: my-coder
-  #   display_name: "My Coder"
-  #   binary: my-coder
-  #   integration: exec
-  #   parser: regex
-  #   regex: { text: '^OUT:\s*(.+)$' }
-  #   args: ["--prompt", "{{.Prompt}}"]
-  #   limits: { max_concurrent: 2 }
-

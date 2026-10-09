@@ -17,17 +17,10 @@ import (
 	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
-// opencodeWorkspaceHandler builds a handler confined to dir, so a task's working
-// directory is a temp dir and relative tool writes stay inside it.
+// opencodeWorkspaceHandler builds a handler whose CLI is started in dir, so
+// relative tool writes land there.
 func opencodeWorkspaceHandler(t *testing.T, ctx context.Context, dir string, ac config.AgentConfig) a2asrv.RequestHandler {
-	return opencodeHandlerWith(t, ctx, workspace.NewResolver(dir, false), 120*time.Second, ac)
-}
-
-// messageIn builds a message that pins the task to the workspace root.
-func messageIn(text string) *a2a.Message {
-	m := message(text)
-	m.Metadata = map[string]any{"harbor.workDir": "."}
-	return m
+	return opencodeHandlerWith(t, ctx, workspace.NewResolver(dir), 120*time.Second, ac)
 }
 
 // expectText asserts a completed task's artifact contains want. Tool tasks can be
@@ -53,7 +46,7 @@ func TestRealOpencodeExecTool(t *testing.T) {
 	t.Cleanup(cancel)
 	h := opencodeWorkspaceHandler(t, ctx, t.TempDir(), opencodeExecConfig())
 	prompt := "Use your Bash tool to run the command `echo $((6 * 7))`, then reply with only the command's output."
-	task, _ := sendTask(t, h, messageIn(prompt))
+	task, _ := sendTask(t, h, message(prompt))
 	expectText(t, task, "42")
 }
 
@@ -65,7 +58,7 @@ func TestRealOpencodeExecFile(t *testing.T) {
 	h := opencodeWorkspaceHandler(t, ctx, dir, opencodeExecConfig())
 	prompt := "Use your file tools to create the file output.txt in the current working " +
 		"directory whose exact contents are OC42 (no trailing newline). Then reply with the single word: written"
-	task, _ := sendTask(t, h, messageIn(prompt))
+	task, _ := sendTask(t, h, message(prompt))
 	expectText(t, task, "written")
 
 	got, err := os.ReadFile(filepath.Join(dir, "output.txt"))
@@ -86,7 +79,7 @@ func TestRealOpencodeACPTool(t *testing.T) {
 		ID: "oc", Binary: "opencode", Integration: config.IntegrationACP, Args: []string{"acp"},
 	})
 	prompt := "Use your Bash tool to run the command `echo $((6 * 7))`, then reply with only the command's output."
-	task, _ := sendTask(t, h, messageIn(prompt))
+	task, _ := sendTask(t, h, message(prompt))
 	expectText(t, task, "42")
 }
 
@@ -100,7 +93,7 @@ func TestRealOpencodeACPToolFile(t *testing.T) {
 	})
 	prompt := "Use your file tools to create the file acp.txt in the current working " +
 		"directory whose exact contents are ACP42. Then reply with the single word: written"
-	task, _ := sendTask(t, h, messageIn(prompt))
+	task, _ := sendTask(t, h, message(prompt))
 	expectText(t, task, "written")
 
 	got, err := os.ReadFile(filepath.Join(dir, "acp.txt"))
@@ -127,7 +120,6 @@ func TestRealOpencodeFileAttachment(t *testing.T) {
 	file.MediaType = "text/plain"
 	m := a2a.NewMessage(a2a.MessageRoleUser,
 		a2a.NewTextPart("Reply with only the codeword found in the attached file."), file)
-	m.Metadata = map[string]any{"harbor.workDir": "."}
 
 	task, _ := sendTask(t, h, m)
 	if got := strings.ToLower(artifactText(task)); !strings.Contains(got, "orange") {

@@ -53,7 +53,7 @@ Sandboxing, authentication, dangerous switches, etc. are all **configurable poli
 | Configurable item | Config key | Default | Meaning of enabling |
 |---|---|---|---|
 | Authentication | `server.auth.mode` | `none` (local) / `bearer` (external) | Integrate with external systems |
-| Workdir scope | `sandbox.workdir_root` / `allow_outside` | restricted / `false` | Allow access to arbitrary paths |
+| Workdir | `agents[].workdir` | Harbor's working directory | Pin a CLI to a project directory |
 | Environment variables | `sandbox.inherit_env` | `true` (inherit the launching user's environment) | When set to `false`, only a whitelist is injected |
 | Dangerous switches | `agents[].allow_dangerous` | `false` | Enable `--dangerously-skip-permissions`/`-y`/`bypassPermissions` |
 | Container sandbox | `sandbox.container` | off | Strong isolation (network/filesystem) |
@@ -115,7 +115,7 @@ flowchart LR
 | `Runner` | Starts/kills child processes, pumps stdout line/byte-wise, handles timeouts and process groups. |
 | `Parser` | Parses raw CLI output (stream-json / text / custom) into unified events. |
 | `SessionStore` | Maintains the `A2A contextId ↔ CLI native sessionId` mapping. |
-| `Sandbox` | Workdir whitelist, environment variable trimming, optional containerization. |
+| `Sandbox` | Per-agent workdir, environment variable trimming, optional containerization. |
 
 ### 3.1 Multi-CLI Management
 
@@ -677,23 +677,19 @@ mux.Handle("/agents/codebuddy/", a2asrv.NewJSONRPCHandler(handler))
 - Streaming: the client calls `message/stream`, and Harbor pushes `TaskArtifactUpdateEvent` over SSE.
 - Push: very long tasks (compilation, tests) go through push notification so the client can be offline.
 
-### 6.7 Workdir and Workspace Isolation
+### 6.7 Workdir (from configuration)
 
-A coding agent only makes sense inside a **real codebase**, so the workdir is not a matter of "just creating some subdirectory"; it must be bound to the business and the session:
+A coding agent only makes sense inside a **real codebase**, and a CLI treats its **cwd as the project root** (loading `opencode.json`/`.opencode`/`.codebuddy`/`.claude`/`.codex`, skills and sub-agents from there). So which directory a CLI runs in is a **deployment property of the agent**, not a per-request parameter:
 
-- **Source**: the caller specifies it via A2A `Message.Metadata` (conventional key `harbor.workDir`); `sandbox.workdir_root` is the only allowed root.
-- **Validation (security precondition)**: take the realpath of both the request path and `workdir_root`, and perform a prefix check by **path components**; **reject** `..` traversal and symlink escape; when `allow_outside=false`, out-of-bounds is rejected outright (fail fast, the CLI is not started).
-- **Binding to `contextId`**: the workdir is bound to the A2A `contextId`. Subsequent tasks of the same context (including `--resume`) **must reuse the same working tree**, otherwise the CLI session and file changes become misaligned.
-- **When unspecified**: first look at `agents[].workdir` (each agent's optional default project directory, constrained by `workdir_root`); if still unconfigured, allocate a scratch directory per context (suitable only for tasks that do not need an existing codebase). This is the only way to "pin a CLI to a project" — because the CLI treats cwd as the project root and loads project-level configuration, skills, and sub-agents such as `opencode.json`/`.opencode`/`.codebuddy`/`.claude`/`.codex` from there.
-- **Scratch naming safety**: `contextId` is client-controllable and **must not be concatenated directly into the path** — take its hash or whitelist characters, and reject `..` and path separators.
-- **Isolation strategy** (configuration, determines concurrency safety):
-  - `shared`: run directly in the specified directory (fastest; concurrent runs in the same directory interfere with each other and require **lock-serialization by workdir**).
-  - `worktree` (recommended, M2): when the target is a git repository, create a `git worktree` for **each context** to achieve isolation and concurrency; `--fork` → a new worktree.
-  - `copy`: for non-git directories, copy the entire directory.
-- **Additional directories**: extra writable directories such as `--add-dir` must also pass the above validation.
-- **cwd and `PWD`**: the child process is started with the workdir as **cwd**, and **`PWD`** is set to that directory in sync — `exec` only changes the kernel cwd and does not update the inherited `PWD`, while some CLIs (e.g. opencode) determine the session/project directory from `PWD`; if not synchronized, they read and write Harbor's cwd.
-
-> Conclusion: **it is not an either-or** — the `harbor.workDir` metadata is the primary source and is bound to the context; "one subdirectory per context" is only the fallback when unspecified; concurrent isolation is the responsibility of the `worktree` / directory-lock strategy.
+- **Source**: `agents[].workdir` — the directory the CLI is started in (its project root). When unset, the CLI inherits **Harbor's working directory**. To serve several projects, register several agents (one card each) — this matches how a CLI is normally used (`cd project && cli`).
+- **Validation**: `agents[].workdir`, when set, must exist and be a directory (checked at startup; the agent is otherwise refused).
+- **No per-request override**: A2A has no notion of a working directory, and requiring a custom `harbor.*` metadata key would not interoperate with standard clients. Harbor does not expose the server's filesystem layout to callers.
+- **Binding to `contextId`**: the resolved directory is bound to the A2A `contextId` so that subsequent tasks of the same context (including `--resume`) **reuse the same working tree**.
+- **Isolation strategy** (`sandbox.isolation`, configuration; determines concurrency safety):
+  - `shared`: run directly in the configured directory (fastest; concurrent runs in the same directory interfere and are **lock-serialized by directory**).
+  - `worktree` (recommended): when the directory is a git repository, create a `git worktree` for **each context** (under `sandbox.isolation_root`) for isolation and concurrency.
+  - `copy`: for non-git directories, copy the directory per context.
+- **cwd and `PWD`**: the child process is started with the resolved directory as **cwd**, and **`PWD`** is set to it in sync — `exec` only changes the kernel cwd and does not update the inherited `PWD`, while some CLIs (e.g. opencode) determine the session/project directory from `PWD`; if not synchronized, they read and write Harbor's cwd.
 
 ### 6.8 Collecting Code Changes and Expressing Them as Artifacts
 
@@ -706,7 +702,7 @@ The core output of a coding agent is **code changes**, which must be delivered a
   - **per-file artifact (already implemented, optional)**: when `sandbox.file_artifacts: true`, in addition to the diff, each changed file is emitted as its own `FilePart` (MIME determined by extension, single file ≤1MiB, images not duplicated);
   - `Artifact.Metadata = {"agent","base","files":[...],"truncated":bool}`.
 - **Streaming vs finalization**: by default it is delivered **once at finalization** (stable); if the CLI can report per-file edits (tool_result carrying a path), `ArtifactUpdateEvent` can be emitted incrementally per file.
-- **Boundary**: only collect changes within `workDir` (and the allowed `--add-dir`); very long diffs are trimmed and marked `truncated`; binaries report only paths.
+- **Boundary**: only collect changes within the resolved workdir; very long diffs are trimmed and marked `truncated`; binaries report only paths.
 - In coordination with §6.7: in `worktree` mode the diff is relative to that context's baseline.
 - **Concurrency affects diff reliability**: in `shared` mode, concurrent runs in the same directory mix in others' changes → the diff is unreliable; production should use `worktree` or lock by directory (§6.7).
 
@@ -716,7 +712,6 @@ The core output of a coding agent is **code changes**, which must be delivered a
 
 | Key | Type | Meaning |
 |---|---|---|
-| `harbor.workDir` | string | Workdir (relative to `workdir_root`), see §6.7 |
 | `harbor.model` | string | Model (passed through to the Adapter) |
 | `harbor.agent` | string | CLI-internal agent name |
 | `harbor.systemPrompt` | string | Appended system prompt |
@@ -731,7 +726,6 @@ The core output of a coding agent is **code changes**, which must be delivered a
 | code | Trigger |
 |---|---|
 | `unsupported_content` | The requested capability is not within the effective capabilities (§7.5) |
-| `workdir_denied` | Workdir out of bounds / validation failed (§6.7) |
 | `auth_required` | CLI provider not logged in / authentication invalid (§10.5). Value domain reserved; currently surfaced by the CLI's own error (not actively emitted) |
 | `cli_not_found` | Binary missing or not executable |
 | `agent_unavailable` | agent circuit-broken (consecutive failures) or not enabled; fast-fail (§11.2) |
@@ -844,7 +838,7 @@ The three kinds of "questions" have different semantics; they are unified into a
   - `tool_name="ExitPlanMode"` (plan mode) → `InteractionPlanApproval` (options allow/deny), answered the same as permission (the `allowed` of `control_response`).
   - In all the above cases the **original process suspends** waiting on stdin; no restart is needed. Real-machine testing with codebuddy: permission (pause → `allow` → Bash executes → complete), `AskUserQuestion` question (pause → choose `Blue` → complete), form elicitation (pause → submit `content` → complete), and plan approval (`ExitPlanMode` → pause) all pass.
 
-**Live-process-lost recovery (lossy)**: the `input-required` message metadata records the CLI session id (`harbor.sessionId`, from `EventSession`). When an answer arrives but the live process no longer exists (typically because after a Harbor restart `runs`/`live` have been cleared), if that session id exists and the CLI's `SessionResume` capability is true, it **restarts with `--resume <id>`** and injects the answer text as the next prompt (`resumeFresh`); otherwise it fails with `internal` and prompts a resend. The injection is lossy: the CLI restarts, context may be replayed, and the workdir is taken from the `harbor.workDir` of the answer message (falling back to the default). ACP does not report a session id, so after a restart this path fails for lack of an id.
+**Live-process-lost recovery (lossy)**: the `input-required` message metadata records the CLI session id (`harbor.sessionId`, from `EventSession`). When an answer arrives but the live process no longer exists (typically because after a Harbor restart `runs`/`live` have been cleared), if that session id exists and the CLI's `SessionResume` capability is true, it **restarts with `--resume <id>`** and injects the answer text as the next prompt (`resumeFresh`); otherwise it fails with `internal` and prompts a resend. The injection is lossy: the CLI restarts, context may be replayed, and the workdir is the agent's configured `workdir`. ACP does not report a session id, so after a restart this path fails for lack of an id.
 
 ### 7.5 Media Type Alignment
 
@@ -974,10 +968,10 @@ func init() {
    - **Scope**: the Bearer middleware **wraps only the JSON-RPC endpoints**; cards and discovery endpoints (`/.well-known/agent-card.json`, `/.well-known/agents.json`, `/agents/{id}/.well-known/agent-card.json`) are **public** — a client needs the card first to learn the auth scheme, and codebuddy does not carry a token when fetching cards.
    **Not planned to support** OAuth2 / mTLS / token introspection / fine-grained authorization (YAGNI). Per-caller credentials (model B in §10.2) are not implemented; if per-user quota/billing is needed, start multiple Harbor instances each with a different OS user.
 2. **Upstream credentials and login**: see **§10** (the CLI's own provider login/credential isolation, a separate matter from this item's service authentication).
-3. **Workdir sandbox**: all tasks are confined within `sandbox.workdir_root`; `allow_outside` defaults to `false`; realpath/prefix validation rejects `..` and symlink escape (see §6.7 for details).
+3. **Workdir**: each agent runs in its configured `agents[].workdir` (its project root), which must exist; when unset it inherits Harbor's working directory (see §6.7 for details).
 4. **Environment variables**: **by default the launching user's environment is inherited** (many CLIs depend on it); when `sandbox.inherit_env: false`, only a whitelist (`PATH`/`HOME`/`LANG`/`LC_ALL`/`TERM`/`TMPDIR`) + `agents[].env` are injected, to reduce credential exposure.
 5. **Dangerous switches made explicit**: `--dangerously-skip-permissions`/`-y`/`bypassPermissions` can only be enabled by the deployer in the configuration (`agents[].allow_dangerous`, default `false`), with **no environment-variable bypass**, and are highlighted with warnings in the startup log. Hardening (already implemented, optional): when `sandbox.require_container_for_dangerous: true`, any `allow_dangerous` agent may only start if `sandbox.container` is configured; otherwise `config.Load` errors out and refuses to start.
-6. **Optional container sandbox (already implemented)**: when `sandbox.container: {image, network, runtime}` is enabled, each CLI process starts with `<runtime> run --rm -i --network <network>` (the `Runner`, covering exec/stream-json/acp and the long-running process of server). The **sandbox roots** (`workdir_root`, `isolation_root`, `cli_home`) are bind-mounted at their **host original paths** (`-v <path>:<path>`), and the task workdir is specified via `-w`, so `PWD` and each CLI's configuration root remain valid inside the container; the environment is forwarded entry by entry via `--env` (including the results of `inherit_env`/`cli_home`). `network` defaults to `none`, `runtime` to `docker` (can be set to `podman`). The image must ship the corresponding CLI. Trade-off: in-container paths match the host, so `inv.Bin` is not rewritten; image selection and credential injection are the deployer's responsibility.
+6. **Optional container sandbox (already implemented)**: when `sandbox.container: {image, network, runtime}` is enabled, each CLI process starts with `<runtime> run --rm -i --network <network>` (the `Runner`, covering exec/stream-json/acp and the long-running process of server). The agent's **workdir**, the `isolation_root`, and `cli_home` are bind-mounted at their **host original paths** (`-v <path>:<path>`), and the workdir is specified via `-w`, so `PWD` and each CLI's configuration root remain valid inside the container; the environment is forwarded entry by entry via `--env` (including the results of `inherit_env`/`cli_home`). `network` defaults to `none`, `runtime` to `docker` (can be set to `podman`). The image must ship the corresponding CLI. Trade-off: in-container paths match the host, so `inv.Bin` is not rewritten; image selection and credential injection are the deployer's responsibility.
 7. **Resource limits**: concurrency cap, CPU/memory (`ulimit`/cgroup), per-task timeout and maximum turns, to prevent runaway loops.
 8. **Audit log**: record `user → agent → prompt summary → taskId → result status`, with sensitive content redactable.
 9. **Network**: CORS allows trusted domains only; the AgentCard may be public but the invocation interface requires authentication.
@@ -1134,7 +1128,7 @@ half-open allows 1 probe request; success → closed (count reset); failure → 
 **Counts and thresholds** (configurable via `limits.breaker`):
 
 - **Counted as failure**: `cli_not_found`, `internal` (crash/startup failure), consecutive `timeout`.
-- **Not counted**: user cancellation (`canceled`), `unsupported_content`, `workdir_denied`, `input-required` pauses.
+- **Not counted**: user cancellation (`canceled`), `unsupported_content`, `input-required` pauses.
 - Defaults: `threshold: 3` (consecutive failures within a time window), `window: 5m`, `cooldown: 30s`, `max_cooldown: 10m`.
 
 **Behavior after triggering**:
@@ -1234,14 +1228,11 @@ server:
   cors_allowed_origins: ["https://ops.example.com"]
 
 sandbox:
-  workdir_root: "/srv/workspaces"
-  allow_outside: false
-  isolation: shared          # shared | worktree | copy
+  isolation: shared                  # shared | worktree | copy
+  # isolation_root: "/srv/iso"       # required for worktree/copy
   inherit_env: true
   cli_home: "/srv/harbor-cli-home"   # optional: redirect the CLI config/home here
   state_dir: "/var/lib/harbor"       # runtime state (orphan records); defaults to the temp dir
-  default_timeout: 30m
-  max_concurrent: 8
   # container: { image: "harbor/claude:latest", network: none }  # optional strong isolation
 
 agents:
@@ -1249,6 +1240,7 @@ agents:
     display_name: "Claude Code"
     binary: claude
     integration: stream-json
+    workdir: "/srv/projects/my-project"   # the CLI's project root (defaults to Harbor's cwd)
     # the prompt is delivered via a stdin stream-json user message (not as an argument)
     args:
       - "-p"
@@ -1389,7 +1381,7 @@ codebuddy
 
 | Phase | Deliverables |
 |---|---|
-| **M1 Skeleton** | Go module, Adapter/Parser/Runner, Registry, A2A server assembly; **codebuddy (`stream-json`, proving the complete architecture) + opencode (`exec`, capability-limited)**; **Bearer authentication + security interlock**; **CLI home isolation + `Probe` auth detection** (§10); per-token streaming; workdir validation bound to context (§6.7). |
+| **M1 Skeleton** | Go module, Adapter/Parser/Runner, Registry, A2A server assembly; **codebuddy (`stream-json`, proving the complete architecture) + opencode (`exec`, capability-limited)**; **Bearer authentication + security interlock**; **CLI home isolation + `Probe` auth detection** (§10); per-token streaming; workdir pinned per agent and bound to context (§6.7). |
 | **M2 Reliability and testing** | Fake CLI fixtures + golden tests; concurrency quota / timeout / cancellation; SSE throttling; crash recovery, orphan cleanup, **breaker/health** (§11.1/§11.2). |
 | **M3 Multi-agent breadth** | codex (standalone JSONL Parser), generic config Adapter, claude along the way; multi-agent routing and multiple cards. |
 | **M4 Output and interaction refinement** | ~~code-change artifact (diff / file)~~, ~~push notifications~~, ~~interaction normalization (Canonical interaction + `input-required` DataPart + Card extension)~~, ~~complete interaction degradation matrix (question / plan_approval / `--resume` lossy injection)~~, ~~durable interaction~~ (all implemented). |
@@ -1571,8 +1563,6 @@ type AuthConfig struct {
 }
 
 type SandboxConfig struct {
-    WorkdirRoot    string           `yaml:"workdir_root"`
-    AllowOutside   bool             `yaml:"allow_outside"`
     Isolation      string           `yaml:"isolation"`       // shared | worktree | copy
     IsolationRoot  string           `yaml:"isolation_root"`  // for worktree/copy
     InheritEnv     *bool            `yaml:"inherit_env"`     // default true
@@ -1872,7 +1862,7 @@ func (e *CLIExecutor) toRequest(ctx context.Context, ec *a2asrv.ExecutorContext)
         SystemExtra: metaString(ec.Message, "harbor.systemPrompt"),
         Model:       metaString(ec.Message, "harbor.model"),
         Agent:       metaString(ec.Message, "harbor.agent"),
-        WorkDir:     e.workdirFor(ec), // constrained by the sandbox
+        WorkDir:     e.workdirFor(ec), // the agent's configured workdir
         SessionID:   sid,
         Continue:    sid == "" && metaBool(ec.Message, "harbor.continue"),
         MaxTurns:    metaInt(ec.Message, "harbor.maxTurns"),
@@ -1982,7 +1972,7 @@ a2a send http://localhost:8080/agents/opencode  "list files"
 
 1. **Streaming granularity (finalized, M1)**: by default **per-token streaming** (claude/codebuddy add `--include-partial-messages`), avoiding "no response for ages"; incremental `TaskArtifactUpdateEvent`s are **coalesced/throttled** (~50–100ms or flush every N characters), preserving real-time behavior without flooding SSE; CLIs without partial capability use status/tool events as activity heartbeats. (The earlier suggestion of "turn-based first, partial in M2" is void.)
 2. **Prompt passing method (finalized, M1)**: claude/codebuddy **directly use `--input-format stream-json` + stdin**, with the prompt written to stdin as the first stream-json user message and **no positional arguments**. Reasons: ① this is the only form that natively supports `input-required` (permission/clarification) bidirectional answering, consistent with the `Session.Send` contract of §4.5; ② it avoids argv length/escaping limits and naturally carries the structured/multimodal input of §7.5; ③ using positional arguments = a one-shot Session, making `Send` impossible, which would weld shut the degradation path of §7.4 and force rework later. Therefore positional arguments are **not chosen for being "simpler"**. (Text is fallen back to only when the CLI has no structured-input capability, e.g. codex `exec` passing the prompt via stdin.)
-3. **Workdir (finalized)**: `Message.Metadata["harbor.workDir"]` is the primary source; the realpath validation must fall within `workdir_root`, and it is **bound to `contextId`** (`--resume` reuses the same working tree); when unspecified, a scratch subdirectory is allocated per context; concurrent isolation uses the `worktree`/directory-lock strategy (see §6.7 for details).
+3. **Workdir (finalized)**: the directory a CLI runs in is a per-agent deployment property (`agents[].workdir`), not a per-request parameter; it defaults to Harbor's working directory and is **bound to `contextId`** (`--resume` reuses the same working tree); concurrent isolation uses the `worktree`/directory-lock strategy (see §6.7 for details).
 4. **Authentication (finalized)**: M1 implements the **Bearer static token middleware** (injecting `CallContext.User`) and adds a **security interlock**: when `listen` is non-loopback and `auth.mode=none`, refuse to start unless `allow_insecure: true` is explicit (reverse proxy/mesh already authenticates). **OAuth2 / mTLS / fine-grained authorization are explicitly unsupported** (YAGNI). The CLI's own provider login is in §10. Reason: a reachable unauthenticated endpoint = remote RCE and cannot be the default, and M1 completes the AgentCard's `securitySchemes`.
 5. **Dangerous switch (finalized)**: `allow_dangerous` is a **pure configuration item** (`agents[].allow_dangerous`, default `false`), set explicitly by the deployer; **no environment-variable bypass is provided** (a hidden switch would break "explicit opt-in + auditable"). For local debugging, use a separate debug config file. Hardening (already implemented): when `sandbox.require_container_for_dangerous: true`, `allow_dangerous: true` requires the container sandbox to be enabled at the same time, otherwise `config.Load` refuses to start.
 6. **Module path/naming (finalized)**: `github.com/jiaweisky/harbor` (corresponding to the repo `https://github.com/jiaweisky/harbor.git`).

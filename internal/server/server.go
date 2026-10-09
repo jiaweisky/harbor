@@ -52,15 +52,15 @@ func sessionStore(dir, agentID string) (bridge.SessionStore, error) {
 }
 
 // containerSpec builds the runner's container sandbox from the configuration, or
-// nil when no container is configured. The sandbox roots (the workdir root,
-// isolation root, and CLI home) are bind-mounted at their host paths so paths
-// inside the container match the host.
-func containerSpec(s config.SandboxConfig) *agent.ContainerSpec {
+// nil when no container is configured. The agent's workdir, the isolation root,
+// and the CLI home are bind-mounted at their host paths so paths inside the
+// container match the host.
+func containerSpec(s config.SandboxConfig, workdir string) *agent.ContainerSpec {
 	if s.Container == nil {
 		return nil
 	}
 	var mounts []string
-	for _, m := range []string{s.WorkdirRoot, s.IsolationRoot, s.CLIHome} {
+	for _, m := range []string{workdir, s.IsolationRoot, s.CLIHome} {
 		if m != "" {
 			mounts = append(mounts, m)
 		}
@@ -121,7 +121,6 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 		auth:           auth,
 		bearer:         cfg.Server.Auth.Mode == "bearer",
 		rl:             newRateLimiter(cfg.Server.RateLimit),
-		container:      containerSpec(cfg.Sandbox),
 		taskLookup:     taskLookupFunc(taskStore),
 		mux:            http.NewServeMux(),
 		authReady:      make(map[string]bool, len(cfg.Agents)),
@@ -190,7 +189,6 @@ type agentBuilder struct {
 	auth           func(http.Handler) http.Handler
 	bearer         bool
 	rl             *rateLimiter
-	container      *agent.ContainerSpec
 	taskLookup     func(context.Context, a2a.TaskID) (*a2a.Task, bool)
 	mux            *http.ServeMux
 	handlerOptions []a2asrv.RequestHandlerOption
@@ -208,7 +206,7 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	ln, info, err := integration.Build(ctx, ac, integration.Options{
 		InheritEnv: b.cfg.Sandbox.InheritEnvEnabled(),
 		CLIHome:    b.cfg.Sandbox.CLIHome,
-		Container:  b.container,
+		Container:  containerSpec(b.cfg.Sandbox, ac.Workdir),
 	})
 	if err != nil {
 		slog.Warn("agent disabled", "id", ac.ID, "err", err)
@@ -223,8 +221,8 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 		slog.Warn("agent disabled", "id", ac.ID, "err", err)
 		return
 	}
-	resolver := workspace.NewResolverWithIsolation(b.cfg.Sandbox.WorkdirRoot,
-		b.cfg.Sandbox.AllowOutside, b.cfg.Sandbox.Isolation, b.cfg.Sandbox.IsolationRoot, ac.Workdir)
+	resolver := workspace.NewResolverWithIsolation(ac.Workdir,
+		b.cfg.Sandbox.Isolation, b.cfg.Sandbox.IsolationRoot)
 	exec := bridge.NewCLIExecutor(ln, sessions, agent.NewLiveSessions(), resolver, ac.Limits)
 	exec.SetFileArtifacts(b.cfg.Sandbox.FileArtifacts)
 	exec.SetTaskLookup(b.taskLookup)

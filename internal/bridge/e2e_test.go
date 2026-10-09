@@ -69,13 +69,13 @@ func newHandler(t *testing.T, ln agent.Launcher) a2asrv.RequestHandler {
 	return a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 }
 
-// newPwdHandler returns a handler whose CLI reports its working directory,
-// confined to root.
+// newPwdHandler returns a handler whose CLI reports its working directory; the
+// CLI is started in dir.
 func newPwdHandler(t *testing.T, root string) a2asrv.RequestHandler {
 	t.Helper()
 	ln := newLauncher(t, scriptPath(t, "fake-pwd.sh"), "exec", nil, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(root, false), config.LimitsConfig{})
+		workspace.NewResolver(root), config.LimitsConfig{})
 	return a2asrv.NewHandler(exec)
 }
 
@@ -1009,7 +1009,7 @@ func TestPromptFromParts(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "exec",
 		[]string{"-p", "{{.Prompt}}"}, map[string]string{"HARBOR_ARG_LOG": logPath})
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(root, false), config.LimitsConfig{})
+		workspace.NewResolver(root), config.LimitsConfig{})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1027,7 +1027,6 @@ func TestPromptFromParts(t *testing.T) {
 		file,
 		link,
 	)
-	m.Metadata = map[string]any{"harbor.workDir": "."}
 	if _, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m}); err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
@@ -1055,7 +1054,7 @@ func TestRejectsUnsupportedImage(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "exec",
 		[]string{"-p", "{{.Prompt}}"}, map[string]string{"HARBOR_ARG_LOG": logPath})
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(root, false), config.LimitsConfig{})
+		workspace.NewResolver(root), config.LimitsConfig{})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1065,7 +1064,6 @@ func TestRejectsUnsupportedImage(t *testing.T) {
 	img.Filename = "x.png"
 	img.MediaType = "image/png"
 	m := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("describe this"), img)
-	m.Metadata = map[string]any{"harbor.workDir": "."}
 
 	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
 	if err != nil {
@@ -1397,13 +1395,12 @@ func TestChangesArtifact(t *testing.T) {
 	repo := gitRepo(t)
 	ln := newLauncher(t, scriptPath(t, "fake-mutate.sh"), "exec", nil, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(repo, false), config.LimitsConfig{})
+		workspace.NewResolver(repo), config.LimitsConfig{})
 	h := a2asrv.NewHandler(exec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	m := message("hi")
-	m.Metadata = map[string]any{"harbor.workDir": "."}
 	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
@@ -1432,13 +1429,12 @@ func TestImageOutputArtifact(t *testing.T) {
 	root := t.TempDir()
 	ln := newLauncher(t, scriptPath(t, "fake-image.sh"), "exec", []string{"{{.Prompt}}"}, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(root, false), config.LimitsConfig{})
+		workspace.NewResolver(root), config.LimitsConfig{})
 	h := a2asrv.NewHandler(exec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	m := message("draw a picture")
-	m.Metadata = map[string]any{"harbor.workDir": "."}
 	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
@@ -1493,14 +1489,13 @@ func TestFileArtifacts(t *testing.T) {
 	repo := gitRepo(t)
 	ln := newLauncher(t, scriptPath(t, "fake-mutate.sh"), "exec", nil, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(repo, false), config.LimitsConfig{})
+		workspace.NewResolver(repo), config.LimitsConfig{})
 	exec.SetFileArtifacts(true)
 	h := a2asrv.NewHandler(exec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	m := message("hi")
-	m.Metadata = map[string]any{"harbor.workDir": "."}
 	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
@@ -1686,17 +1681,12 @@ func TestCLIHomeIsolation(t *testing.T) {
 }
 
 func TestWorkdirApplied(t *testing.T) {
-	root := t.TempDir()
-	repo := filepath.Join(root, "repo")
-	if err := os.MkdirAll(repo, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	repo := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	m := message("hi")
-	m.Metadata = map[string]any{"harbor.workDir": "repo"}
-	resp, err := newPwdHandler(t, root).SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
+	resp, err := newPwdHandler(t, repo).SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
@@ -1704,33 +1694,8 @@ func TestWorkdirApplied(t *testing.T) {
 	if task.Status.State != a2a.TaskStateCompleted {
 		t.Fatalf("state = %s", task.Status.State)
 	}
-	want, _ := filepath.EvalSymlinks(repo)
-	if got := artifactText(task); !strings.Contains(got, want) {
-		t.Fatalf("artifact %q does not contain workdir %q", got, want)
-	}
-}
-
-func TestWorkdirDenied(t *testing.T) {
-	parent := t.TempDir()
-	root := filepath.Join(parent, "root")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	m := message("hi")
-	m.Metadata = map[string]any{"harbor.workDir": "../outside"}
-	resp, err := newPwdHandler(t, root).SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-	task := resp.(*a2a.Task)
-	if task.Status.State != a2a.TaskStateFailed {
-		t.Fatalf("state = %s", task.Status.State)
-	}
-	if task.Status.Message == nil || task.Status.Message.Metadata["harbor.errorCode"] != "workdir_denied" {
-		t.Fatalf("missing workdir_denied error code: %+v", task.Status.Message)
+	if got := artifactText(task); !strings.Contains(got, repo) {
+		t.Fatalf("artifact %q does not contain workdir %q", got, repo)
 	}
 }
 
