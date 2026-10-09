@@ -92,6 +92,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := servers.Close(); err != nil {
+			slog.Warn("store close", "err", err)
+		}
+	}()
 	srv := &http.Server{
 		Addr:    cfg.Server.Listen,
 		Handler: servers.HTTP,

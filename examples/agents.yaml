@@ -10,9 +10,11 @@ server:
     tokens: []
   # Optional per-(caller, agent) token-bucket rate limit (0 disables).
   # rate_limit: { per_minute: 120, burst: 20 }
-  # Persist tasks (durable interactions) and CLI session ids across restarts.
-  # task_store_file: "/var/lib/harbor/tasks.json"
-  # session_store_dir: "/var/lib/harbor/sessions"
+  # Persist tasks and CLI session ids across restarts with SQLite. Without
+  # `store: sqlite` everything is in-memory and lost on restart.
+  # store: sqlite
+  # store_path: "/var/lib/harbor/tasks.db"         # SQLite DB for tasks
+  # session_store_dir: "/var/lib/harbor/sessions"   # per-agent <id>.db
   # Other server options:
   # allow_insecure: false             # a non-loopback bind with auth.mode=none refuses to start unless true
   # cors_allowed_origins: ["https://ops.example.com"]

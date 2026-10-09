@@ -1150,8 +1150,8 @@ limits:
 
 ## 12. Persistence and State Storage
 
-- **TaskStore**: in-memory by default; `server.task_store_file` persists JSON to disk. **durable interaction** depends on it: the `input-required` interaction is persisted with the task and rebuilt from the stored messages after restart (§11).
-- **SessionStore**: `contextId → cliSessionID`; with `server.session_store_dir`, one `<dir>/<id>.json` is persisted per agent, making CLI session resumption work across restarts.
+- **TaskStore**: in-memory by default; with `server.store: sqlite` (and `server.store_path`), tasks are stored in SQLite, which is the source of truth (no in-memory copy of the task set). **durable interaction** depends on it: the `input-required` interaction is persisted with the task and rebuilt from the stored messages after restart (§11).
+- **SessionStore**: `contextId → cliSessionID`; with `server.store: sqlite` (and `server.session_store_dir`), one `<dir>/<id>.db` SQLite database is persisted per agent, making CLI session resumption work across restarts.
 - **PushConfigStore / Sender**: `a2asrv.WithPushNotifications(store, sender)`; `sender` delivers an HTTP webhook (validating the URL against SSRF, with retry on failure). **Already implemented**, with Card `PushNotifications:true`.
 - **Execution log (already implemented, optional)**: with `sandbox.raw_stream_dir` (+ `raw_stream_compress`), each task's raw stdout/stderr is persisted as `<taskID>.out/.err(.gz)`, convenient for replay and troubleshooting.
 
@@ -1385,7 +1385,7 @@ codebuddy
 | **M2 Reliability and testing** | Fake CLI fixtures + golden tests; concurrency quota / timeout / cancellation; SSE throttling; crash recovery, orphan cleanup, **breaker/health** (§11.1/§11.2). |
 | **M3 Multi-agent breadth** | codex (standalone JSONL Parser), generic config Adapter, claude along the way; multi-agent routing and multiple cards. |
 | **M4 Output and interaction refinement** | ~~code-change artifact (diff / file)~~, ~~push notifications~~, ~~interaction normalization (Canonical interaction + `input-required` DataPart + Card extension)~~, ~~complete interaction degradation matrix (question / plan_approval / `--resume` lossy injection)~~, ~~durable interaction~~ (all implemented). |
-| **M5 Security and operations** | ~~container / worktree sandbox~~, ~~metrics~~ (Prometheus text + OTLP), ~~audit log~~ (slog), ~~persistent TaskStore~~ (JSON file), ~~rate limiting~~, ~~dangerous-switch hardening~~. |
+| **M5 Security and operations** | ~~container / worktree sandbox~~, ~~metrics~~ (Prometheus text + OTLP), ~~audit log~~ (slog), ~~persistent TaskStore~~ (SQLite), ~~rate limiting~~, ~~dangerous-switch hardening~~. |
 | **M6 Advanced** | ~~ACP integration mode~~ (implemented, stdio, including codebuddy `streamable-http`), ~~server integration mode (opencode `serve` / codebuddy `--serve` / codex `app-server`)~~ (implemented), ~~service-level credentials (§10, model A)~~ (implemented), ~~compile-time Adapter registry (§16 level 3)~~ (implemented), ~~Go plugin extension~~ (implemented, experimental, §16), ~~REST/gRPC transport, stdio ACP `session/load`, codex attachment arguments, OTLP metrics/cross-process context~~ (implemented, §7/§13). |
 
 ---
@@ -1545,8 +1545,9 @@ type ServerConfig struct {
     Listen             string          `yaml:"listen"`
     BaseURL            string          `yaml:"base_url"`
     AllowInsecure      bool            `yaml:"allow_insecure"` // allow a non-loopback unauthenticated bind
-    TaskStoreFile      string          `yaml:"task_store_file"`   // persist tasks (durable interaction)
-    SessionStoreDir    string          `yaml:"session_store_dir"` // persist CLI session ids per agent
+    StorePath          string          `yaml:"store_path"`       // SQLite DB path for tasks (store: sqlite)
+    SessionStoreDir    string          `yaml:"session_store_dir"` // dir for per-agent session DBs
+    Store              string          `yaml:"store"`             // persistence: "" (in-memory) | sqlite
     Auth               AuthConfig      `yaml:"auth"`
     CORSAllowedOrigins []string        `yaml:"cors_allowed_origins"`
     RateLimit          *RateLimitConfig `yaml:"rate_limit"` // per-(caller, agent) token bucket

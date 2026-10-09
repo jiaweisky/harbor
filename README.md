@@ -177,8 +177,9 @@ full reference. Durations use Go syntax (`30s`, `30m`, `1h`).
 | `base_url` | string | no | — | externally reachable URL used in agent cards |
 | `allow_insecure` | bool | no | `false` | allow a non-loopback bind with `auth.mode: none` |
 | `push_allow_private_networks` | bool | no | `false` | disable the SSRF guard on push webhooks |
-| `task_store_file` | string | no | — | persist tasks (durable interactions) to this JSON file |
-| `session_store_dir` | string | no | — | persist CLI session ids per agent (`<dir>/<id>.json`) |
+| `store` | string | no | — | persistence backend: unset = in-memory, `sqlite` = durable (survives restart) |
+| `store_path` | string | for `store: sqlite` | — | SQLite DB path for tasks |
+| `session_store_dir` | string | no | — | dir for per-agent session DBs (`<dir>/<id>.db`) |
 | `auth.mode` | string | no | `none` | `none` \| `bearer` |
 | `auth.tokens` | string[] | no | — | bearer tokens (required when `mode: bearer`) |
 | `cors_allowed_origins` | string[] | no | — | allowed CORS origins |

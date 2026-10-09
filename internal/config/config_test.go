@@ -261,6 +261,40 @@ agents:
 	}
 }
 
+func TestStoreMustBeKnown(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+server:
+  store: bogus
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "store") {
+		t.Fatalf("expected a store error, got %v", err)
+	}
+}
+
+func TestSQLiteStoreRequiresAPath(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+server:
+  store: sqlite
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "store_path") {
+		t.Fatalf("expected a path error, got %v", err)
+	}
+}
+
 func TestAgentWorkdirMustExist(t *testing.T) {
 	path := writeConfig(t, `
 version: 1

@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -41,14 +42,14 @@ import (
 // information; it exists so CodeBuddy works out of the box.
 const DiscoveryPath = "/.well-known/agents.json"
 
-// sessionStore returns a per-agent session store: a file-backed store under dir
-// when configured (so CLI session continuity survives a restart), otherwise an
-// in-memory one.
-func sessionStore(dir, agentID string) (bridge.SessionStore, error) {
-	if dir == "" {
+// sessionStore returns a per-agent session store: a SQLite store under dir when
+// persistence is enabled (so CLI session continuity survives a restart),
+// otherwise an in-memory one.
+func sessionStore(sc config.ServerConfig, agentID string) (bridge.SessionStore, error) {
+	if sc.Store != config.StoreSQLite || sc.SessionStoreDir == "" {
 		return session.New(), nil
 	}
-	return session.NewFileStore(filepath.Join(dir, agentID+".json"))
+	return session.NewSQLiteStore(filepath.Join(sc.SessionStoreDir, agentID+".db"))
 }
 
 // containerSpec builds the runner's container sandbox from the configuration, or
@@ -90,7 +91,12 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 type Servers struct {
 	HTTP http.Handler
 	GRPC []*GRPCServer
+
+	closers []io.Closer
 }
+
+// Close releases resources held by the servers, such as SQLite stores.
+func (s *Servers) Close() error { return closeAll(s.closers) }
 
 // GRPCServer is one agent's gRPC server (A2A gRPC binding) on its address.
 type GRPCServer struct {
@@ -105,9 +111,13 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 	if err != nil {
 		return nil, err
 	}
-	taskStore, err := newTaskStore(cfg.Server.TaskStoreFile)
+	taskStore, err := newTaskStore(cfg.Server)
 	if err != nil {
 		return nil, err
+	}
+	var closers []io.Closer
+	if c, ok := taskStore.(io.Closer); ok {
+		closers = append(closers, c)
 	}
 
 	pushStore := push.NewInMemoryStore()
@@ -125,11 +135,13 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 		mux:            http.NewServeMux(),
 		authReady:      make(map[string]bool, len(cfg.Agents)),
 		handlerOptions: handlerOptions(pushStore, pushSender, taskStore),
+		closers:        closers,
 	}
 	for i := range cfg.Agents {
 		b.addAgent(ctx, cfg.Agents[i])
 	}
 	if len(b.cards) == 0 {
+		_ = closeAll(b.closers)
 		return nil, fmt.Errorf("no agents available; check the agent config and that their binaries exist")
 	}
 
@@ -141,17 +153,28 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 	mux.HandleFunc("/metrics", metricsHandler(b.execs))
 
 	httpHandler := traceMiddleware(bridge.CORSMiddleware(cfg.Server.CORSAllowedOrigins, mux))
-	return &Servers{HTTP: httpHandler, GRPC: b.grpc}, nil
+	return &Servers{HTTP: httpHandler, GRPC: b.grpc, closers: b.closers}, nil
 }
 
-// newTaskStore returns the configured task store: file-backed when path is set,
-// otherwise in-memory. The executor also reads it, for idempotent sends and
-// durable interactions.
-func newTaskStore(path string) (taskstore.Store, error) {
-	if path == "" {
+// closeAll closes every closer, returning the first error.
+func closeAll(closers []io.Closer) error {
+	var err error
+	for _, c := range closers {
+		if e := c.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
+}
+
+// newTaskStore returns the configured task store: a SQLite store when
+// server.store is "sqlite" and a path is set, otherwise in-memory. The executor
+// also reads it, for idempotent sends and durable interactions.
+func newTaskStore(sc config.ServerConfig) (taskstore.Store, error) {
+	if sc.Store != config.StoreSQLite || sc.StorePath == "" {
 		return taskstore.NewInMemory(nil), nil
 	}
-	ts, err := store.NewFileStore(path)
+	ts, err := store.NewSQLiteStore(sc.StorePath)
 	if err != nil {
 		return nil, fmt.Errorf("task store: %w", err)
 	}
@@ -197,6 +220,7 @@ type agentBuilder struct {
 	execs     []*bridge.CLIExecutor
 	authReady map[string]bool
 	grpc      []*GRPCServer
+	closers   []io.Closer
 }
 
 // addAgent builds one agent's runtime and, on success, registers its card,
@@ -216,10 +240,13 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 		slog.Warn("binary missing", "id", ac.ID, "err", info.Err)
 		return
 	}
-	sessions, err := sessionStore(b.cfg.Server.SessionStoreDir, ac.ID)
+	sessions, err := sessionStore(b.cfg.Server, ac.ID)
 	if err != nil {
 		slog.Warn("agent disabled", "id", ac.ID, "err", err)
 		return
+	}
+	if c, ok := sessions.(io.Closer); ok {
+		b.closers = append(b.closers, c)
 	}
 	resolver := workspace.NewResolverWithIsolation(ac.Workdir,
 		b.cfg.Sandbox.Isolation, b.cfg.Sandbox.IsolationRoot)

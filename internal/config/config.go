@@ -31,14 +31,20 @@ type TelemetryConfig struct {
 	ServiceName string `yaml:"service_name"` // resource service.name; default harbor
 }
 
+// Persistence backend for the task and session stores.
+const (
+	StoreSQLite = "sqlite"
+)
+
 // ServerConfig configures the HTTP server and discovery.
 type ServerConfig struct {
 	Listen                   string     `yaml:"listen"`
 	BaseURL                  string     `yaml:"base_url"`
 	AllowInsecure            bool       `yaml:"allow_insecure"`              // allow a non-loopback unauthenticated bind
 	PushAllowPrivateNetworks bool       `yaml:"push_allow_private_networks"` // disable the push webhook SSRF guard
-	TaskStoreFile            string     `yaml:"task_store_file"`             // persist tasks (durable interaction)
-	SessionStoreDir          string     `yaml:"session_store_dir"`           // persist CLI session ids per agent
+	StorePath                string     `yaml:"store_path"`                  // SQLite DB path for tasks (store: sqlite)
+	SessionStoreDir          string     `yaml:"session_store_dir"`           // dir for per-agent session DBs
+	Store                    string     `yaml:"store"`                       // persistence: "" (in-memory) | sqlite
 	Auth                     AuthConfig `yaml:"auth"`
 	CORSAllowedOrigins       []string   `yaml:"cors_allowed_origins"`
 
@@ -426,10 +432,18 @@ func (c *Config) validate() error {
 func (c *Config) validateServer() error {
 	switch c.Server.Auth.Mode {
 	case "none", "bearer":
-		return nil
 	default:
 		return fmt.Errorf("server.auth.mode must be one of none, bearer; got %q", c.Server.Auth.Mode)
 	}
+	switch c.Server.Store {
+	case "", StoreSQLite:
+	default:
+		return fmt.Errorf("server.store must be sqlite; got %q", c.Server.Store)
+	}
+	if c.Server.Store == StoreSQLite && c.Server.StorePath == "" && c.Server.SessionStoreDir == "" {
+		return fmt.Errorf("server.store: sqlite requires store_path or session_store_dir")
+	}
+	return nil
 }
 
 func (c *Config) validateSandbox() error {
