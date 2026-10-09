@@ -321,11 +321,14 @@ type LimitsConfig struct {
 	Breaker       *BreakerConfig `yaml:"breaker"`      // optional failure circuit breaker
 }
 
-// BreakerConfig configures the per-agent failure circuit breaker.
+// BreakerConfig configures the per-agent failure circuit breaker. It trips on a
+// failure ratio over a sliding window of recent calls.
 type BreakerConfig struct {
-	Threshold   int           `yaml:"threshold"`    // consecutive failures that open the breaker
-	Cooldown    time.Duration `yaml:"cooldown"`     // open duration before a probe
-	MaxCooldown time.Duration `yaml:"max_cooldown"` // backoff cap
+	Threshold         int           `yaml:"threshold"`           // recent calls tracked (window size)
+	FailureRatio      float64       `yaml:"failure_ratio"`       // trip when failures/window >= this; default 0.5
+	HalfOpenSuccesses int           `yaml:"half_open_successes"` // probe successes needed to close; default 1
+	Cooldown          time.Duration `yaml:"cooldown"`            // open duration before a probe
+	MaxCooldown       time.Duration `yaml:"max_cooldown"`        // backoff cap
 }
 
 // Load reads and validates a config file, applying defaults.

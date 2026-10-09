@@ -259,8 +259,10 @@ full reference. Durations use Go syntax (`30s`, `30m`, `1h`).
 | `timeout` | duration | total task timeout |
 | `idle_timeout` | duration | fail a task with no events for this long |
 | `max_turns` | int | max turns (start + resumes) per task |
-| `breaker.threshold` | int | consecutive failures that open the circuit breaker |
-| `breaker.cooldown` | duration | open duration before a probe |
+| `breaker.threshold` | int | recent calls tracked (window size) |
+| `breaker.failure_ratio` | float | trip when the failure ratio in the window reaches this (default `0.5`) |
+| `breaker.half_open_successes` | int | consecutive probe successes that close the breaker (default `1`) |
+| `breaker.cooldown` | duration | open duration before a probe (also the probe deadline) |
 | `breaker.max_cooldown` | duration | backoff cap |
 
 ### `agents[].skills[]`

@@ -1120,22 +1120,22 @@ Key points:
 **State machine (independent per agent)**: `closed → open → half-open → closed`
 
 ```
-closed    accepting normally; consecutive failure count ++
+closed    accepting normally; each outcome feeds a sliding window of the last N calls
 open      fast-fail (reject new tasks), lasts for cooldown; on expiry → half-open
-half-open allows 1 probe request; success → closed (count reset); failure → open (cooldown doubles, capped at max)
+half-open admits one probe at a time for a bounded window; enough consecutive success → closed (window reset); any failure → open (cooldown doubles, capped at max); a probe never answered → re-open on the deadline
 ```
 
 **Counts and thresholds** (configurable via `limits.breaker`):
 
-- **Counted as failure**: `cli_not_found`, `internal` (crash/startup failure), consecutive `timeout`.
-- **Not counted**: user cancellation (`canceled`), `unsupported_content`, `input-required` pauses.
-- Defaults: `threshold: 3` (consecutive failures within a time window), `window: 5m`, `cooldown: 30s`, `max_cooldown: 10m`.
+- **Counted as failure**: `cli_not_found`, `internal` (crash/startup failure), `timeout`.
+- **Not counted**: user cancellation (`canceled`), `unsupported_content`, `input-required` pauses (these `Resolve` a probe instead of failing it).
+- The breaker trips when the window is full and the failure ratio reaches `failure_ratio`. Defaults: `threshold: 3` (window size), `failure_ratio: 0.5`, `half_open_successes: 1`, `cooldown: 30s`, `max_cooldown: 10m`.
 
 **Behavior after triggering**:
 
 - New tasks are **immediately** returned with `TaskStateRejected` + `harbor.errorCode=agent_unavailable` (the process is not started; fast-fail).
 - `/readyz` marks that agent `unhealthy`; if **all** agents are unavailable the service is `not ready`.
-- During the breaker period, background `Probe` (or half-open probing) runs according to the cooldown to auto-recover.
+- Auto-recovery: after the cooldown the breaker admits a half-open probe; the half-open phase is time-bounded, so an unanswered probe cannot wedge it.
 
 **Difference from startup disable**: a startup `Probe` failure = **permanently disabled** (until configuration/environment is fixed); a runtime breaker = **temporarily open**, recoverable automatically.
 
@@ -1143,7 +1143,7 @@ half-open allows 1 probe request; success → closed (count reset); failure → 
 
 ```yaml
 limits:
-  breaker: { threshold: 3, window: 5m, cooldown: 30s, max_cooldown: 10m }
+  breaker: { threshold: 3, failure_ratio: 0.5, cooldown: 30s, max_cooldown: 10m }
 ```
 
 ---
@@ -1631,10 +1631,11 @@ type LimitsConfig struct {
 }
 
 type BreakerConfig struct {
-    Threshold   int           `yaml:"threshold"`    // consecutive failures to open
-    Window      time.Duration `yaml:"window"`       // counting window
-    Cooldown    time.Duration `yaml:"cooldown"`     // initial open duration
-    MaxCooldown time.Duration `yaml:"max_cooldown"` // backoff cap
+    Threshold         int           `yaml:"threshold"`           // recent calls tracked (window size)
+    FailureRatio      float64       `yaml:"failure_ratio"`       // trip when failures/window >= this
+    HalfOpenSuccesses int           `yaml:"half_open_successes"` // probe successes needed to close
+    Cooldown          time.Duration `yaml:"cooldown"`            // initial open duration
+    MaxCooldown       time.Duration `yaml:"max_cooldown"`        // backoff cap
 }
 ```
 
