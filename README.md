@@ -27,7 +27,7 @@ An `agents[]` entry binds one CLI (`binary`) to exactly one **integration**
 | Integration   | How the CLI is driven                                                                 |
 |---------------|---------------------------------------------------------------------------------------|
 | `stream-json` | Prompt (and later answers) over stdin as NDJSON; events streamed back on stdout. Gives token streaming, tool traces, and native interaction. |
-| `exec`        | One-shot invocation; the prompt is substituted into `args` and the CLI's stdout is parsed (plain `text` or a `regex`). |
+| `exec`        | One-shot invocation; the prompt is substituted into `args` and the CLI's stdout is parsed (`text` by default; `codex`, `regex`, or `stream-json` via `parser`). |
 | `acp`         | Agent Client Protocol over the CLI's stdio (`<cli> acp`, `codebuddy --acp`).          |
 | `server`      | Harbor proxies the CLI's own HTTP/app server (opencode `serve`, codebuddy `--serve`, codex `app-server`) and reuses server-side sessions. |
 
@@ -223,13 +223,13 @@ full reference. Durations use Go syntax (`30s`, `30m`, `1h`).
 | `id` | string | **yes** | — | agent id (route/card/skill base) |
 | `binary` | string | **yes** | — | CLI executable (name or path) |
 | `integration` | string | for unknown binaries | profile default | `exec` \| `stream-json` \| `acp` \| `server` |
-| `display_name` | string | no | `id` | card `name` suffix and skill name |
+| `display_name` | string | no | `id` | card `name` (`Harbor/<display_name>`) |
 | `description` | string | no | template | card description text |
 | `version` | string | no | probed | card version (skips probing) |
 | `workdir` | string | no | Harbor cwd | project dir the CLI is started in (its project root); must exist |
 | `args` | string[] | exec/acp rules | — | launch args. `exec` must contain `{{.Prompt}}`; `acp` needs the ACP subcommand |
 | `env` | map | no | — | extra environment for the CLI |
-| `parser` | string | no | `text` | `exec` framing: `text` \| `codex` \| `regex` |
+| `parser` | string | no | `text` | `exec` framing: `text` \| `stream-json` \| `codex` \| `regex` |
 | `regex.text` | string | for `parser: regex` | — | line regex with one capture group |
 | `server_url` | string | no | — | `server`: connect to an existing instance instead of spawning |
 | `server_protocol` | string | no | `http` | `server`: `http` \| `acp` \| `acp-streamable-http` |
@@ -313,23 +313,23 @@ rules in config (`OPENCODE_CONFIG_CONTENT` or a project `opencode.json`); codex
 ## Testing with a codebuddy client
 
 Start Harbor, then point codebuddy's A2A client at its aggregate discovery
-endpoint. The URL must match your `server.base_url` (the command below assumes
-Harbor is on port 9099; the bundled example uses 8080):
+endpoint. The URL must match your `server.base_url`; the bundled example listens
+on `127.0.0.1:8080`:
 
 ```sh
 make run            # builds and runs on the configured server.listen
 
 # in another shell
 CODEBUDDY_A2A_OUTBOUND_ENABLED=1 \
-CODEBUDDY_REMOTE_AGENTS_URL=http://127.0.0.1:9099/.well-known/agents.json \
+CODEBUDDY_REMOTE_AGENTS_URL=http://127.0.0.1:8080/.well-known/agents.json \
 codebuddy
 ```
 
 You can also inspect the agents directly:
 
 ```sh
-curl -s http://127.0.0.1:9099/.well-known/agents.json | jq '.[].name'
-curl -s http://127.0.0.1:9099/agents/codebuddy/.well-known/agent-card.json | jq
+curl -s http://127.0.0.1:8080/.well-known/agents.json | jq '.[].name'
+curl -s http://127.0.0.1:8080/agents/codebuddy/.well-known/agent-card.json | jq
 ```
 
 ## Extending

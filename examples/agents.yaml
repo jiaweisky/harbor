@@ -72,7 +72,7 @@ agents:
       - "ReadMcpResource"
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
     limits: { max_concurrent: 3, timeout: 30m, breaker: { threshold: 3, cooldown: 30s, max_cooldown: 10m } }
-    description: "CodeBuddy (read-only) answers questions about a codebase without modifying it."
+    description: "CodeBuddy (read-only) answers questions about the Harbor project without modifying it."
 
   # OpenCode with no tool restrictions: any tool its agent mode allows is usable.
   - id: opencode
@@ -82,4 +82,4 @@ agents:
     args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]   # exec passes the prompt via {{.Prompt}}
     session: { id_flag: "--session", continue_flag: "--continue" }
     limits: { max_concurrent: 2 }
-    description: "OpenCode is a helpful software-development assistant for reading, searching, and explaining a codebase."
+    description: "OpenCode assists with the Harbor project: reading, searching, explaining, and editing its code."
