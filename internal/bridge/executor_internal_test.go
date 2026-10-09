@@ -53,12 +53,11 @@ func TestResumeFreshInjectsAnswer(t *testing.T) {
 		t.Fatalf("sessionId = %v, want sess-xyz", sid)
 	}
 
-	// Simulate the process being gone (Harbor restarted): drop the live session,
-	// its run entry, and the in-memory pending interaction, so the interaction
-	// must be reconstructed from the persisted input-required status message.
+	// Simulate the process being gone (Harbor restarted): drop the live session
+	// and the whole per-task state, so the interaction must be reconstructed
+	// from the persisted input-required status message.
 	exec.live.Del(string(task.ID))
-	exec.runs.Delete(string(task.ID))
-	exec.interactions.Delete(string(task.ID))
+	exec.tasks.Delete(string(task.ID))
 
 	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("allow"))
 	answer.TaskID = task.ID

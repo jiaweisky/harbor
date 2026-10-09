@@ -65,14 +65,7 @@ type CLIExecutor struct {
 	timeout       time.Duration // total task timeout; 0 disables
 	idleTimeout   time.Duration // fail a task with no output for this long; 0 disables
 	breaker       *breaker      // nil disables
-	baselines     sync.Map      // taskID -> changes.Baseline
-	locks         sync.Map      // taskID -> func() (workdir lock release)
-	runs          sync.Map      // taskID -> *taskRun (process lifetime, decoupled from the request)
-	interactions  sync.Map      // taskID -> *agent.Interaction awaiting an answer
-	taskStart     sync.Map      // taskID -> time.Time (submission, for duration)
-	structured    sync.Map      // taskID -> *structuredState
-	turns         sync.Map      // taskID -> *atomic.Int64 (start + resumes)
-	pauseReap     sync.Map      // taskID -> context.CancelFunc (paused-task reaper)
+	tasks         sync.Map      // taskID -> *taskState (all per-task transient state)
 	maxTurns      int
 	fileArtifacts bool // emit a per-file artifact for each changed file
 	taskLookup    func(context.Context, a2a.TaskID) (*a2a.Task, bool)
@@ -128,15 +121,113 @@ func (c *idemCache) storeLocked(key string, id a2a.TaskID) {
 
 // structuredState tracks a task whose request asked for structured output, so
 // the executor can fall back to parsing the final text when the CLI has no
-// explicit structured-output event (exec CLIs).
+// explicit structured-output event (exec CLIs). It is touched only by the task's
+// own goroutine.
 type structuredState struct{ emitted bool }
 
-// taskRun is the lifetime of one CLI process. Its context is detached from the
-// RPC context so a task paused on input-required keeps the process alive after
-// the request returns; it is canceled only on a terminal state or Cancel.
-type taskRun struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+// taskState is the transient state of one task execution. A single entry in
+// CLIExecutor.tasks owns everything a task holds while it runs: its process
+// lifetime (ctx/cancel), the workdir lock, the change baseline, the turn count,
+// the structured-output flag, and any pending interaction or paused-task reaper.
+// forget releases the entry and everything in it together.
+type taskState struct {
+	// ctx is detached from the RPC context so a task paused on input-required
+	// keeps its process alive after the request returns; it is canceled on a
+	// terminal state, Cancel, or the configured task timeout.
+	ctx     context.Context
+	cancel  context.CancelFunc
+	started time.Time
+
+	turns atomic.Int64
+
+	// mu guards the fields below, which are touched from more than one
+	// goroutine (the task's own goroutine, Cancel, and the paused-task reaper).
+	mu          sync.Mutex
+	lock        func()
+	baseline    *changes.Baseline
+	structured  *structuredState
+	interaction *agent.Interaction
+	reap        context.CancelFunc
+}
+
+func (s *taskState) setStructured(st *structuredState) {
+	s.mu.Lock()
+	s.structured = st
+	s.mu.Unlock()
+}
+
+func (s *taskState) structuredState() *structuredState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.structured
+}
+
+func (s *taskState) setBaseline(b changes.Baseline) {
+	s.mu.Lock()
+	s.baseline = &b
+	s.mu.Unlock()
+}
+
+// takeBaseline returns the change baseline once, then clears it so a second
+// call does not re-emit the same changes.
+func (s *taskState) takeBaseline() (changes.Baseline, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.baseline == nil {
+		return changes.Baseline{}, false
+	}
+	b := *s.baseline
+	s.baseline = nil
+	return b, true
+}
+
+func (s *taskState) setLock(release func()) {
+	if release == nil {
+		return
+	}
+	s.mu.Lock()
+	s.lock = release
+	s.mu.Unlock()
+}
+
+func (s *taskState) takeLock() func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.lock
+	s.lock = nil
+	return f
+}
+
+func (s *taskState) setInteraction(it *agent.Interaction) {
+	s.mu.Lock()
+	s.interaction = it
+	s.mu.Unlock()
+}
+
+func (s *taskState) takeInteraction() {
+	s.mu.Lock()
+	s.interaction = nil
+	s.mu.Unlock()
+}
+
+func (s *taskState) pendingInteraction() *agent.Interaction {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.interaction
+}
+
+func (s *taskState) setReap(cancel context.CancelFunc) {
+	s.mu.Lock()
+	s.reap = cancel
+	s.mu.Unlock()
+}
+
+func (s *taskState) takeReap() context.CancelFunc {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.reap
+	s.reap = nil
+	return c
 }
 
 // NewCLIExecutor creates an executor over the given launcher. limits bounds the
@@ -255,7 +346,6 @@ func (e *CLIExecutor) instrument(
 				submitted = true
 				e.metrics.submitted.Add(1)
 				telemetry.TaskSubmitted(name)
-				e.taskStart.Store(taskID, start)
 				slog.Info("task submitted", "agent", name, "task", taskID, "user", username)
 			}
 		}
@@ -264,8 +354,8 @@ func (e *CLIExecutor) instrument(
 				finished = true
 				e.metrics.record(outcome)
 				span.SetAttributes(attribute.String("harbor.outcome", outcome))
-				if ts, ok := e.taskStart.LoadAndDelete(taskID); ok {
-					start = ts.(time.Time) // measure from submission, across a resume
+				if st := e.loadState(taskID); st != nil {
+					start = st.started // measure from submission, across a resume
 				}
 				dur := time.Since(start)
 				e.metrics.observeDuration(dur)
@@ -283,67 +373,82 @@ func (e *CLIExecutor) start(
 	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string,
 	yield func(a2a.Event, error) bool,
 ) {
-	if e.takeTurn(taskID) {
-		e.breaker.Resolve()
+	st := e.startTask(ctx, taskID)
+	if e.takeTurn(st) {
+		e.cleanup(taskID, false)
 		yield(failedStatus(ec, codeMaxTurns, "max turns exceeded"), nil)
 		return
 	}
 	if ec.StoredTask == nil {
 		if !yield(a2a.NewSubmittedTask(ec, ec.Message), nil) {
+			e.cleanup(taskID, false)
 			return
 		}
 	}
 	if !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
+		e.cleanup(taskID, false)
 		return
 	}
 
 	req, err := e.toRequest(ec)
 	if err != nil {
-		e.breaker.Resolve()
+		e.cleanup(taskID, false)
 		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
 		return
 	}
 	if req.OutputSchema != nil {
-		e.structured.Store(taskID, &structuredState{})
+		st.setStructured(&structuredState{})
 	}
-	e.locks.Store(taskID, e.workspace.Lock(req.WorkDir))
+	st.setLock(e.workspace.Lock(req.WorkDir))
 	if req.WorkDir != "" {
-		e.baselines.Store(taskID, changes.Snapshot(req.WorkDir))
+		st.setBaseline(changes.Snapshot(req.WorkDir))
 	}
-	runCtx := e.beginRun(ctx, taskID)
-	sess, err := e.launcher.Start(agent.WithTaskID(runCtx, taskID), req)
+	e.launchAndPump(st, ec, taskID, req, false, yield)
+}
+
+// launchAndPump starts the CLI for a prepared task and pumps its events. A
+// resumed session announces the working state after the process starts; a fresh
+// start already announced it, so emitWorking is false there.
+func (e *CLIExecutor) launchAndPump(
+	st *taskState, ec *a2asrv.ExecutorContext, taskID string, req *agent.Request,
+	emitWorking bool, yield func(a2a.Event, error) bool,
+) {
+	sess, err := e.launcher.Start(agent.WithTaskID(st.ctx, taskID), req)
 	if err != nil {
 		e.cleanup(taskID, true)
 		yield(failedStatus(ec, codeForStartError(err), err.Error()), nil)
 		return
 	}
 	e.live.Put(taskID, sess)
-	e.pump(runCtx, ec, taskID, sess, yield)
+	if emitWorking && !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
+		e.teardown(taskID, sess)
+		return
+	}
+	e.pump(st, ec, taskID, sess, yield)
 }
 
-// beginRun starts a process lifetime for a task and returns its context. The
-// context is detached from parent (which is canceled when the RPC returns) so a
-// paused task stays alive; it is bounded by the configured task timeout.
-func (e *CLIExecutor) beginRun(parent context.Context, taskID string) context.Context {
+// startTask creates a task's state and starts its process lifetime. The context
+// is detached from parent (canceled when the RPC returns) so a paused task stays
+// alive; it is bounded by the configured task timeout.
+func (e *CLIExecutor) startTask(parent context.Context, taskID string) *taskState {
 	base := context.WithoutCancel(parent)
 	runCtx, cancel := context.WithCancel(base)
 	if e.timeout > 0 {
 		runCtx, cancel = context.WithTimeout(base, e.timeout)
 	}
-	e.runs.Store(taskID, &taskRun{ctx: runCtx, cancel: cancel})
+	st := &taskState{ctx: runCtx, cancel: cancel, started: time.Now()}
+	e.tasks.Store(taskID, st)
 	e.metrics.active.Add(1)
 	telemetry.TaskActive(1)
-	return runCtx
+	return st
 }
 
-// endRun cancels and forgets a task's process lifetime. It is idempotent, so
-// the active gauge is decremented exactly once per run.
-func (e *CLIExecutor) endRun(taskID string) {
-	if v, ok := e.runs.LoadAndDelete(taskID); ok {
-		v.(*taskRun).cancel()
-		e.metrics.active.Add(-1)
-		telemetry.TaskActive(-1)
+// loadState returns a task's state, or nil when the task has none.
+func (e *CLIExecutor) loadState(taskID string) *taskState {
+	if v, ok := e.tasks.Load(taskID); ok {
+		return v.(*taskState)
 	}
+	return nil
 }
 
 // resume answers a task paused on input-required by writing to its live session.
@@ -351,29 +456,26 @@ func (e *CLIExecutor) resume(
 	ec *a2asrv.ExecutorContext, taskID string,
 	yield func(a2a.Event, error) bool,
 ) {
-	e.disarmPauseReaper(taskID)
-	if e.takeTurn(taskID) {
-		if sess, ok := e.live.Get(taskID); ok {
-			e.teardown(taskID, sess)
+	st := e.loadState(taskID)
+	if st != nil {
+		e.disarmPauseReaper(st)
+		if e.takeTurn(st) {
+			e.stopPausedTask(taskID)
+			yield(failedStatus(ec, codeMaxTurns, "max turns exceeded"), nil)
+			return
 		}
-		e.breaker.Resolve()
-		yield(failedStatus(ec, codeMaxTurns, "max turns exceeded"), nil)
-		return
-	}
-	v, ok := e.runs.Load(taskID)
-	if !ok {
-		e.resumeFresh(ec, taskID, yield)
-		return
-	}
-	run := v.(*taskRun)
-	if err := run.ctx.Err(); err != nil {
-		// The process already ended (typically the task timed out while paused).
-		e.cleanup(taskID, true)
-		yield(failedStatus(ec, codeForRunError(err), err.Error()), nil)
-		return
+		if err := st.ctx.Err(); err != nil {
+			// The process already ended (typically the task timed out while paused).
+			e.cleanup(taskID, true)
+			yield(failedStatus(ec, codeForRunError(err), err.Error()), nil)
+			return
+		}
 	}
 	sess, ok := e.live.Get(taskID)
-	if !ok {
+	if st == nil || !ok {
+		// No live process (for example after a restart): drop any stale state
+		// and resume the CLI's recorded session instead.
+		e.forget(taskID)
 		e.resumeFresh(ec, taskID, yield)
 		return
 	}
@@ -385,8 +487,8 @@ func (e *CLIExecutor) resume(
 		yield(failedStatus(ec, codeInternal, err.Error()), nil)
 		return
 	}
-	e.interactions.Delete(taskID)
-	if err := sess.Send(run.ctx, in); err != nil {
+	st.takeInteraction()
+	if err := sess.Send(st.ctx, in); err != nil {
 		e.cleanup(taskID, true)
 		yield(failedStatus(ec, codeInternal, err.Error()), nil)
 		return
@@ -395,7 +497,17 @@ func (e *CLIExecutor) resume(
 		e.teardown(taskID, sess)
 		return
 	}
-	e.pump(run.ctx, ec, taskID, sess, yield)
+	e.pump(st, ec, taskID, sess, yield)
+}
+
+// stopPausedTask tears down a paused task's live process, or releases its state
+// when no live process remains.
+func (e *CLIExecutor) stopPausedTask(taskID string) {
+	if sess, ok := e.live.Get(taskID); ok {
+		e.teardown(taskID, sess)
+		return
+	}
+	e.cleanup(taskID, false)
 }
 
 // resumeFresh recovers a task paused on input-required whose live process is gone
@@ -414,28 +526,19 @@ func (e *CLIExecutor) resumeFresh(
 	}
 	in, err := e.answerFromMessage(ec, taskID, ec.Message)
 	if err != nil || strings.TrimSpace(in.Answer) == "" {
+		e.forget(taskID)
 		yield(failedStatus(ec, codeInternal, "session lost"), nil)
 		return
 	}
 	dir, err := e.workspace.Resolve(contextKey(ec))
 	if err != nil {
+		e.forget(taskID)
 		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
 		return
 	}
-	runCtx := e.beginRun(context.Background(), taskID)
-	sess, err := e.launcher.Start(agent.WithTaskID(runCtx, taskID),
-		&agent.Request{Prompt: in.Answer, SessionID: sid, WorkDir: dir})
-	if err != nil {
-		e.cleanup(taskID, true)
-		yield(failedStatus(ec, codeForStartError(err), err.Error()), nil)
-		return
-	}
-	e.live.Put(taskID, sess)
-	if !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
-		e.teardown(taskID, sess)
-		return
-	}
-	e.pump(runCtx, ec, taskID, sess, yield)
+	st := e.startTask(context.Background(), taskID)
+	e.launchAndPump(st, ec, taskID,
+		&agent.Request{Prompt: in.Answer, SessionID: sid, WorkDir: dir}, true, yield)
 }
 
 // sessionFromTask returns the CLI session id recorded with a paused task.
@@ -453,43 +556,46 @@ func (e *CLIExecutor) teardown(taskID string, sess agent.Session) {
 	e.cleanup(taskID, false)
 }
 
-// forget releases a task's transient state: its process lifetime, live session,
-// change baseline, pending interaction, and workdir lock. It is idempotent and
-// does not touch the failure breaker.
+// forget releases a task's state: its process lifetime, workdir lock, change
+// baseline, pending interaction, paused-task reaper, and live session. It is the
+// single release path and is idempotent; it does not touch the failure breaker.
 func (e *CLIExecutor) forget(taskID string) {
-	e.disarmPauseReaper(taskID)
-	e.endRun(taskID)
+	v, ok := e.tasks.LoadAndDelete(taskID)
+	if !ok {
+		return
+	}
+	st := v.(*taskState)
+	st.cancel()
+	if c := st.takeReap(); c != nil {
+		c()
+	}
+	if f := st.takeLock(); f != nil {
+		f()
+	}
 	e.live.Del(taskID)
-	e.baselines.Delete(taskID)
-	e.interactions.Delete(taskID)
-	e.structured.Delete(taskID)
-	e.turns.Delete(taskID)
-	e.releaseLock(taskID)
+	e.metrics.active.Add(-1)
+	telemetry.TaskActive(-1)
 }
 
 // armPauseReaper reaps a task paused on input-required if it is not answered
 // before idleTimeout elapses or its run deadline passes. Without it a paused
 // task holds its CLI process and workdir lock until the client answers.
-func (e *CLIExecutor) armPauseReaper(taskID string, runCtx context.Context, sess agent.Session) {
+func (e *CLIExecutor) armPauseReaper(st *taskState, taskID string, sess agent.Session) {
 	ctx, cancel := context.WithCancel(context.Background())
-	e.pauseReap.Store(taskID, cancel)
+	st.setReap(cancel)
 	go func() {
 		defer cancel()
+		var timeoutC <-chan time.Time
 		if e.idleTimeout > 0 {
 			t := time.NewTimer(e.idleTimeout)
 			defer t.Stop()
-			select {
-			case <-runCtx.Done():
-			case <-t.C:
-			case <-ctx.Done():
-				return
-			}
-		} else {
-			select {
-			case <-runCtx.Done():
-			case <-ctx.Done():
-				return
-			}
+			timeoutC = t.C
+		}
+		select {
+		case <-st.ctx.Done():
+		case <-timeoutC:
+		case <-ctx.Done():
+			return
 		}
 		e.teardown(taskID, sess)
 	}()
@@ -497,20 +603,19 @@ func (e *CLIExecutor) armPauseReaper(taskID string, runCtx context.Context, sess
 
 // disarmPauseReaper stops a paused task's reaper, called when it resumes. It is
 // idempotent.
-func (e *CLIExecutor) disarmPauseReaper(taskID string) {
-	if v, ok := e.pauseReap.LoadAndDelete(taskID); ok {
-		v.(context.CancelFunc)()
+func (e *CLIExecutor) disarmPauseReaper(st *taskState) {
+	if c := st.takeReap(); c != nil {
+		c()
 	}
 }
 
 // takeTurn counts a turn for the task (a start or a resume) and reports
 // whether it exceeds the configured cap. A cap of 0 disables the check.
-func (e *CLIExecutor) takeTurn(taskID string) bool {
+func (e *CLIExecutor) takeTurn(st *taskState) bool {
 	if e.maxTurns <= 0 {
 		return false
 	}
-	v, _ := e.turns.LoadOrStore(taskID, new(atomic.Int64))
-	return int(v.(*atomic.Int64).Add(1)) > e.maxTurns
+	return int(st.turns.Add(1)) > e.maxTurns
 }
 
 // cleanup releases a task's state. When fail is true the failure breaker is
@@ -534,7 +639,7 @@ func codeForRunError(err error) string {
 // pump consumes session events, coalescing text into artifact updates and
 // keeping the task alive across an input-required pause.
 func (e *CLIExecutor) pump(
-	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
+	st *taskState, ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
 	yield func(a2a.Event, error) bool,
 ) {
 	emit := func(ev a2a.Event) bool {
@@ -566,14 +671,15 @@ func (e *CLIExecutor) pump(
 				idle.Reset(e.idleTimeout)
 			}
 			if !ok {
-				e.finish(ctx, ec, taskID, sess, sink, emit)
+				e.finish(st, ec, taskID, sess, sink, emit)
 				return
 			}
-			if !e.handleEvent(ec, taskID, sess, sink, emit, ev) {
+			if !e.handleEvent(st, ec, taskID, sess, sink, emit, ev) {
 				// A pause keeps the process and workdir lock alive for the client's
-				// answer; reap them if the answer never arrives.
-				if _, paused := e.interactions.Load(taskID); paused {
-					e.armPauseReaper(taskID, ctx, sess)
+				// answer; reap them if the answer never arrives. Skip a state torn
+				// down by a consumer disconnect.
+				if st.pendingInteraction() != nil && st.ctx.Err() == nil {
+					e.armPauseReaper(st, taskID, sess)
 				}
 				return
 			}
@@ -592,7 +698,7 @@ func (e *CLIExecutor) pump(
 // continue. A false result means the pump may stop (yield stopped, or a
 // terminal/input-required state was emitted).
 func (e *CLIExecutor) handleEvent(
-	ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
+	st *taskState, ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
 	sink *textSink, emit func(a2a.Event) bool, ev agent.Event,
 ) bool {
 	switch ev.Kind {
@@ -607,14 +713,14 @@ func (e *CLIExecutor) handleEvent(
 		if !sink.Flush() {
 			return false
 		}
-		e.markStructured(taskID)
+		e.markStructured(st)
 		return emitStructured(ec, emit, ev.Data)
 	case agent.EventPermissionRequest:
 		if !sink.Flush() {
 			return false
 		}
 		itx := interactionFromEvent(ev)
-		e.interactions.Store(taskID, itx)
+		st.setInteraction(itx)
 		// Keep the session alive for the client's answer; record its id so a
 		// restart can resume the CLI session and inject the answer.
 		sid, _ := e.sessions.Get(contextKey(ec))
@@ -639,7 +745,7 @@ func (e *CLIExecutor) handleEvent(
 			e.forget(taskID)
 			return false
 		}
-		e.emitStructuredFallback(ec, taskID, sink, emit)
+		e.emitStructuredFallback(st, ec, sink, emit)
 		e.complete(ec, taskID, emit)
 		return false
 	case agent.EventThinking, agent.EventToolCall, agent.EventToolResult, agent.EventUsage:
@@ -669,13 +775,15 @@ func emitStructured(ec *a2asrv.ExecutorContext, emit func(a2a.Event) bool, data 
 	return emit(evt)
 }
 
-// markStructured records that a task emitted an explicit structured result.
-func (e *CLIExecutor) markStructured(taskID string) {
-	if v, ok := e.structured.Load(taskID); ok {
-		v.(*structuredState).emitted = true
-		return
+// markStructured records that a task emitted an explicit structured result. The
+// caller always has a live task state.
+func (e *CLIExecutor) markStructured(st *taskState) {
+	ss := st.structuredState()
+	if ss == nil {
+		ss = &structuredState{}
+		st.setStructured(ss)
 	}
-	e.structured.Store(taskID, &structuredState{emitted: true})
+	ss.emitted = true
 }
 
 // emitStructuredFallback emits a schema-validated DataPart parsed from the final
@@ -683,14 +791,14 @@ func (e *CLIExecutor) markStructured(taskID string) {
 // explicit structured event (exec CLIs whose output is the JSON itself). It is a
 // no-op otherwise.
 func (e *CLIExecutor) emitStructuredFallback(
-	ec *a2asrv.ExecutorContext, taskID string, sink *textSink, emit func(a2a.Event) bool,
+	st *taskState, ec *a2asrv.ExecutorContext, sink *textSink, emit func(a2a.Event) bool,
 ) {
-	v, ok := e.structured.Load(taskID)
-	if !ok || v.(*structuredState).emitted {
+	ss := st.structuredState()
+	if ss == nil || ss.emitted {
 		return
 	}
 	if data := jsonObject(sink.Text()); data != nil {
-		e.markStructured(taskID)
+		ss.emitted = true
 		emitStructured(ec, emit, data)
 	}
 }
@@ -751,7 +859,7 @@ func usageMeta(u *agent.Usage) map[string]any {
 // channel closes (the CLI process has exited). A context deadline is reported
 // as a timeout failure.
 func (e *CLIExecutor) finish(
-	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
+	st *taskState, ec *a2asrv.ExecutorContext, taskID string, sess agent.Session,
 	sink *textSink, emit func(a2a.Event) bool,
 ) {
 	defer e.forget(taskID)
@@ -761,11 +869,11 @@ func (e *CLIExecutor) finish(
 	if sess.Canceled() {
 		return // Cancel already emitted the canceled state.
 	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if errors.Is(st.ctx.Err(), context.DeadlineExceeded) {
 		e.fail(ec, taskID, emit, codeTimeout, "task timed out")
 		return
 	}
-	e.emitStructuredFallback(ec, taskID, sink, emit)
+	e.emitStructuredFallback(st, ec, sink, emit)
 	e.emitChanges(ec, taskID, emit)
 	e.breaker.Success()
 	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil))
@@ -775,9 +883,9 @@ func (e *CLIExecutor) finish(
 // waiting for the process to exit (a duplex CLI keeps running for more input).
 func (e *CLIExecutor) complete(ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool) {
 	e.emitChanges(ec, taskID, emit)
-	e.forget(taskID)
 	e.breaker.Success()
 	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil))
+	e.forget(taskID)
 }
 
 // idleTimeoutFail fails a task whose CLI produced no output within the idle
@@ -793,28 +901,25 @@ func (e *CLIExecutor) idleTimeoutFail(
 	e.fail(ec, taskID, emit, codeTimeout, "task idle timeout")
 }
 
-// fail captures a task's changes, releases its state, and emits a failed status
-// with a machine-readable code.
+// fail captures a task's changes and emits a failed status with a
+// machine-readable code, then releases the task's state.
 func (e *CLIExecutor) fail(
 	ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool, code, msg string,
 ) {
 	e.emitChanges(ec, taskID, emit)
-	e.forget(taskID)
 	e.breaker.Failure()
 	emit(failedStatus(ec, code, msg))
-}
-
-// releaseLock releases the workdir lock held for a task, if any. It is idempotent.
-func (e *CLIExecutor) releaseLock(taskID string) {
-	if v, ok := e.locks.LoadAndDelete(taskID); ok {
-		v.(func())()
-	}
+	e.forget(taskID)
 }
 
 // emitChanges captures the task's working-tree changes and emits them as a
 // "changes" artifact. It is a no-op when there is no baseline or no diff.
 func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool) {
-	v, ok := e.baselines.LoadAndDelete(taskID)
+	st := e.loadState(taskID)
+	if st == nil {
+		return
+	}
+	base, ok := st.takeBaseline()
 	if !ok {
 		return
 	}
@@ -822,7 +927,7 @@ func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emi
 	if err != nil || dir == "" {
 		return
 	}
-	res := changes.Capture(dir, v.(changes.Baseline), 0)
+	res := changes.Capture(dir, base, 0)
 	// Surface changed image files (for example a text-to-image result) as raw
 	// image artifacts, alongside the textual diff.
 	e.emitImageArtifacts(ec, dir, res.Files, emit)
@@ -963,9 +1068,9 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 		if sess, ok := e.live.Get(taskID); ok {
 			_ = sess.Cancel()
 		}
-		e.forget(taskID)
 		e.breaker.Resolve()
 		emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCanceled, nil), nil)
+		e.forget(taskID)
 	}
 }
 
@@ -1239,7 +1344,7 @@ func (e *CLIExecutor) answerFromMessage(
 ) (agent.Input, error) {
 	id, answer, content := parseAnswer(m)
 	kind, action, target := "answer", "", ""
-	if cur, ok := e.pendingInteraction(ec, taskID); ok {
+	if cur, ok := e.answerableInteraction(ec, taskID); ok {
 		if id != "" && id != cur.ID {
 			return agent.Input{}, fmt.Errorf("interaction id mismatch: got %q, want %q", id, cur.ID)
 		}
@@ -1278,13 +1383,15 @@ func parseAnswer(m *a2a.Message) (id, answer string, content map[string]any) {
 	return metaString(m.Metadata, metaKeyInteractionID), firstTextPart(m), nil
 }
 
-// pendingInteraction returns the input request a paused task is waiting on. It
-// falls back to the interaction recorded in the persisted input-required status
-// message, so a paused task remains answerable across a restart (when a durable
-// task store is configured).
-func (e *CLIExecutor) pendingInteraction(ec *a2asrv.ExecutorContext, taskID string) (*agent.Interaction, bool) {
-	if v, ok := e.interactions.Load(taskID); ok {
-		return v.(*agent.Interaction), true
+// answerableInteraction returns the input request a paused task is waiting on.
+// It falls back to the interaction recorded in the persisted input-required
+// status message, so a paused task remains answerable across a restart (when a
+// durable task store is configured).
+func (e *CLIExecutor) answerableInteraction(ec *a2asrv.ExecutorContext, taskID string) (*agent.Interaction, bool) {
+	if st := e.loadState(taskID); st != nil {
+		if it := st.pendingInteraction(); it != nil {
+			return it, true
+		}
 	}
 	if ec.StoredTask != nil {
 		if itx, ok := interactionFromStatusMessage(ec.StoredTask.Status.Message); ok {
