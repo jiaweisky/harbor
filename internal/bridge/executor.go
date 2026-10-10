@@ -64,6 +64,7 @@ type CLIExecutor struct {
 	workspace     *workspace.Resolver
 	timeout       time.Duration // total task timeout; 0 disables
 	idleTimeout   time.Duration // fail a task with no output for this long; 0 disables
+	keepalive     time.Duration // emit a keepalive when quiet for this long; 0 disables
 	breaker       *breaker      // nil disables
 	tasks         sync.Map      // taskID -> *taskState (all per-task transient state)
 	maxTurns      int
@@ -253,6 +254,11 @@ func NewCLIExecutor(
 // SetFileArtifacts enables emitting a per-file artifact for each changed file.
 func (e *CLIExecutor) SetFileArtifacts(on bool) { e.fileArtifacts = on }
 
+// SetKeepaliveInterval makes the executor emit a lightweight working update
+// when the CLI has been silent for this long, so a liveness watchdog does not
+// mistake a long output-less step for a dead agent. 0 disables it.
+func (e *CLIExecutor) SetKeepaliveInterval(d time.Duration) { e.keepalive = d }
+
 // SetTaskLookup installs a lookup used to answer a duplicate send (same
 // messageId) from the earlier task's result instead of re-running the CLI.
 func (e *CLIExecutor) SetTaskLookup(fn func(context.Context, a2a.TaskID) (*a2a.Task, bool)) {
@@ -322,7 +328,7 @@ func (e *CLIExecutor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) i
 			return
 		}
 		if isWaitingForInput(ec) {
-			e.resume(ec, taskID, emit)
+			e.resume(ctx, ec, taskID, emit)
 			return
 		}
 		e.start(ctx, ec, taskID, emit)
@@ -403,15 +409,15 @@ func (e *CLIExecutor) start(
 	if req.WorkDir != "" {
 		st.setBaseline(changes.Snapshot(req.WorkDir))
 	}
-	e.launchAndPump(st, ec, taskID, req, false, yield)
+	e.launchAndPump(ctx, st, ec, taskID, req, false, yield)
 }
 
 // launchAndPump starts the CLI for a prepared task and pumps its events. A
 // resumed session announces the working state after the process starts; a fresh
 // start already announced it, so emitWorking is false there.
 func (e *CLIExecutor) launchAndPump(
-	st *taskState, ec *a2asrv.ExecutorContext, taskID string, req *agent.Request,
-	emitWorking bool, yield func(a2a.Event, error) bool,
+	parent context.Context, st *taskState, ec *a2asrv.ExecutorContext, taskID string,
+	req *agent.Request, emitWorking bool, yield func(a2a.Event, error) bool,
 ) {
 	sess, err := e.launcher.Start(agent.WithTaskID(st.ctx, taskID), req)
 	if err != nil {
@@ -420,6 +426,7 @@ func (e *CLIExecutor) launchAndPump(
 		return
 	}
 	e.live.Put(taskID, sess)
+	e.watchExecution(parent, taskID)
 	if emitWorking && !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
 		e.teardown(taskID, sess)
 		return
@@ -453,7 +460,7 @@ func (e *CLIExecutor) loadState(taskID string) *taskState {
 
 // resume answers a task paused on input-required by writing to its live session.
 func (e *CLIExecutor) resume(
-	ec *a2asrv.ExecutorContext, taskID string,
+	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string,
 	yield func(a2a.Event, error) bool,
 ) {
 	st := e.loadState(taskID)
@@ -476,7 +483,7 @@ func (e *CLIExecutor) resume(
 		// No live process (for example after a restart): drop any stale state
 		// and resume the CLI's recorded session instead.
 		e.forget(taskID)
-		e.resumeFresh(ec, taskID, yield)
+		e.resumeFresh(ctx, ec, taskID, yield)
 		return
 	}
 	in, err := e.answerFromMessage(ec, taskID, ec.Message)
@@ -497,6 +504,7 @@ func (e *CLIExecutor) resume(
 		e.teardown(taskID, sess)
 		return
 	}
+	e.watchExecution(ctx, taskID)
 	e.pump(st, ec, taskID, sess, yield)
 }
 
@@ -516,7 +524,7 @@ func (e *CLIExecutor) stopPausedTask(taskID string) {
 // (the CLI restarts and may replay context) and requires a recorded session id
 // and a resume-capable CLI.
 func (e *CLIExecutor) resumeFresh(
-	ec *a2asrv.ExecutorContext, taskID string, yield func(a2a.Event, error) bool,
+	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string, yield func(a2a.Event, error) bool,
 ) {
 	sid := e.sessionFromTask(ec)
 	if sid == "" || !e.launcher.Capabilities().SessionResume {
@@ -536,8 +544,8 @@ func (e *CLIExecutor) resumeFresh(
 		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
 		return
 	}
-	st := e.startTask(context.Background(), taskID)
-	e.launchAndPump(st, ec, taskID,
+	st := e.startTask(ctx, taskID)
+	e.launchAndPump(ctx, st, ec, taskID,
 		&agent.Request{Prompt: in.Answer, SessionID: sid, WorkDir: dir}, true, yield)
 }
 
@@ -554,6 +562,25 @@ func (e *CLIExecutor) sessionFromTask(ec *a2asrv.ExecutorContext) string {
 func (e *CLIExecutor) teardown(taskID string, sess agent.Session) {
 	_ = sess.Cancel()
 	e.cleanup(taskID, false)
+}
+
+// watchExecution stops the task's CLI when the server aborts the execution with
+// the agent inactivity timeout. A normal return (the request completed, e.g. a
+// pause, which also cancels the context) must not stop the CLI, so the client
+// can still resume it; a client cancel is handled by Cancel.
+func (e *CLIExecutor) watchExecution(parent context.Context, taskID string) {
+	if parent.Done() == nil {
+		return
+	}
+	go func() {
+		<-parent.Done()
+		if !errors.Is(context.Cause(parent), a2asrv.ErrAgentInactivityTimeout) {
+			return
+		}
+		if sess, ok := e.live.Get(taskID); ok {
+			e.teardown(taskID, sess)
+		}
+	}()
 }
 
 // forget releases a task's state: its process lifetime, workdir lock, change
@@ -663,10 +690,20 @@ func (e *CLIExecutor) pump(
 		defer idle.Stop()
 	}
 
+	var keep *time.Ticker
+	var keepC <-chan time.Time
+	if e.keepalive > 0 {
+		keep = time.NewTicker(e.keepalive)
+		keepC = keep.C
+		defer keep.Stop()
+	}
+
 	ch := sess.Events()
+	lastActivity := time.Now()
 	for {
 		select {
 		case ev, ok := <-ch:
+			lastActivity = time.Now()
 			if idle != nil {
 				idle.Reset(e.idleTimeout)
 			}
@@ -686,6 +723,13 @@ func (e *CLIExecutor) pump(
 		case <-ticker.C:
 			if !sink.Flush() {
 				return
+			}
+		case <-keepC:
+			if time.Since(lastActivity) >= e.keepalive {
+				if !emit(traceStatus(ec, "keepalive", "working", nil)) {
+					return
+				}
+				lastActivity = time.Now()
 			}
 		case <-idleC:
 			e.idleTimeoutFail(ec, taskID, sess, sink, emit)

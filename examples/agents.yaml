@@ -16,6 +16,7 @@ server:
   # store_path: "/var/lib/harbor/tasks.db"         # SQLite DB for tasks
   # session_store_dir: "/var/lib/harbor/sessions"   # per-agent <id>.db
   # Other server options:
+  # agent_inactivity_timeout: 10m     # fail a task if the CLI is silent this long; 0 disables
   # allow_insecure: false             # a non-loopback bind with auth.mode=none refuses to start unless true
   # cors_allowed_origins: ["https://ops.example.com"]
   # push_allow_private_networks: false

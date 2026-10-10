@@ -295,6 +295,26 @@ agents:
 	}
 }
 
+func TestAgentInactivityTimeout(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+server:
+  agent_inactivity_timeout: 30s
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Server.AgentInactivityTimeout == nil || *cfg.Server.AgentInactivityTimeout != 30*time.Second {
+		t.Fatalf("agent_inactivity_timeout = %v, want 30s", cfg.Server.AgentInactivityTimeout)
+	}
+}
+
 func TestAgentWorkdirMustExist(t *testing.T) {
 	path := writeConfig(t, `
 version: 1

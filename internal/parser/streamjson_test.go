@@ -108,6 +108,35 @@ func TestStreamJSONPartialDedup(t *testing.T) {
 	}
 }
 
+// TestStreamJSONThinkingDelta verifies an extended-thinking delta is surfaced,
+// so a long reasoning phase is not an invisible (and apparently idle) stream.
+func TestStreamJSONThinkingDelta(t *testing.T) {
+	p := parser.NewStreamJSON()
+	rec := `{"type":"stream_event","event":{"delta":{"type":"thinking_delta","thinking":"hmm"}}}`
+	evs := collect(t, p, rec)
+	if len(evs) != 1 || evs[0].Kind != agent.EventThinking || evs[0].Text != "hmm" {
+		t.Fatalf("thinking delta: %+v", evs)
+	}
+}
+
+// TestStreamJSONThinkingDeltaKeepsText verifies a thinking delta does not
+// suppress the assistant's text (only a streamed text delta does).
+func TestStreamJSONThinkingDeltaKeepsText(t *testing.T) {
+	p := parser.NewStreamJSON()
+	collect(t, p, `{"type":"stream_event","event":{"delta":{"type":"thinking_delta","thinking":"hmm"}}}`)
+	evs := collect(t, p, `{"type":"assistant","message":{"content":[{"type":"text","text":"answer"}]}}`)
+
+	var text string
+	for _, e := range evs {
+		if e.Kind == agent.EventTextDelta {
+			text += e.Text
+		}
+	}
+	if text != "answer" {
+		t.Fatalf("text = %q, want answer (thinking must not suppress the message text)", text)
+	}
+}
+
 func TestStreamJSONElicitationForm(t *testing.T) {
 	p := parser.NewStreamJSON()
 	rec := `{"type":"control_request","request_id":"el_1",` +

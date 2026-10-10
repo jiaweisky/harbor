@@ -11,7 +11,7 @@ import (
 // mode. It prefers incremental deltas over full assistant messages so that,
 // when partial streaming is enabled, text is not emitted twice.
 type StreamJSON struct {
-	sawDelta bool // a streamed delta was seen; skip duplicate full-message text
+	sawDelta bool // a streamed text delta was seen; skip the duplicate full-message text
 	sawText  bool // text was emitted; suppress the result's final-text fallback
 }
 
@@ -48,10 +48,16 @@ func (p *StreamJSON) Parse(rec []byte, out func(agent.Event)) error {
 // Flush implements agent.Parser.
 func (p *StreamJSON) Flush(func(agent.Event)) error { return nil }
 
-// parseStreamEvent handles an incremental text delta.
+// parseStreamEvent handles an incremental delta: assistant text or extended
+// thinking. Forwarding thinking keeps a long reasoning phase visible (and an
+// otherwise silent stream from looking idle to a liveness watchdog).
 func (p *StreamJSON) parseStreamEvent(rec []byte, out func(agent.Event)) {
-	p.sawDelta = true
-	if text := deltaText(rec); text != "" {
+	text, thinking := deltaText(rec)
+	switch {
+	case thinking != "":
+		out(agent.Event{Kind: agent.EventThinking, Text: thinking, Raw: rec})
+	case text != "":
+		p.sawDelta = true
 		p.sawText = true
 		out(agent.Event{Kind: agent.EventTextDelta, Text: text, Raw: rec})
 	}
@@ -177,19 +183,21 @@ func contentBlocks(rec []byte) []contentBlock {
 	return blocks
 }
 
-// deltaText extracts the text from a streamed partial-message event.
-func deltaText(rec []byte) string {
+// deltaText extracts the assistant text and extended-thinking text from a
+// streamed partial-message delta (either may be empty).
+func deltaText(rec []byte) (text, thinking string) {
 	var e struct {
 		Event struct {
 			Delta struct {
-				Text string `json:"text"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
 			} `json:"delta"`
 		} `json:"event"`
 	}
 	if err := json.Unmarshal(rec, &e); err != nil {
-		return ""
+		return "", ""
 	}
-	return e.Event.Delta.Text
+	return e.Event.Delta.Text, e.Event.Delta.Thinking
 }
 
 func init() {

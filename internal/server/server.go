@@ -125,6 +125,7 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 		Timeout:              10 * time.Second,
 		AllowPrivateNetworks: cfg.Server.PushAllowPrivateNetworks,
 	})
+	inactivity := inactivityTimeout(cfg.Server)
 
 	b := &agentBuilder{
 		cfg:            cfg,
@@ -134,7 +135,8 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 		taskLookup:     taskLookupFunc(taskStore),
 		mux:            http.NewServeMux(),
 		authReady:      make(map[string]bool, len(cfg.Agents)),
-		handlerOptions: handlerOptions(pushStore, pushSender, taskStore),
+		handlerOptions: handlerOptions(pushStore, pushSender, taskStore, inactivity),
+		keepalive:      inactivity / 2,
 		closers:        closers,
 	}
 	for i := range cfg.Agents {
@@ -194,15 +196,24 @@ func taskLookupFunc(ts taskstore.Store) func(context.Context, a2a.TaskID) (*a2a.
 
 // handlerOptions returns the shared A2A request-handler options.
 func handlerOptions(
-	pushStore push.ConfigStore, pushSender push.Sender, ts taskstore.Store,
+	pushStore push.ConfigStore, pushSender push.Sender, ts taskstore.Store, inactivity time.Duration,
 ) []a2asrv.RequestHandlerOption {
 	return []a2asrv.RequestHandlerOption{
 		a2asrv.WithLogger(slog.Default()),
-		a2asrv.WithAgentInactivityTimeout(10 * time.Minute),
+		a2asrv.WithAgentInactivityTimeout(inactivity),
 		a2asrv.WithPushNotifications(pushStore, pushSender),
 		a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true, PushNotifications: true}),
 		a2asrv.WithTaskStore(ts),
 	}
+}
+
+// inactivityTimeout returns the configured agent inactivity timeout, or the
+// default when unset.
+func inactivityTimeout(sc config.ServerConfig) time.Duration {
+	if sc.AgentInactivityTimeout != nil {
+		return *sc.AgentInactivityTimeout
+	}
+	return 10 * time.Minute
 }
 
 // agentBuilder assembles the per-agent runtime, card, routes, and optional gRPC
@@ -213,6 +224,7 @@ type agentBuilder struct {
 	bearer         bool
 	rl             *rateLimiter
 	taskLookup     func(context.Context, a2a.TaskID) (*a2a.Task, bool)
+	keepalive      time.Duration
 	mux            *http.ServeMux
 	handlerOptions []a2asrv.RequestHandlerOption
 
@@ -253,6 +265,12 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	exec := bridge.NewCLIExecutor(ln, sessions, agent.NewLiveSessions(), resolver, ac.Limits)
 	exec.SetFileArtifacts(b.cfg.Sandbox.FileArtifacts)
 	exec.SetTaskLookup(b.taskLookup)
+	// Enable the keepalive only when the agent also has a Harbor-side bound, so
+	// that suppressing the server watchdog for a long silent step does not leave
+	// a genuinely hung CLI running with no timeout to reap it.
+	if ac.Limits.Timeout > 0 || ac.Limits.IdleTimeout > 0 {
+		exec.SetKeepaliveInterval(b.keepalive)
+	}
 	handler := a2asrv.NewHandler(exec, b.handlerOptions...)
 
 	path := AgentPath(ac.ID)

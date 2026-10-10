@@ -48,6 +48,10 @@ type ServerConfig struct {
 	Auth                     AuthConfig `yaml:"auth"`
 	CORSAllowedOrigins       []string   `yaml:"cors_allowed_origins"`
 
+	// AgentInactivityTimeout bounds how long the server waits for any event
+	// from an agent before failing the task; 0 disables it. Default 10m.
+	AgentInactivityTimeout *time.Duration `yaml:"agent_inactivity_timeout"`
+
 	RateLimit *RateLimitConfig `yaml:"rate_limit"`
 }
 

@@ -1141,6 +1141,8 @@ half-open admits one probe at a time for a bounded window; enough consecutive su
 
 **Task-level isolation**: `a2asrv.WithExecutionPanicHandler` + executor `recover`, so a single task's panic does not affect the service; that task counts as one failure under `internal`.
 
+**Liveness watchdog**: the server fails a task when it sees no event from the CLI for `server.agent_inactivity_timeout` (default 10m; 0 disables). Because a coding agent can legitimately run a long output-less step, the executor forwards streaming **thinking** deltas and, when the agent also has a Harbor-side bound (`limits.timeout` or `limits.idle_timeout`), emits a periodic **keepalive** working update (half the watchdog) so the watchdog does not fail a working agent; the bound still reaps a genuinely hung CLI. If the watchdog does fire it stops the CLI, so no process or workdir lock is left behind.
+
 ```yaml
 limits:
   breaker: { threshold: 3, failure_ratio: 0.5, cooldown: 30s, max_cooldown: 10m }
@@ -1548,6 +1550,10 @@ type ServerConfig struct {
     StorePath          string          `yaml:"store_path"`       // SQLite DB path for tasks (store: sqlite)
     SessionStoreDir    string          `yaml:"session_store_dir"` // dir for per-agent session DBs
     Store              string          `yaml:"store"`             // persistence: "" (in-memory) | sqlite
+    // Server liveness watchdog: fail a task if no event arrives from the CLI for
+    // this long. 0 disables. When set, the executor also emits a periodic
+    // keepalive so a long output-less step is not mistaken for a dead agent.
+    AgentInactivityTimeout *time.Duration `yaml:"agent_inactivity_timeout"`
     Auth               AuthConfig      `yaml:"auth"`
     CORSAllowedOrigins []string        `yaml:"cors_allowed_origins"`
     RateLimit          *RateLimitConfig `yaml:"rate_limit"` // per-(caller, agent) token bucket

@@ -180,6 +180,7 @@ full reference. Durations use Go syntax (`30s`, `30m`, `1h`).
 | `store` | string | no | — | persistence backend: unset = in-memory, `sqlite` = durable (survives restart) |
 | `store_path` | string | for `store: sqlite` | — | SQLite DB path for tasks |
 | `session_store_dir` | string | no | — | dir for per-agent session DBs (`<dir>/<id>.db`) |
+| `agent_inactivity_timeout` | duration | no | `10m` | fail a task if the server sees no event from the CLI for this long; `0` disables. A silent CLI is kept alive only when the agent also sets `limits.timeout` or `limits.idle_timeout` |
 | `auth.mode` | string | no | `none` | `none` \| `bearer` |
 | `auth.tokens` | string[] | no | — | bearer tokens (required when `mode: bearer`) |
 | `cors_allowed_origins` | string[] | no | — | allowed CORS origins |
