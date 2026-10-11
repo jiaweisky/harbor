@@ -72,6 +72,40 @@ func Build(ctx context.Context, ac config.AgentConfig, opts Options) (agent.Laun
 	}, nil
 }
 
+// interactionLauncher overrides an agent's advertised interaction capability
+// without changing how the CLI is driven.
+type interactionLauncher struct {
+	agent.Launcher
+	caps agent.Capabilities
+}
+
+// Capabilities reports the overridden interaction capability.
+func (l interactionLauncher) Capabilities() agent.Capabilities { return l.caps }
+
+// applyInteractionMode applies the configured interaction mode to a launcher's
+// capabilities. auto (or unset) keeps the integration default; interactive
+// forces prompts to be surfaced; non-interactive drops them so the card does not
+// advertise the interaction extension and the executor fails if the CLI still
+// prompts.
+func applyInteractionMode(ln agent.Launcher, mode string) (agent.Launcher, error) {
+	caps := ln.Capabilities()
+	switch mode {
+	case "", "auto":
+		return ln, nil
+	case "interactive":
+		caps.Permission = agent.PermInteractive
+		caps.InputRequiredResume = true
+	case "non-interactive":
+		caps.Permission = agent.PermFlagOnly
+		caps.InputRequiredResume = false
+		caps.PlanApproval = false
+		caps.AskQuestion = false
+	default:
+		return nil, fmt.Errorf("unknown interaction mode %q", mode)
+	}
+	return interactionLauncher{Launcher: ln, caps: caps}, nil
+}
+
 // infoSkills maps the configured card skills onto the agent package type.
 func infoSkills(ac config.AgentConfig) []agent.Skill {
 	if len(ac.Skills) == 0 {
@@ -87,9 +121,20 @@ func infoSkills(ac config.AgentConfig) []agent.Skill {
 	return out
 }
 
-// New constructs a Launcher for the given agent config. When the integration
-// is empty it is resolved from the CLI's known profile.
+// New constructs a Launcher for the given agent config and applies the
+// configured interaction mode to its capabilities. When the integration is
+// empty it is resolved from the CLI's known profile.
 func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
+	ln, err := newLauncher(ac, opts)
+	if err != nil {
+		return nil, err
+	}
+	return applyInteractionMode(ln, ac.Interaction)
+}
+
+// newLauncher builds the integration-specific launcher without the interaction
+// override.
+func newLauncher(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 	profile, known := config.LookupProfile(ac.Binary)
 
 	integ := ac.Integration

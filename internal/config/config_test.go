@@ -124,6 +124,67 @@ agents:
 	}
 }
 
+func TestInteractionValidation(t *testing.T) {
+	for _, mode := range []string{"auto", "interactive", "non-interactive"} {
+		path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    interaction: `+mode+`
+`)
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("interaction %q: unexpected error: %v", mode, err)
+		}
+		if cfg.Agents[0].Interaction != mode {
+			t.Fatalf("interaction = %q, want %q", cfg.Agents[0].Interaction, mode)
+		}
+	}
+
+	def := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+`)
+	cfg, err := config.Load(def)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Agents[0].Interaction != "auto" {
+		t.Fatalf("default interaction = %q, want auto", cfg.Agents[0].Interaction)
+	}
+
+	bad := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    interaction: sometimes
+`)
+	if _, err := config.Load(bad); err == nil || !strings.Contains(err.Error(), "interaction") {
+		t.Fatalf("expected an interaction error, got %v", err)
+	}
+
+	// interactive requires a pausable integration.
+	badCombo := writeConfig(t, `
+version: 1
+agents:
+  - id: oc
+    binary: opencode
+    integration: exec
+    interaction: interactive
+    args: ["run", "{{.Prompt}}"]
+`)
+	if _, err := config.Load(badCombo); err == nil || !strings.Contains(err.Error(), "pausable") {
+		t.Fatalf("expected a pausable-integration error, got %v", err)
+	}
+}
+
 func TestACPProfileFillsDefaultArgs(t *testing.T) {
 	path := writeConfig(t, `
 version: 1

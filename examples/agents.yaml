@@ -53,6 +53,10 @@ agents:
     display_name: "CodeBuddy"
     binary: codebuddy
     integration: stream-json
+    # interaction: auto | interactive | non-interactive   # whether CLI permission/plan prompts
+    #                                                     # surface as A2A input-required (default: auto);
+    #                                                     # keep the CLI from prompting (e.g. dontAsk below)
+    #                                                     # when non-interactive
     # workdir: "/srv/projects/my-project"   # project dir the CLI starts in (its project
     #                                       # root); defaults to Harbor's working directory
     args:

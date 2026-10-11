@@ -237,6 +237,7 @@ full reference. Durations use Go syntax (`30s`, `30m`, `1h`).
 | `server_protocol` | string | no | `http` | `server`: `http` \| `acp` \| `acp-streamable-http` |
 | `grpc_listen` | string | no | — | also serve this agent over gRPC at `host:port` |
 | `allow_dangerous` | bool | no | `false` | enable the CLI's dangerous/permission-bypass flag |
+| `interaction` | string | no | `auto` | `auto` \| `interactive` \| `non-interactive`: whether CLI permission/plan prompts surface as A2A `input-required` |
 | `sdk_capabilities` | bool | no | `false` | `stream-json`: declare `askUserQuestion` before the first prompt |
 | `output_schema_args` | string[] | no | profile | `exec` structured-output args (`{{.SchemaFile}}`/`{{.Schema}}`) |
 | `file_args` | string[] | no | profile | attach files via args (`{{.File}}`) |

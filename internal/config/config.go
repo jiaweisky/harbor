@@ -212,8 +212,12 @@ type AgentConfig struct {
 	// skills are advertised (the A2A "skills" field is still present).
 	Skills  []SkillConfig `yaml:"skills"`
 	Version string        `yaml:"version"` // optional card version override; skips probing
-	Session SessionConfig `yaml:"session"`
-	Limits  LimitsConfig  `yaml:"limits"`
+	// Interaction controls whether the CLI's permission/plan/question prompts are
+	// surfaced as A2A input-required. auto (default) derives it from the
+	// integration; interactive forces it on; non-interactive turns it off.
+	Interaction string        `yaml:"interaction"`
+	Session     SessionConfig `yaml:"session"`
+	Limits      LimitsConfig  `yaml:"limits"`
 }
 
 // RegexConfig configures the regex parser.
@@ -389,6 +393,9 @@ func (c *Config) applyDefaults() {
 	}
 	for i := range c.Agents {
 		a := &c.Agents[i]
+		if a.Interaction == "" {
+			a.Interaction = "auto"
+		}
 		if p, ok := LookupProfile(a.Binary); ok {
 			if a.Integration == "" {
 				a.Integration = p.Integration
@@ -535,6 +542,21 @@ func validateAgent(i int, a *AgentConfig) error {
 		return fmt.Errorf(
 			"agent %q: server_protocol must be one of %q, %q, %q; got %q",
 			a.ID, ServerProtocolHTTP, ServerProtocolACP, ServerProtocolACPStreamableHTTP, a.ServerProtocol,
+		)
+	}
+	switch a.Interaction {
+	case "auto", "interactive", "non-interactive":
+	default:
+		return fmt.Errorf(
+			"agent %q: interaction must be one of auto, interactive, non-interactive; got %q",
+			a.ID, a.Interaction,
+		)
+	}
+	if a.Interaction == "interactive" &&
+		a.Integration != IntegrationStreamJSON && a.Integration != IntegrationACP {
+		return fmt.Errorf(
+			"agent %q: interaction \"interactive\" requires a pausable integration (%q or %q); got %q",
+			a.ID, IntegrationStreamJSON, IntegrationACP, a.Integration,
 		)
 	}
 	for j, s := range a.Skills {

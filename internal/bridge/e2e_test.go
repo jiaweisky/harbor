@@ -512,6 +512,67 @@ func TestStreamJSONPlanApproval(t *testing.T) {
 	}
 }
 
+// TestNonInteractivePermissionFails verifies that a non-interactive agent fails
+// (rather than pausing) when the CLI still asks for permission.
+func TestNonInteractivePermissionFails(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "stdin.log")
+	ln, err := integration.New(config.AgentConfig{
+		ID: "plan", Binary: scriptPath(t, "fake-plan.sh"),
+		Integration: config.IntegrationStreamJSON, Args: []string{"-p"},
+		Interaction: "non-interactive",
+		Env:         map[string]string{"HARBOR_STDIN_LOG": logPath},
+	}, integration.Options{InheritEnv: true})
+	if err != nil {
+		t.Fatalf("integration.New: %v", err)
+	}
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
+		config.LimitsConfig{Timeout: 10 * time.Second})
+	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: message("plan this")})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := resp.(*a2a.Task)
+	if task.Status.State != a2a.TaskStateFailed {
+		t.Fatalf("state = %s, want failed", task.Status.State)
+	}
+	if code := task.Status.Message.Metadata["harbor.errorCode"]; code != "interaction_unexpected" {
+		t.Fatalf("errorCode = %v, want interaction_unexpected", code)
+	}
+}
+
+// launcherWithInteraction builds a stream-json launcher with an interaction mode.
+func launcherWithInteraction(t *testing.T, script, mode string) agent.Launcher {
+	t.Helper()
+	ln, err := integration.New(config.AgentConfig{
+		ID: "cb", Binary: script, Integration: config.IntegrationStreamJSON, Interaction: mode,
+	}, integration.Options{InheritEnv: true})
+	if err != nil {
+		t.Fatalf("integration.New: %v", err)
+	}
+	return ln
+}
+
+// TestCardInteractionMode verifies the interaction extension follows the mode.
+func TestCardInteractionMode(t *testing.T) {
+	script := scriptPath(t, "fake-codebuddy.sh")
+
+	nonInteractive := bridge.BuildCard(launcherWithInteraction(t, script, "non-interactive"),
+		agent.Info{Name: "cb"}, "http://example/agents/cb/", false)
+	if hasExtension(nonInteractive, bridge.InteractionExtensionURI) {
+		t.Fatalf("non-interactive card should omit the interaction extension")
+	}
+
+	interactive := bridge.BuildCard(launcherWithInteraction(t, script, "interactive"),
+		agent.Info{Name: "cb"}, "http://example/agents/cb/", false)
+	if !hasExtension(interactive, bridge.InteractionExtensionURI) {
+		t.Fatalf("interactive card should declare the interaction extension")
+	}
+}
+
 // TestStreamJSONStructuredOutput verifies a harbor.outputSchema request produces
 // a schema-validated JSON DataPart artifact.
 func TestStreamJSONStructuredOutput(t *testing.T) {

@@ -36,6 +36,9 @@ const (
 	codeTimeout            = "timeout"
 	codeMaxTurns           = "max_turns"
 	codeAgentUnavailable   = "agent_unavailable"
+	// codeInteractionUnexpected marks a permission prompt from a non-interactive
+	// agent whose CLI was not configured to bypass permissions.
+	codeInteractionUnexpected = "interaction_unexpected"
 )
 
 // Metadata keys carried on task status messages. The interaction id is both
@@ -763,12 +766,7 @@ func (e *CLIExecutor) handleEvent(
 		if !sink.Flush() {
 			return false
 		}
-		itx := interactionFromEvent(ev)
-		st.setInteraction(itx)
-		// Keep the session alive for the client's answer; record its id so a
-		// restart can resume the CLI session and inject the answer.
-		sid, _ := e.sessions.Get(contextKey(ec))
-		emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateInputRequired, interactionMessage(ev.Text, itx, sid)))
+		e.handlePermissionRequest(ec, taskID, st, emit, ev)
 		return false
 	case agent.EventError:
 		sink.Flush()
@@ -805,6 +803,24 @@ func (e *CLIExecutor) handleEvent(
 		return emitTrace(ec, emit, ev)
 	}
 	return true
+}
+
+// handlePermissionRequest pauses a task for the client's answer, or fails it when
+// the agent is non-interactive and the CLI should not have prompted.
+func (e *CLIExecutor) handlePermissionRequest(
+	ec *a2asrv.ExecutorContext, taskID string, st *taskState, emit func(a2a.Event) bool, ev agent.Event,
+) {
+	if e.launcher.Capabilities().Permission != agent.PermInteractive {
+		e.fail(ec, taskID, emit, codeInteractionUnexpected,
+			"non-interactive agent received a permission request; configure the CLI to bypass permissions")
+		return
+	}
+	itx := interactionFromEvent(ev)
+	st.setInteraction(itx)
+	// Keep the session alive for the client's answer; record its id so a restart
+	// can resume the CLI session and inject the answer.
+	sid, _ := e.sessions.Get(contextKey(ec))
+	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateInputRequired, interactionMessage(ev.Text, itx, sid)))
 }
 
 // emitStructured delivers a schema-validated result as a JSON DataPart artifact.
