@@ -31,6 +31,19 @@ server:
 # Optional runtime adapter plugins (Go .so, each exporting Register()).
 # plugins: ["/opt/harbor/plugins/my-cli.so"]
 
+# Optional file-exchange data plane. When configured, each agent's card
+# advertises a storage extension and large files move out of band instead of
+# inside A2A messages. See STORAGE-DESIGN.md for the full reference.
+# storage:
+#   backend: http            # http | s3 | cos | local (exactly one)
+#   prefix: harbor/
+#   inline_max_bytes: 262144
+#   inbound_media: spool     # spool (default) | inline
+#   http:
+#     put_url: "https://store.example.com/in/harbor/"
+#     get_base: "https://store.example.com/pub/harbor/"
+#     auth: none             # none | basic | bearer (Harbor's own credential)
+
 sandbox:
   inherit_env: true                  # false restricts the CLI env to an allowlist
   # Optional per-context isolation for concurrent tasks on the same project.

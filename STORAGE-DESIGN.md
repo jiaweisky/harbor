@@ -1,6 +1,6 @@
 # Harbor File Exchange and Storage Data Plane
 
-Status: design proposal for review. Not yet implemented.
+Status: implemented for review. See the code for the current behavior.
 
 This document specifies how Harbor moves large files between agents. It separates
 the A2A control plane (which prefers references and carries only small inline
@@ -1058,8 +1058,6 @@ Each step is triggered by a current need; nothing is built ahead of demand.
   silently.
 - No Range or media streaming: a large video is materialized whole. Added when a
   concrete media case appears.
-- D3 (brokered presigned upload) is specified but not built until the concrete
-  case "a peer cannot reach the shared store and can only reach Harbor" appears.
 - Multipart upload is not implemented; COS and S3 presigned/simple uploads cap
   at about 5 GiB, so a larger transfer needs multipart (and, in broker mode, a
   negotiated part flow).

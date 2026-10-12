@@ -1,9 +1,13 @@
 package bridge
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,13 +22,16 @@ import (
 // never spawns a process.
 var errUnsupportedContent = errors.New("unsupported content type")
 
+// errStorage indicates the data plane could not read or verify a reference.
+var errStorage = errors.New("storage error")
+
 // promptFromParts assembles the normalized input from a message's parts: an
 // ordered list of text blocks, native image inputs, and attachable file paths.
 // Text parts become blocks, structured data parts become standalone JSON blocks,
 // raw image parts the CLI can accept become native image blocks, and other file
 // parts are materialized into dir, attached via their path (caps.AttachFiles)
 // or named in a block. Parts the agent cannot accept are rejected.
-func (e *CLIExecutor) promptFromParts(m *a2a.Message, dir string) (promptInput, error) {
+func (e *CLIExecutor) promptFromParts(ctx context.Context, m *a2a.Message, dir string) (promptInput, error) {
 	var in promptInput
 	if m == nil {
 		return in, errNoText
@@ -42,7 +49,7 @@ func (e *CLIExecutor) promptFromParts(m *a2a.Message, dir string) (promptInput, 
 			in.Blocks = appendDataBlock(in.Blocks, p.Data())
 		case p.Raw() != nil || p.URL() != "":
 			n++
-			if err := addFilePart(&in, p, dir, n, caps); err != nil {
+			if err := e.addFilePart(ctx, &in, p, dir, n, caps); err != nil {
 				return promptInput{}, err
 			}
 		}
@@ -51,17 +58,24 @@ func (e *CLIExecutor) promptFromParts(m *a2a.Message, dir string) (promptInput, 
 }
 
 // addFilePart classifies one raw/URL part: a native image, an image attached via
-// args, a file attached via args, or a named reference in the prompt.
-func addFilePart(in *promptInput, p *a2a.Part, dir string, n int, caps agent.Capabilities) error {
-	img, err := imageInput(p, caps)
-	if err != nil {
-		return err
+// args, a file attached via args, or a named reference in the prompt. A URL part
+// is read through the store when one is configured.
+func (e *CLIExecutor) addFilePart(
+	ctx context.Context, in *promptInput, p *a2a.Part, dir string, n int, caps agent.Capabilities,
+) error {
+	// spool keeps every attachment as a file path; any other mode (or no store)
+	// lets a CLI-accepted image become a native content block.
+	if e.inboundMedia != "spool" {
+		img, err := imageInput(p, caps)
+		if err != nil {
+			return err
+		}
+		if img != nil {
+			in.Images = append(in.Images, *img)
+			return nil
+		}
 	}
-	if img != nil {
-		in.Images = append(in.Images, *img)
-		return nil
-	}
-	ref, path, err := materializeFile(p, dir, n, caps)
+	ref, path, err := e.materializeFile(ctx, p, dir, n, caps)
 	if err != nil {
 		return err
 	}
@@ -122,16 +136,22 @@ func appendDataBlock(blocks []string, v any) []string {
 	return appendBlock(blocks, string(buf))
 }
 
-// materializeFile writes a raw file part under dir and returns a prompt line
-// naming it plus its path (empty for a URL part). Images are only accepted when
-// the agent advertises their MIME type; other files require file-input support.
-func materializeFile(p *a2a.Part, dir string, n int, caps agent.Capabilities) (ref, path string, err error) {
+// materializeFile writes a file part under dir and returns a prompt line naming
+// it plus its path (empty for an unreadable URL part). Images are only accepted
+// when the agent advertises their MIME type; other files require file-input
+// support. A URL part is read through the store when one is configured.
+func (e *CLIExecutor) materializeFile(
+	ctx context.Context, p *a2a.Part, dir string, n int, caps agent.Capabilities,
+) (ref, path string, err error) {
 	if strings.HasPrefix(strings.ToLower(p.MediaType), "image/") {
 		if !supportsMIME(caps.InputImage, p.MediaType) {
 			return "", "", fmt.Errorf("%w: image %s", errUnsupportedContent, p.MediaType)
 		}
 	} else if !caps.InputFile {
 		return "", "", fmt.Errorf("%w: file %s", errUnsupportedContent, p.MediaType)
+	}
+	if len(e.mediaTypes) > 0 && p.MediaType != "" && !mediaAllowed(e.mediaTypes, p.MediaType) {
+		return "", "", fmt.Errorf("%w: %s", errUnsupportedContent, p.MediaType)
 	}
 
 	name := safeFilename(p.Filename, n)
@@ -146,7 +166,63 @@ func materializeFile(p *a2a.Part, dir string, n int, caps agent.Capabilities) (r
 		}
 		return text + " saved to " + pth, pth, nil
 	}
+	if u := p.URL(); u != "" && e.store != nil {
+		pth, err := e.materializeReference(ctx, string(u), metaString(p.Metadata, "sha256"),
+			dir, fmt.Sprintf("%d-%s", n, name))
+		if err != nil {
+			return "", "", fmt.Errorf("%w: %s", errStorage, u)
+		}
+		return text + " saved to " + pth, pth, nil
+	}
 	return text + " " + string(p.URL()), "", nil
+}
+
+// materializeReference streams a store reference into dir, enforcing the size
+// bound and verifying the expected sha256 (when provided), so a large file
+// never has to be buffered whole.
+func (e *CLIExecutor) materializeReference(
+	ctx context.Context, uri, wantSHA, dir, name string,
+) (string, error) {
+	if e.downloadTO > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.downloadTO)
+		defer cancel()
+	}
+	rc, err := e.store.Get(ctx, uri)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+
+	path, err := uploadPath(dir, name)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	src := io.Reader(rc)
+	if e.maxBytes > 0 {
+		src = io.LimitReader(rc, e.maxBytes+1)
+	}
+	n, err := io.Copy(io.MultiWriter(f, h), src)
+	if err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if e.maxBytes > 0 && n > e.maxBytes {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("reference %s exceeds the size limit", uri)
+	}
+	if wantSHA != "" && hex.EncodeToString(h.Sum(nil)) != wantSHA {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("reference %s failed its integrity check", uri)
+	}
+	return path, nil
 }
 
 // imageExt maps an image MIME type to a file extension, appended when a
@@ -159,6 +235,19 @@ var imageExt = map[string]string{
 // writeUpload writes data under dir/.harbor/uploads, falling back to the system
 // temp directory when the task has no working directory.
 func writeUpload(dir, name string, data []byte) (string, error) {
+	path, err := uploadPath(dir, name)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// uploadPath returns the materialization path under dir/.harbor/uploads,
+// creating the directory.
+func uploadPath(dir, name string) (string, error) {
 	if dir == "" {
 		dir = os.TempDir()
 	}
@@ -166,11 +255,7 @@ func writeUpload(dir, name string, data []byte) (string, error) {
 	if err := os.MkdirAll(uploads, 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(uploads, name)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
+	return filepath.Join(uploads, name), nil
 }
 
 // safeFilename reduces a client-supplied name to a single path element, falling

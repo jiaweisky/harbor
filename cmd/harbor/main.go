@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -97,15 +99,26 @@ func run() error {
 			slog.Warn("store close", "err", err)
 		}
 	}()
+	tlsConfig, err := httpTLSConfig(cfg.Server.TLS)
+	if err != nil {
+		return fmt.Errorf("server tls: %w", err)
+	}
 	srv := &http.Server{
 		Addr:    cfg.Server.Listen,
 		Handler: servers.HTTP,
 		// Requests derive from the root context, so shutdown cancels in-flight tasks.
 		BaseContext: func(net.Listener) context.Context { return ctx },
+		TLSConfig:   tlsConfig,
 	}
 
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.ListenAndServe() }()
+	go func() {
+		if cfg.Server.TLS.CertFile != "" {
+			serveErr <- srv.ListenAndServeTLS(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
+			return
+		}
+		serveErr <- srv.ListenAndServe()
+	}()
 	for _, gs := range servers.GRPC {
 		lis, err := net.Listen("tcp", gs.Addr)
 		if err != nil {
@@ -135,4 +148,32 @@ func run() error {
 		}
 		return err
 	}
+}
+
+// httpTLSConfig builds the server's TLS configuration, or nil when no
+// certificate is configured (plaintext).
+func httpTLSConfig(cfg config.TLSConfig) (*tls.Config, error) {
+	if cfg.CertFile == "" {
+		return nil, nil
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		return nil, err
+	}
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+	if cfg.CAFile != "" {
+		pem, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no certificates in %s", cfg.CAFile)
+		}
+		tlsCfg.ClientCAs = pool
+	}
+	if cfg.ClientAuth {
+		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return tlsCfg, nil
 }

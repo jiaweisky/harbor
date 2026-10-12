@@ -18,6 +18,7 @@ type Config struct {
 	Server    ServerConfig    `yaml:"server"`
 	Sandbox   SandboxConfig   `yaml:"sandbox"`
 	Telemetry TelemetryConfig `yaml:"telemetry"`
+	Storage   StorageConfig   `yaml:"storage"`
 	// Plugins are Go plugin (.so) paths loaded at startup; each must export a
 	// Register() func that registers CLI adapters (optional, experimental).
 	Plugins []string      `yaml:"plugins"`
@@ -52,7 +53,101 @@ type ServerConfig struct {
 	// from an agent before failing the task; 0 disables it. Default 10m.
 	AgentInactivityTimeout *time.Duration `yaml:"agent_inactivity_timeout"`
 
+	// MaxRequestBytes bounds an incoming JSON-RPC/REST request body when set, so
+	// oversized inline file parts are rejected before being read into memory.
+	MaxRequestBytes int64 `yaml:"max_request_bytes"`
+
 	RateLimit *RateLimitConfig `yaml:"rate_limit"`
+	TLS       TLSConfig        `yaml:"tls"`
+}
+
+// TLSConfig configures TLS for a listener or a client. For the server the
+// certificate is what Harbor presents; for a client it is Harbor's client
+// certificate (mutual TLS).
+type TLSConfig struct {
+	CertFile           string `yaml:"cert_file"`
+	KeyFile            string `yaml:"key_file"`
+	CAFile             string `yaml:"ca_file"`
+	ClientAuth         bool   `yaml:"client_auth"`          // server: require a client certificate
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"` // client: do not verify the peer
+}
+
+// StorageConfig configures the file-exchange data plane. An empty Backend
+// disables it, and the card advertises no storage extension.
+type StorageConfig struct {
+	Backend        string           `yaml:"backend"`          // http | s3 | cos | local
+	Prefix         string           `yaml:"prefix"`           // key prefix within the store
+	InlineMaxBytes int64            `yaml:"inline_max_bytes"` // local inline threshold; 0 uses the default
+	MediaTypes     []string         `yaml:"media_types"`      // allowed ingest media types; unset uses the defaults
+	InboundMedia   string           `yaml:"inbound_media"`    // spool (default) | inline
+	Retention      time.Duration    `yaml:"retention"`        // reap local objects older than this; 0 disables
+	Download       DownloadConfig   `yaml:"download"`
+	HTTP           HTTPStoreConfig  `yaml:"http"`
+	S3             S3StoreConfig    `yaml:"s3"`
+	COS            COSStoreConfig   `yaml:"cos"`
+	Local          LocalStoreConfig `yaml:"local"`
+}
+
+// DownloadConfig bounds reading ingested objects back from the store.
+type DownloadConfig struct {
+	MaxBytes   int64                   `yaml:"max_bytes"`
+	Timeout    time.Duration           `yaml:"timeout"`
+	Credential []StoreCredentialConfig `yaml:"credentials"`
+}
+
+// StoreCredentialConfig is a credential for a private HTTPS store origin.
+type StoreCredentialConfig struct {
+	Host  string `yaml:"host"`
+	Auth  string `yaml:"auth"` // bearer | basic
+	Token string `yaml:"token"`
+	User  string `yaml:"username"`
+	Pass  string `yaml:"password"`
+}
+
+// HTTPStoreConfig configures the self-hosted HTTP store.
+type HTTPStoreConfig struct {
+	PutURL        string        `yaml:"put_url"`
+	GetBase       string        `yaml:"get_base"`
+	Auth          string        `yaml:"auth"` // none | basic | bearer (Harbor's own credential)
+	Username      string        `yaml:"username"`
+	Password      string        `yaml:"password"`
+	Token         string        `yaml:"token"`
+	TLS           TLSConfig     `yaml:"tls"`
+	PresignURL    string        `yaml:"presign_url"`
+	PresignSecret string        `yaml:"presign_secret"`
+	PresignTTL    time.Duration `yaml:"presign_ttl"`
+}
+
+// S3StoreConfig configures an S3-compatible store (AWS S3, OSS, MinIO, COS via
+// SigV4).
+type S3StoreConfig struct {
+	Endpoint     string        `yaml:"endpoint"`
+	Region       string        `yaml:"region"`
+	Bucket       string        `yaml:"bucket"`
+	AccessKey    string        `yaml:"access_key"`
+	SecretKey    string        `yaml:"secret_key"`
+	SessionToken string        `yaml:"session_token"`
+	PathStyle    bool          `yaml:"path_style"`
+	TLS          TLSConfig     `yaml:"tls"`
+	PresignTTL   time.Duration `yaml:"presign_ttl"`
+}
+
+// COSStoreConfig configures Tencent COS over its native REST API.
+type COSStoreConfig struct {
+	Region       string        `yaml:"region"`
+	Bucket       string        `yaml:"bucket"`
+	SecretID     string        `yaml:"secret_id"`
+	SecretKey    string        `yaml:"secret_key"`
+	SessionToken string        `yaml:"session_token"`
+	Endpoint     string        `yaml:"endpoint"`
+	TLS          TLSConfig     `yaml:"tls"`
+	PresignTTL   time.Duration `yaml:"presign_ttl"`
+}
+
+// LocalStoreConfig configures a shared-directory store.
+type LocalStoreConfig struct {
+	Root         string `yaml:"root"`
+	ServeBaseURL string `yaml:"serve_base_url"`
 }
 
 // RateLimitConfig configures a per-(user, agent) token-bucket rate limit on the
@@ -345,8 +440,12 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	expanded, err := expandEnv(string(b))
+	if err != nil {
+		return nil, err
+	}
 	var cfg Config
-	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec := yaml.NewDecoder(bytes.NewReader(expanded))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
@@ -356,6 +455,42 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// expandEnv substitutes ${NAME} and ${NAME:-default} from the process
+// environment; a literal "${" is written "$${".
+func expandEnv(s string) ([]byte, error) {
+	var out bytes.Buffer
+	for i := 0; i < len(s); {
+		switch {
+		case strings.HasPrefix(s[i:], "$${"):
+			out.WriteString("${")
+			i += 3
+		case strings.HasPrefix(s[i:], "${"):
+			end := strings.IndexByte(s[i+2:], '}')
+			if end < 0 {
+				return nil, fmt.Errorf("config: unterminated ${")
+			}
+			out.WriteString(lookupEnv(s[i+2 : i+2+end]))
+			i += 2 + end + 1
+		default:
+			out.WriteByte(s[i])
+			i++
+		}
+	}
+	return out.Bytes(), nil
+}
+
+// lookupEnv resolves a ${NAME} or ${NAME:-default} expression.
+func lookupEnv(expr string) string {
+	name, def, hasDefault := strings.Cut(expr, ":-")
+	if v, ok := os.LookupEnv(name); ok {
+		return v
+	}
+	if hasDefault {
+		return def
+	}
+	return ""
 }
 
 // MustLoad is Load that panics on error.
@@ -391,6 +526,7 @@ func (c *Config) applyDefaults() {
 			ct.Runtime = "docker"
 		}
 	}
+	c.applyStorageDefaults()
 	for i := range c.Agents {
 		a := &c.Agents[i]
 		if a.Interaction == "" {
@@ -425,6 +561,75 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+// defaultMediaTypes is the ingest allowlist applied when media_types is unset.
+func defaultMediaTypes() []string {
+	return []string{"text/*", "application/json", "application/xml", "image/*"}
+}
+
+// applyStorageDefaults fills the storage data-plane defaults.
+func (c *Config) applyStorageDefaults() {
+	s := &c.Storage
+	if s.InlineMaxBytes == 0 {
+		s.InlineMaxBytes = 256 << 10
+	}
+	if s.InboundMedia == "" {
+		s.InboundMedia = "spool"
+	}
+	if len(s.MediaTypes) == 0 {
+		s.MediaTypes = defaultMediaTypes()
+	}
+	if s.Download.MaxBytes == 0 {
+		s.Download.MaxBytes = 256 << 20
+	}
+	if s.HTTP.PresignTTL == 0 {
+		s.HTTP.PresignTTL = 15 * time.Minute
+	}
+	if s.S3.PresignTTL == 0 {
+		s.S3.PresignTTL = 15 * time.Minute
+	}
+	if s.COS.PresignTTL == 0 {
+		s.COS.PresignTTL = 15 * time.Minute
+	}
+}
+
+// validateStorage validates the storage data plane. An empty backend disables
+// it and requires nothing else.
+func (c *Config) validateStorage() error {
+	s := c.Storage
+	if s.Backend == "" {
+		return nil
+	}
+	switch s.Backend {
+	case "http", "s3", "cos", "local":
+	default:
+		return fmt.Errorf("storage.backend must be one of http, s3, cos, local; got %q", s.Backend)
+	}
+	switch s.InboundMedia {
+	case "spool", "inline":
+	default:
+		return fmt.Errorf("storage.inbound_media must be one of spool, inline; got %q", s.InboundMedia)
+	}
+	switch s.Backend {
+	case "http":
+		if s.HTTP.GetBase == "" {
+			return fmt.Errorf("storage.http.get_base is required for the http backend")
+		}
+	case "s3":
+		if s.S3.Bucket == "" || s.S3.Region == "" {
+			return fmt.Errorf("storage.s3.bucket and storage.s3.region are required for the s3 backend")
+		}
+	case "cos":
+		if s.COS.Bucket == "" || s.COS.Region == "" {
+			return fmt.Errorf("storage.cos.bucket and storage.cos.region are required for the cos backend")
+		}
+	case "local":
+		if s.Local.Root == "" {
+			return fmt.Errorf("storage.local.root is required for the local backend")
+		}
+	}
+	return nil
+}
+
 func (c *Config) validate() error {
 	if len(c.Agents) == 0 {
 		return fmt.Errorf("at least one agent must be configured")
@@ -433,6 +638,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.validateSandbox(); err != nil {
+		return err
+	}
+	if err := c.validateStorage(); err != nil {
 		return err
 	}
 	for i := range c.Agents {

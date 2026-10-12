@@ -1,14 +1,18 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/blob"
 	"github.com/jiaweisky/harbor/internal/changes"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/telemetry"
@@ -39,6 +44,8 @@ const (
 	// codeInteractionUnexpected marks a permission prompt from a non-interactive
 	// agent whose CLI was not configured to bypass permissions.
 	codeInteractionUnexpected = "interaction_unexpected"
+	// codeStorageError marks a data-plane read or write failure.
+	codeStorageError = "storage_error"
 )
 
 // Metadata keys carried on task status messages. The interaction id is both
@@ -48,6 +55,13 @@ const (
 	metaKeyErrorCode     = "harbor.errorCode"
 	metaKeyInteractionID = "harbor.interactionId"
 	metaKeySessionID     = "harbor.sessionId"
+)
+
+// DataPart kinds for the broker exchange: a sender reserves an upload slot and
+// Harbor returns a presigned target.
+const (
+	kindUploadSlotRequest = "storage/upload-slot-request"
+	kindUploadSlot        = "storage/upload-slot"
 )
 
 // errNoText is returned when an incoming message has no textual part.
@@ -71,7 +85,14 @@ type CLIExecutor struct {
 	breaker       *breaker      // nil disables
 	tasks         sync.Map      // taskID -> *taskState (all per-task transient state)
 	maxTurns      int
-	fileArtifacts bool // emit a per-file artifact for each changed file
+	fileArtifacts bool          // emit a per-file artifact for each changed file
+	store         blob.Store    // file data plane; nil disables it
+	uploadClient  *http.Client  // sender-side client; nil uses the default
+	inboundMedia  string        // spool | inline
+	inlineMax     int64         // sender inline threshold; 0 disables reference uploads
+	maxBytes      int64         // largest accepted reference (broker)
+	mediaTypes    []string      // allowed ingest media types
+	downloadTO    time.Duration // bound on reading a reference; 0 disables
 	taskLookup    func(context.Context, a2a.TaskID) (*a2a.Task, bool)
 	idem          *idemCache // messageId -> taskID (duplicate-send guard)
 	metrics       *agentMetrics
@@ -257,6 +278,29 @@ func NewCLIExecutor(
 // SetFileArtifacts enables emitting a per-file artifact for each changed file.
 func (e *CLIExecutor) SetFileArtifacts(on bool) { e.fileArtifacts = on }
 
+// SetStore installs the file data-plane store; nil disables it.
+func (e *CLIExecutor) SetStore(s blob.Store) { e.store = s }
+
+// SetUploadClient sets the HTTP client used to reach a consumer's upload target.
+func (e *CLIExecutor) SetUploadClient(c *http.Client) { e.uploadClient = c }
+
+// SetInboundMedia selects how inbound attachments reach the model (spool|inline).
+func (e *CLIExecutor) SetInboundMedia(mode string) { e.inboundMedia = mode }
+
+// SetInlineMaxBytes sets the sender's inline threshold: an outbound artifact
+// larger than this is uploaded to the consumer's ingest target (when one is
+// supplied) instead of inlined. 0 keeps the legacy fixed caps.
+func (e *CLIExecutor) SetInlineMaxBytes(n int64) { e.inlineMax = n }
+
+// SetStoragePolicy sets the ingest bounds the broker enforces.
+func (e *CLIExecutor) SetStoragePolicy(maxBytes int64, mediaTypes []string) {
+	e.maxBytes = maxBytes
+	e.mediaTypes = mediaTypes
+}
+
+// SetDownloadTimeout bounds reading a reference; 0 disables it.
+func (e *CLIExecutor) SetDownloadTimeout(d time.Duration) { e.downloadTO = d }
+
 // SetKeepaliveInterval makes the executor emit a lightweight working update
 // when the CLI has been silent for this long, so a liveness watchdog does not
 // mistake a long output-less step for a dead agent. 0 disables it.
@@ -307,6 +351,9 @@ func (e *CLIExecutor) Snapshot() MetricsSnapshot {
 func (e *CLIExecutor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
 		taskID := string(ec.TaskID)
+		if e.handleStorageRequest(ctx, ec, yield) {
+			return
+		}
 		if e.answerWithoutRunning(ctx, ec, yield) {
 			return
 		}
@@ -399,7 +446,7 @@ func (e *CLIExecutor) start(
 		return
 	}
 
-	req, err := e.toRequest(ec)
+	req, err := e.toRequest(ctx, ec)
 	if err != nil {
 		e.cleanup(taskID, false)
 		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
@@ -987,7 +1034,7 @@ func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emi
 	if err != nil || dir == "" {
 		return
 	}
-	res := changes.Capture(dir, base, 0)
+	res := changes.Capture(dir, base, maxDiffReadBytes)
 	// Surface changed image files (for example a text-to-image result) as raw
 	// image artifacts, alongside the textual diff.
 	e.emitImageArtifacts(ec, dir, res.Files, emit)
@@ -997,16 +1044,34 @@ func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emi
 	if res.Diff == "" {
 		return
 	}
-	part := a2a.NewTextPart(res.Diff)
-	part.MediaType = "text/x-diff"
+	e.emitDiff(ec, res, emit)
+}
+
+// emitDiff delivers the change diff: uploaded and referenced when it exceeds the
+// inline threshold and a consumer target is available, else inlined as text.
+func (e *CLIExecutor) emitDiff(ec *a2asrv.ExecutorContext, res changes.Result, emit func(a2a.Event) bool) {
+	data := []byte(res.Diff)
+	var part *a2a.Part
+	if ref := e.uploadArtifact(ec, "changes.diff", "text/x-diff", data); ref != "" {
+		part = a2a.NewFileURLPart(a2a.URL(ref), "text/x-diff")
+		part.Filename = "changes.diff"
+	} else {
+		part = a2a.NewTextPart(res.Diff)
+		part.MediaType = "text/x-diff"
+	}
+	part.Metadata = digestMeta(data)
 	evt := a2a.NewArtifactEvent(ec, part)
 	evt.Artifact.Name = "changes"
 	evt.Artifact.Metadata = map[string]any{"files": toAnySlice(res.Files), "truncated": res.Truncated}
 	emit(evt)
 }
 
-// maxImageBytes caps a single emitted image artifact.
-const maxImageBytes = 8 << 20
+// maxArtifactReadBytes bounds how much of a single changed file is read into
+// memory before it is inlined or uploaded.
+const maxArtifactReadBytes = 256 << 20
+
+// maxDiffReadBytes bounds the captured diff before it is uploaded or truncated.
+const maxDiffReadBytes = 32 << 20
 
 // imageMediaTypes maps a lower-case file extension to its image MIME type. It
 // covers the formats the supported CLIs produce.
@@ -1014,9 +1079,6 @@ var imageMediaTypes = map[string]string{
 	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 	".gif": "image/gif", ".webp": "image/webp",
 }
-
-// maxFileArtifactBytes caps a single per-file artifact.
-const maxFileArtifactBytes = 1 << 20
 
 // textMediaTypes maps a lower-case file extension to a text media type; unknown
 // extensions fall back to application/octet-stream.
@@ -1028,9 +1090,9 @@ var textMediaTypes = map[string]string{
 	".sh": "text/plain", ".html": "text/html", ".css": "text/css",
 }
 
-// emitImageArtifacts emits one raw image artifact per changed image file in the
-// task's working directory, so a generated image reaches the client as an image
-// part (not merely a path in the diff).
+// emitImageArtifacts emits one image artifact per changed image file in the
+// task's working directory (inlined, or a URL reference when uploaded), so a
+// generated image reaches the client as an image part rather than a diff line.
 func (e *CLIExecutor) emitImageArtifacts(
 	ec *a2asrv.ExecutorContext, dir string, files []string, emit func(a2a.Event) bool,
 ) {
@@ -1039,14 +1101,15 @@ func (e *CLIExecutor) emitImageArtifacts(
 		if !ok {
 			continue
 		}
-		if !emitChangedFile(ec, dir, rel, "image", media, maxImageBytes, emit) {
+		if !e.emitChangedFile(ec, dir, rel, "image", media, emit) {
 			return
 		}
 	}
 }
 
-// emitFileArtifacts emits one raw FilePart per changed non-image file (bounded
-// per file), so a client receives the produced files, not only a diff.
+// emitFileArtifacts emits one file artifact per changed non-image file (inlined,
+// or a URL reference when uploaded), so a client receives the produced files,
+// not only a diff.
 func (e *CLIExecutor) emitFileArtifacts(
 	ec *a2asrv.ExecutorContext, dir string, files []string, emit func(a2a.Event) bool,
 ) {
@@ -1059,39 +1122,222 @@ func (e *CLIExecutor) emitFileArtifacts(
 		if !ok {
 			media = "application/octet-stream"
 		}
-		if !emitChangedFile(ec, dir, rel, "file", media, maxFileArtifactBytes, emit) {
+		if !e.emitChangedFile(ec, dir, rel, "file", media, emit) {
 			return
 		}
 	}
 }
 
-// emitChangedFile emits one raw artifact for a changed file. It returns false
-// only when the consumer has gone away (so the caller should stop emitting);
-// unreadable or oversized files are skipped (returns true).
-func emitChangedFile(
-	ec *a2asrv.ExecutorContext, dir, rel, artifactName, media string, maxBytes int64,
+// emitChangedFile emits one artifact for a changed file. A file larger than the
+// inline threshold is uploaded to the consumer's ingest target (when one was
+// supplied) and referenced; otherwise it is inlined as raw bytes. It returns
+// false only when the consumer has gone away (so the caller should stop
+// emitting); unreadable or oversized files are skipped (returns true).
+func (e *CLIExecutor) emitChangedFile(
+	ec *a2asrv.ExecutorContext, dir, rel, artifactName, media string,
 	emit func(a2a.Event) bool,
 ) bool {
-	data, ok := readChangedFile(dir, rel, maxBytes)
+	// Prefer a streaming upload (the file never enters memory); otherwise inline
+	// a bounded read of it.
+	if ref, sha, size, ok := e.uploadFile(ec, dir, rel, media); ok {
+		part := a2a.NewFileURLPart(a2a.URL(ref), media)
+		part.Filename = filepath.Base(rel)
+		part.Metadata = map[string]any{"sha256": sha, "size": size}
+		evt := a2a.NewArtifactEvent(ec, part)
+		evt.Artifact.Name = artifactName
+		evt.Artifact.Metadata = map[string]any{"path": rel}
+		return emit(evt)
+	}
+	data, ok := readChangedFile(dir, rel, maxArtifactReadBytes)
 	if !ok {
 		return true
 	}
+	return emit(e.fileArtifact(ec, rel, artifactName, media, data))
+}
+
+// uploadFile streams a changed file to the consumer's ingest target when it
+// exceeds the inline threshold and a target was supplied. It returns the
+// reference, content hash, and size; ok is false when the caller should inline.
+func (e *CLIExecutor) uploadFile(
+	ec *a2asrv.ExecutorContext, dir, rel, media string,
+) (ref, sha string, size int64, ok bool) {
+	path, err := safePath(dir, rel)
+	if err != nil {
+		return "", "", 0, false
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", "", 0, false
+	}
+	t, limit, ok := e.uploadTarget(ec)
+	if !ok || limit <= 0 || info.Size() <= limit {
+		return "", "", 0, false
+	}
+	sha, err = hashFile(path)
+	if err != nil {
+		return "", "", 0, false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", 0, false
+	}
+	defer f.Close()
+	ref, ok = e.putToTarget(t, media, applyKeyRule(t.keyRule, sha), f, info.Size())
+	if !ok {
+		return "", "", 0, false
+	}
+	return ref, sha, info.Size(), true
+}
+
+// fileArtifact builds the inline artifact for a changed file.
+func (e *CLIExecutor) fileArtifact(
+	ec *a2asrv.ExecutorContext, rel, artifactName, media string, data []byte,
+) *a2a.TaskArtifactUpdateEvent {
 	part := a2a.NewRawPart(data)
 	part.MediaType = media
 	part.Filename = filepath.Base(rel)
+	part.Metadata = digestMeta(data)
 	evt := a2a.NewArtifactEvent(ec, part)
 	evt.Artifact.Name = artifactName
 	evt.Artifact.Metadata = map[string]any{"path": rel}
-	return emit(evt)
+	return evt
+}
+
+// digestMeta is the integrity metadata carried on a file part.
+func digestMeta(data []byte) map[string]any {
+	return map[string]any{"sha256": sha256Hex(data), "size": len(data)}
+}
+
+// sha256Hex is the lowercase hex SHA-256 of data.
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// hashFile streams path and returns its hex SHA-256.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// uploadTarget returns the consumer's ingest target and the effective inline
+// limit, reporting false when no target was supplied.
+func (e *CLIExecutor) uploadTarget(ec *a2asrv.ExecutorContext) (consumerIngest, int64, bool) {
+	t, ok := ingestTarget(ec)
+	if !ok {
+		return consumerIngest{}, 0, false
+	}
+	return t, e.inlineLimit(t), true
+}
+
+// uploadArtifact uploads in-memory data (the diff) to the consumer's ingest
+// target when it exceeds the inline threshold, returning the reference or "".
+func (e *CLIExecutor) uploadArtifact(ec *a2asrv.ExecutorContext, rel, media string, data []byte) string {
+	t, limit, ok := e.uploadTarget(ec)
+	if !ok || limit <= 0 || int64(len(data)) <= limit {
+		return ""
+	}
+	ref, _ := e.putToTarget(t, media, applyKeyRule(t.keyRule, sha256Hex(data)), bytes.NewReader(data), int64(len(data)))
+	return ref
+}
+
+// putToTarget uploads r to the target under key and returns the reference.
+func (e *CLIExecutor) putToTarget(t consumerIngest, media, key string, r io.Reader, size int64) (string, bool) {
+	target := blob.UploadTarget{URL: strings.TrimRight(t.base, "/") + "/" + key, Method: t.method}
+	if media != "" {
+		target.Headers = map[string]string{"Content-Type": media}
+	}
+	if err := blob.Upload(context.Background(), e.uploadClient, target, r, size); err != nil {
+		slog.Warn("artifact upload failed; inlining instead", "key", key, "err", err)
+		return "", false
+	}
+	return strings.TrimRight(t.readBase(), "/") + "/" + key, true
+}
+
+// inlineLimit is the effective inline threshold: the local default, capped by
+// the consumer's advertised maximum when it is smaller.
+func (e *CLIExecutor) inlineLimit(t consumerIngest) int64 {
+	limit := e.inlineMax
+	if t.maxInline > 0 && (limit <= 0 || t.maxInline < limit) {
+		limit = t.maxInline
+	}
+	return limit
+}
+
+// safePath joins dir and rel, rejecting absolute paths and traversal.
+func safePath(dir, rel string) (string, error) {
+	if filepath.IsAbs(rel) || strings.HasPrefix(filepath.Clean(rel), "..") {
+		return "", fmt.Errorf("unsafe path %q", rel)
+	}
+	return filepath.Join(dir, rel), nil
+}
+
+// consumerIngest is a caller-supplied target for response files.
+type consumerIngest struct {
+	base      string
+	method    string
+	keyRule   string
+	reference string // read base; empty means base
+	maxInline int64  // consumer's max inline size; 0 means unspecified
+}
+
+// ingestTarget reads the caller's ingest target from the request metadata
+// (harbor.ingest = {base, method, key, reference, maxInlineBytes}).
+func ingestTarget(ec *a2asrv.ExecutorContext) (consumerIngest, bool) {
+	v, ok := mergeMetadata(ec)["harbor.ingest"].(map[string]any)
+	if !ok {
+		return consumerIngest{}, false
+	}
+	base, _ := v["base"].(string)
+	if base == "" {
+		return consumerIngest{}, false
+	}
+	method, _ := v["method"].(string)
+	key, _ := v["key"].(string)
+	ref, _ := v["reference"].(string)
+	return consumerIngest{
+		base: base, method: method, keyRule: key, reference: ref,
+		maxInline: int64Field(v, "maxInlineBytes"),
+	}, true
+}
+
+// readBase returns the base the reference is read from.
+func (c consumerIngest) readBase() string {
+	if c.reference != "" {
+		return c.reference
+	}
+	return c.base
+}
+
+// applyKeyRule renders the object key from the consumer's rule and a content
+// hash. An empty or {sha256} rule uses the hash; any other rule is a prefix that
+// also carries the hash, so distinct files never collide.
+func applyKeyRule(rule, hash string) string {
+	switch {
+	case rule == "":
+		return hash
+	case strings.Contains(rule, "{sha256}"):
+		return strings.ReplaceAll(rule, "{sha256}", hash)
+	default:
+		return strings.Trim(rule, "/") + "/" + hash
+	}
 }
 
 // readChangedFile reads a changed file inside dir when rel is a safe relative
 // path to a regular file within maxBytes.
 func readChangedFile(dir, rel string, maxBytes int64) ([]byte, bool) {
-	if filepath.IsAbs(rel) || strings.HasPrefix(filepath.Clean(rel), "..") {
+	path, err := safePath(dir, rel)
+	if err != nil {
 		return nil, false
 	}
-	path := filepath.Join(dir, rel)
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Size() > maxBytes {
 		return nil, false
@@ -1136,13 +1382,13 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 
 // toRequest maps the A2A request onto an agent.Request, merging message-level
 // and request-level metadata (request-level wins).
-func (e *CLIExecutor) toRequest(ec *a2asrv.ExecutorContext) (*agent.Request, error) {
+func (e *CLIExecutor) toRequest(ctx context.Context, ec *a2asrv.ExecutorContext) (*agent.Request, error) {
 	meta := mergeMetadata(ec)
 	dir, err := e.workspace.Resolve(contextKey(ec))
 	if err != nil {
 		return nil, err
 	}
-	in, err := e.promptFromParts(ec.Message, dir)
+	in, err := e.promptFromParts(ctx, ec.Message, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -1187,6 +1433,124 @@ func isWaitingForInput(ec *a2asrv.ExecutorContext) bool {
 // answerWithoutRunning reports whether a request is answered from existing
 // state instead of starting a CLI run: a repeated message returns the earlier
 // task, and a message to a finished task returns it unchanged.
+// handleStorageRequest answers a broker request (a storage/upload-slot-request
+// DataPart) with a presigned target, without starting a CLI. It reports whether
+// the message was a storage request.
+func (e *CLIExecutor) handleStorageRequest(
+	ctx context.Context, ec *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool,
+) bool {
+	req := storageDataPart(ec.Message, kindUploadSlotRequest)
+	if req == nil {
+		return false
+	}
+	if !yield(a2a.NewSubmittedTask(ec, ec.Message), nil) {
+		return true
+	}
+	slot, err := e.reserve(ctx, req)
+	if err != nil {
+		yield(failedStatus(ec, codeUnsupportedContent, err.Error()), nil)
+		return true
+	}
+	evt := a2a.NewArtifactEvent(ec, a2a.NewDataPart(slot))
+	evt.Artifact.Name = "upload-slot"
+	if !yield(evt, nil) {
+		return true
+	}
+	yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil), nil)
+	return true
+}
+
+// reserve validates a broker request and returns the upload-slot payload.
+func (e *CLIExecutor) reserve(ctx context.Context, req map[string]any) (map[string]any, error) {
+	if e.store == nil {
+		return nil, errors.New("storage is not configured")
+	}
+	name := stringField(req, "name")
+	mediaType := stringField(req, "mediaType")
+	size := int64Field(req, "size")
+	if e.maxBytes > 0 && size > e.maxBytes {
+		return nil, fmt.Errorf("file size %d exceeds the limit %d", size, e.maxBytes)
+	}
+	if !mediaAllowed(e.mediaTypes, mediaType) {
+		return nil, fmt.Errorf("media type %q is not accepted", mediaType)
+	}
+	t, err := e.store.Reserve(ctx, name, mediaType, size)
+	if err != nil {
+		return nil, err
+	}
+	slot := map[string]any{
+		"kind":      kindUploadSlot,
+		"uploadUrl": t.URL,
+		"method":    t.Method,
+		"reference": t.Ref(),
+	}
+	if len(t.Headers) > 0 {
+		slot["headers"] = t.Headers
+	}
+	if !t.Expires.IsZero() {
+		slot["expiresAt"] = t.Expires.UTC().Format(time.RFC3339)
+	}
+	return slot, nil
+}
+
+// storageDataPart returns the DataPart value carrying the given kind, if any.
+func storageDataPart(m *a2a.Message, kind string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	for _, p := range m.Parts {
+		d, ok := p.Data().(map[string]any)
+		if !ok {
+			continue
+		}
+		if k, _ := d["kind"].(string); k == kind {
+			return d
+		}
+	}
+	return nil
+}
+
+func stringField(m map[string]any, key string) string {
+	v, _ := m[key].(string)
+	return v
+}
+
+// mediaAllowed reports whether mime matches any allowlist pattern, where a
+// pattern may be an exact type, a subtype wildcard ("text/*"), or "*/*".
+func mediaAllowed(patterns []string, mime string) bool {
+	mime = strings.ToLower(strings.TrimSpace(mime))
+	if mime == "" {
+		return false
+	}
+	for _, p := range patterns {
+		p = strings.ToLower(strings.TrimSpace(p))
+		switch {
+		case p == "*/*" || p == mime:
+			return true
+		case strings.HasSuffix(p, "/*") && strings.HasPrefix(mime, strings.TrimSuffix(p, "*")):
+			return true
+		}
+	}
+	return false
+}
+
+// int64Field reads a numeric field that may decode as int, float64, or
+// json.Number.
+func int64Field(m map[string]any, key string) int64 {
+	switch v := m[key].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	}
+	return 0
+}
+
 func (e *CLIExecutor) answerWithoutRunning(
 	ctx context.Context, ec *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool,
 ) bool {
@@ -1277,6 +1641,8 @@ func codeForRequestError(err error) string {
 	switch {
 	case errors.Is(err, errNoText), errors.Is(err, errUnsupportedContent):
 		return codeUnsupportedContent
+	case errors.Is(err, errStorage):
+		return codeStorageError
 	default:
 		return codeInternal
 	}
