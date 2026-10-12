@@ -3,8 +3,8 @@ package server
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,17 +14,11 @@ import (
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
-	"github.com/a2aproject/a2a-go/v2/a2agrpc/v1"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
-	"google.golang.org/grpc/status"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/blob"
@@ -87,11 +81,9 @@ func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
 	return servers.HTTP, nil
 }
 
-// Servers bundles the HTTP handler and any configured gRPC servers. The gRPC
-// servers are built but not yet serving; the caller listens and serves them.
+// Servers bundles the HTTP handler and the resources the caller must release.
 type Servers struct {
 	HTTP http.Handler
-	GRPC []*GRPCServer
 
 	closers []io.Closer
 }
@@ -99,14 +91,7 @@ type Servers struct {
 // Close releases resources held by the servers, such as SQLite stores.
 func (s *Servers) Close() error { return closeAll(s.closers) }
 
-// GRPCServer is one agent's gRPC server (A2A gRPC binding) on its address.
-type GRPCServer struct {
-	Addr   string
-	Server *grpc.Server
-}
-
-// New builds the HTTP handler and the gRPC servers for the configured agents.
-// Each agent with a grpc_listen address gets its own gRPC server.
+// New builds the HTTP handler for the configured agents.
 func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 	auth, err := authMiddleware(cfg.Server.Auth)
 	if err != nil {
@@ -133,8 +118,8 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 		_ = closeAll(closers)
 		return nil, fmt.Errorf("storage: %w", err)
 	}
-	if reaper, ok := blobStore.(blob.Reaper); ok && cfg.Storage.Backend == "local" && cfg.Storage.Retention > 0 {
-		go reapObjects(ctx, reaper, cfg.Storage.Retention)
+	if blob.CanReap(blobStore) && cfg.Storage.Retention > 0 {
+		go reapObjects(ctx, blobStore.(blob.Reaper), cfg.Storage.Retention)
 	}
 
 	b := &agentBuilder{
@@ -166,7 +151,7 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 	mux.HandleFunc("/metrics", metricsHandler(b.execs))
 
 	httpHandler := traceMiddleware(bridge.CORSMiddleware(cfg.Server.CORSAllowedOrigins, mux))
-	return &Servers{HTTP: httpHandler, GRPC: b.grpc, closers: b.closers}, nil
+	return &Servers{HTTP: httpHandler, closers: b.closers}, nil
 }
 
 // closeAll closes every closer, returning the first error.
@@ -243,13 +228,12 @@ type agentBuilder struct {
 	cards     []*a2a.AgentCard
 	execs     []*bridge.CLIExecutor
 	authReady map[string]bool
-	grpc      []*GRPCServer
 	closers   []io.Closer
 }
 
-// addAgent builds one agent's runtime and, on success, registers its card,
-// routes, and gRPC server. A build error or missing binary disables the agent
-// with a warning rather than failing startup.
+// addAgent builds one agent's runtime and, on success, registers its card and
+// routes. A build error or missing binary disables the agent with a warning
+// rather than failing startup.
 func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	ln, info, err := integration.Build(ctx, ac, integration.Options{
 		InheritEnv: b.cfg.Sandbox.InheritEnvEnabled(),
@@ -298,12 +282,6 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	path := AgentPath(ac.ID)
 	contract := bridge.NewStorageContract(b.cfg.Storage, b.store)
 	card := bridge.BuildCard(ln, info, EndpointURL(b.cfg.Server.BaseURL, ac.ID), b.bearer, contract)
-	if ac.GRPCListen != "" {
-		card.SupportedInterfaces = append(card.SupportedInterfaces, &a2a.AgentInterface{
-			URL: ac.GRPCListen, ProtocolBinding: a2a.TransportProtocolGRPC, ProtocolVersion: a2a.Version,
-		})
-		b.grpc = append(b.grpc, newGRPCServer(handler, ac, b.cfg.Server.Auth, b.rl))
-	}
 	limit := b.cfg.Server.MaxRequestBytes
 	b.mux.Handle(path, b.auth(b.rl.middleware(ac.ID, maxBytes(limit, a2asrv.NewJSONRPCHandler(handler)))))
 	// The HTTP+JSON (A2A REST) binding, mounted under the agent's base path.
@@ -321,16 +299,6 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	slog.Info("agent ready", "id", ac.ID, "integration", ac.Integration, "endpoint", path)
 }
 
-// newGRPCServer builds one agent's gRPC server.
-func newGRPCServer(
-	handler a2asrv.RequestHandler, ac config.AgentConfig, auth config.AuthConfig, rl *rateLimiter,
-) *GRPCServer {
-	gs := grpc.NewServer(grpcServerOptions(auth, rl, ac.ID)...)
-	a2agrpc.NewHandler(handler).RegisterWith(gs)
-	slog.Info("agent grpc ready", "id", ac.ID, "addr", ac.GRPCListen)
-	return &GRPCServer{Addr: ac.GRPCListen, Server: gs}
-}
-
 // traceMiddleware extracts an incoming W3C trace-context so the task span joins
 // the caller's distributed trace.
 func traceMiddleware(next http.Handler) http.Handler {
@@ -338,150 +306,6 @@ func traceMiddleware(next http.Handler) http.Handler {
 		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
-}
-
-// grpcServerOptions returns server options that propagate trace context and, when
-// configured, enforce bearer auth on the gRPC endpoints.
-func grpcServerOptions(auth config.AuthConfig, rl *rateLimiter, agentID string) []grpc.ServerOption {
-	unary := []grpc.UnaryServerInterceptor{traceUnaryInterceptor}
-	stream := []grpc.StreamServerInterceptor{traceStreamInterceptor}
-	// Authenticate before rate limiting so the limiter only sees validated
-	// callers (mirroring the HTTP order).
-	if auth.Mode == "bearer" {
-		unary = append(unary, bearerUnaryInterceptor(auth.Tokens))
-		stream = append(stream, bearerStreamInterceptor(auth.Tokens))
-	}
-	if rl != nil {
-		unary = append(unary, rl.unaryInterceptor(agentID))
-		stream = append(stream, rl.streamInterceptor(agentID))
-	}
-	return []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(unary...),
-		grpc.ChainStreamInterceptor(stream...),
-	}
-}
-
-func (l *rateLimiter) unaryInterceptor(agentID string) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if !l.allow(agentID + "\x00" + l.grpcCallerKey(ctx)) {
-			return nil, status.Error(codes.ResourceExhausted, "rate limit exceeded")
-		}
-		return handler(ctx, req)
-	}
-}
-
-func (l *rateLimiter) streamInterceptor(agentID string) grpc.StreamServerInterceptor {
-	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if !l.allow(agentID + "\x00" + l.grpcCallerKey(ss.Context())) {
-			return status.Error(codes.ResourceExhausted, "rate limit exceeded")
-		}
-		return handler(srv, ss)
-	}
-}
-
-// grpcCallerKey identifies a gRPC caller. As with the HTTP limiter, the bearer
-// token is only used when authentication validated it ahead of the limiter;
-// otherwise the peer address identifies the caller.
-func (l *rateLimiter) grpcCallerKey(ctx context.Context) string {
-	if l.authEnabled {
-		if md, ok := metadata.FromIncomingContext(ctx); ok {
-			if v := md.Get("authorization"); len(v) > 0 {
-				if tok, ok := bridge.BearerToken(v[0]); ok {
-					return tokenKey(tok)
-				}
-			}
-		}
-	}
-	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
-		return p.Addr.String()
-	}
-	return "unknown"
-}
-
-func traceUnaryInterceptor(
-	ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler,
-) (any, error) {
-	return handler(extractGRPCTrace(ctx), req)
-}
-
-func traceStreamInterceptor(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	return handler(srv, tracedStream{ServerStream: ss, ctx: extractGRPCTrace(ss.Context())})
-}
-
-// tracedStream overrides the stream context with the extracted trace context.
-type tracedStream struct {
-	grpc.ServerStream
-	ctx context.Context
-}
-
-func (s tracedStream) Context() context.Context { return s.ctx }
-
-// extractGRPCTrace extracts the W3C trace-context from incoming gRPC metadata.
-func extractGRPCTrace(ctx context.Context) context.Context {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ctx
-	}
-	return otel.GetTextMapPropagator().Extract(ctx, mdCarrier(md))
-}
-
-// mdCarrier adapts gRPC metadata to a propagation.TextMapCarrier.
-type mdCarrier metadata.MD
-
-func (c mdCarrier) Get(key string) string {
-	if v := metadata.MD(c).Get(key); len(v) > 0 {
-		return v[0]
-	}
-	return ""
-}
-
-func (c mdCarrier) Set(key, value string) { metadata.MD(c).Set(key, value) }
-
-func (c mdCarrier) Keys() []string {
-	keys := make([]string, 0, len(c))
-	for k := range c {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-func bearerUnaryInterceptor(tokens []string) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if !grpcAuthorized(ctx, tokens) {
-			return nil, status.Error(codes.Unauthenticated, "missing or invalid bearer token")
-		}
-		return handler(ctx, req)
-	}
-}
-
-func bearerStreamInterceptor(tokens []string) grpc.StreamServerInterceptor {
-	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if !grpcAuthorized(ss.Context(), tokens) {
-			return status.Error(codes.Unauthenticated, "missing or invalid bearer token")
-		}
-		return handler(srv, ss)
-	}
-}
-
-// grpcAuthorized reports whether the incoming gRPC metadata carries a valid
-// bearer token.
-func grpcAuthorized(ctx context.Context, tokens []string) bool {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return false
-	}
-	for _, v := range md.Get("authorization") {
-		tok, ok := bridge.BearerToken(v)
-		if !ok {
-			continue
-		}
-		for _, t := range tokens {
-			if subtle.ConstantTimeCompare([]byte(tok), []byte(t)) == 1 {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // agentReadiness is one agent's readiness, reported on /readyz.
@@ -543,7 +367,11 @@ func reapObjects(ctx context.Context, r blob.Reaper, ttl time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if n, err := r.Reap(ctx, ttl); err == nil && n > 0 {
+			n, err := r.Reap(ctx, ttl)
+			if errors.Is(err, blob.ErrUnsupportedURI) {
+				return // this backend has no lifecycle policy of its own
+			}
+			if err == nil && n > 0 {
 				slog.Info("reaped stale storage objects", "count", n)
 			}
 		}

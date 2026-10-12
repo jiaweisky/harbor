@@ -11,55 +11,12 @@ import (
 	"strings"
 	"testing"
 
-	"net"
-
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
-	"github.com/a2aproject/a2a-go/v2/a2agrpc/v1"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/server"
 )
-
-// TestGRPCBinding verifies the A2A gRPC binding (grpc_listen) drives a task.
-func TestGRPCBinding(t *testing.T) {
-	cfg := testConfig(t)
-	cfg.Agents[0].GRPCListen = "127.0.0.1:0"
-	servers, err := server.New(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if len(servers.GRPC) != 1 {
-		t.Fatalf("grpc servers = %d, want 1", len(servers.GRPC))
-	}
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() { _ = servers.GRPC[0].Server.Serve(lis) }()
-	defer servers.GRPC[0].Server.Stop()
-
-	ctx := context.Background()
-	client, err := a2aclient.NewFromEndpoints(ctx, []*a2a.AgentInterface{{
-		URL:             lis.Addr().String(),
-		ProtocolBinding: a2a.TransportProtocolGRPC,
-		ProtocolVersion: a2a.Version,
-	}}, a2agrpc.WithGRPCTransport(grpc.WithTransportCredentials(insecure.NewCredentials())))
-	if err != nil {
-		t.Fatalf("NewFromEndpoints: %v", err)
-	}
-	res, err := client.SendMessage(ctx, &a2a.SendMessageRequest{
-		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi")),
-	})
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-	if task, ok := res.(*a2a.Task); !ok || task.Status.State != a2a.TaskStateCompleted {
-		t.Fatalf("result = %+v, want a completed task", res)
-	}
-}
 
 // TestRESTBinding verifies the HTTP+JSON (A2A REST) binding drives a task.
 func TestRESTBinding(t *testing.T) {

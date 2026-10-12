@@ -15,21 +15,29 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/config"
 )
 
+// maxRedirects caps how many redirects the client follows.
+const maxRedirects = 5
+
 // httpStore is a self-hosted plain HTTP store (nginx/OpenResty): it accepts PUTs
 // under put_url and serves reads under get_base.
 type httpStore struct {
-	putBase string
-	getBase string
-	keyRule string
-	prefix  string
-	auth    config.HTTPStoreConfig
-	client  *http.Client
-	presign time.Duration
+	putBase     string
+	getBase     string
+	keyRule     string
+	prefix      string
+	auth        config.HTTPStoreConfig
+	credentials []config.StoreCredentialConfig
+	client      *http.Client
+	presign     time.Duration
+
+	mu      sync.Mutex
+	written map[string]time.Time // object key -> last write, for TTL reaping
 }
 
 func newHTTPStore(cfg config.StorageConfig) (Store, error) {
@@ -38,13 +46,15 @@ func newHTTPStore(cfg config.StorageConfig) (Store, error) {
 		return nil, err
 	}
 	return &httpStore{
-		putBase: strings.TrimRight(cfg.HTTP.PutURL, "/"),
-		getBase: strings.TrimRight(cfg.HTTP.GetBase, "/"),
-		keyRule: "{sha256}",
-		prefix:  cfg.Prefix,
-		auth:    cfg.HTTP,
-		client:  client,
-		presign: cfg.HTTP.PresignTTL,
+		putBase:     strings.TrimRight(cfg.HTTP.PutURL, "/"),
+		getBase:     strings.TrimRight(cfg.HTTP.GetBase, "/"),
+		keyRule:     "{sha256}",
+		prefix:      cfg.Prefix,
+		auth:        cfg.HTTP,
+		credentials: cfg.Download.Credential,
+		client:      client,
+		presign:     cfg.HTTP.PresignTTL,
+		written:     map[string]time.Time{},
 	}, nil
 }
 
@@ -99,8 +109,8 @@ func (s *httpStore) reserveViaService(ctx context.Context, rel string) (UploadTa
 		return UploadTarget{}, fmt.Errorf("blob: presign: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return UploadTarget{}, fmt.Errorf("blob: presign: status %d", resp.StatusCode)
+	if err := checkStatus(resp, "presign"); err != nil {
+		return UploadTarget{}, err
 	}
 	var out struct {
 		UploadURL string `json:"uploadUrl"`
@@ -119,15 +129,17 @@ func (s *httpStore) reserveViaService(ctx context.Context, rel string) (UploadTa
 }
 
 func (s *httpStore) Put(ctx context.Context, name, mediaType string, r io.Reader, size int64) (string, error) {
-	data, err := io.ReadAll(r)
+	f, n, sum, err := spool(r)
 	if err != nil {
 		return "", fmt.Errorf("blob: http put: %w", err)
 	}
-	rel := contentKey(s.prefix, name, data)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.putBase+"/"+rel, bytes.NewReader(data))
+	defer func() { f.Close(); os.Remove(f.Name()) }()
+	rel := contentKeySum(s.prefix, name, sum)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.putBase+"/"+rel, f)
 	if err != nil {
 		return "", err
 	}
+	req.ContentLength = n // a file body would otherwise be sent chunked
 	if mediaType != "" {
 		req.Header.Set("Content-Type", mediaType)
 	}
@@ -137,28 +149,111 @@ func (s *httpStore) Put(ctx context.Context, name, mediaType string, r io.Reader
 		return "", fmt.Errorf("blob: http put: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", fmt.Errorf("blob: http put: status %d", resp.StatusCode)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if err := checkStatus(resp, "http put"); err != nil {
+		return "", err
 	}
+	s.track(rel)
 	return s.readBase() + "/" + rel, nil
 }
 
+// track records a written object for TTL reaping.
+func (s *httpStore) track(rel string) {
+	s.mu.Lock()
+	s.written[rel] = time.Now()
+	s.mu.Unlock()
+}
+
+// Reap deletes tracked objects older than maxAge (the store must accept DELETE,
+// for example nginx's WebDAV module). Objects it did not write are not touched.
+func (s *httpStore) Reap(ctx context.Context, maxAge time.Duration) (int, error) {
+	cutoff := time.Now().Add(-maxAge)
+	s.mu.Lock()
+	var expired []string
+	for rel, t := range s.written {
+		if t.Before(cutoff) {
+			expired = append(expired, rel)
+		}
+	}
+	s.mu.Unlock()
+
+	removed := 0
+	for _, rel := range expired {
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.putBase+"/"+rel, nil)
+		if err != nil {
+			continue
+		}
+		s.setAuth(req)
+		resp, err := s.client.Do(req)
+		if err != nil {
+			continue
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			continue
+		}
+		s.mu.Lock()
+		delete(s.written, rel)
+		s.mu.Unlock()
+		removed++
+	}
+	return removed, nil
+}
+
 func (s *httpStore) Get(ctx context.Context, uri string) (io.ReadCloser, error) {
+	return s.fetch(ctx, uri, "", 0)
+}
+
+// GetRange reads length bytes from offset, using an HTTP Range request.
+func (s *httpStore) GetRange(ctx context.Context, uri string, offset, length int64) (io.ReadCloser, error) {
+	return s.fetch(ctx, uri, rangeSpec(offset, length), offset)
+}
+
+// fetch issues a GET with an optional Range header. A 200 reply to a non-zero
+// range offset means the server ignored the range, so it fails rather than
+// returning the wrong bytes.
+func (s *httpStore) fetch(ctx context.Context, uri, rangeHeader string, offset int64) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
 	if err != nil {
 		return nil, ErrUnsupportedURI
 	}
-	s.setAuth(req)
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+	s.authorize(req)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("blob: http get: %w", err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+	if err := objectError(resp, offset, "http get"); err != nil {
 		resp.Body.Close()
-		return nil, fmt.Errorf("blob: http get: status %d", resp.StatusCode)
+		return nil, err
 	}
 	return resp.Body, nil
 }
+
+// Size reports the object's size via a HEAD request.
+func (s *httpStore) Size(ctx context.Context, uri string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, uri, nil)
+	if err != nil {
+		return 0, ErrUnsupportedURI
+	}
+	s.authorize(req)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("blob: http head: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if err := objectError(resp, 0, "http head"); err != nil {
+		return 0, err
+	}
+	return resp.ContentLength, nil
+}
+
+// Reference maps a relative key to its read URL.
+func (s *httpStore) Reference(key string) (string, bool) { return s.readBase() + "/" + key, true }
 
 // setAuth applies Harbor's own credential for reaching the store.
 func (s *httpStore) setAuth(req *http.Request) {
@@ -168,6 +263,25 @@ func (s *httpStore) setAuth(req *http.Request) {
 	case "bearer":
 		req.Header.Set("Authorization", "Bearer "+s.auth.Token)
 	}
+}
+
+// authorize applies the origin credential for the request's host when one is
+// configured, else the store's own credential.
+func (s *httpStore) authorize(req *http.Request) {
+	host := req.URL.Hostname()
+	for _, c := range s.credentials {
+		if !strings.EqualFold(c.Host, host) {
+			continue
+		}
+		switch c.Auth {
+		case "basic":
+			req.SetBasicAuth(c.User, c.Pass)
+		case "bearer":
+			req.Header.Set("Authorization", "Bearer "+c.Token)
+		}
+		return
+	}
+	s.setAuth(req)
 }
 
 // secureLinkMD5 computes nginx secure_link's base64url(md5(expr)).
@@ -200,5 +314,11 @@ func newHTTPClient(cfg config.TLSConfig) (*http.Client, error) {
 	return &http.Client{
 		Timeout:   5 * time.Minute,
 		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+			if len(via) >= maxRedirects {
+				return fmt.Errorf("stopped after %d redirects", maxRedirects)
+			}
+			return nil
+		},
 	}, nil
 }

@@ -273,7 +273,6 @@ type AgentConfig struct {
 	Regex          *RegexConfig      `yaml:"regex"`           // parser: regex
 	ServerURL      string            `yaml:"server_url"`      // integration: server; connect instead of spawning
 	ServerProtocol string            `yaml:"server_protocol"` // "http" (default) | "acp" | "acp-streamable-http"
-	GRPCListen     string            `yaml:"grpc_listen"`     // optional A2A gRPC bind address
 	Workdir        string            `yaml:"workdir"`         // project dir the CLI is started in (its project root)
 	Args           []string          `yaml:"args"`
 	Env            map[string]string `yaml:"env"`

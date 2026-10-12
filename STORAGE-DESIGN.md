@@ -88,8 +88,8 @@ Out of scope (not part of this layer):
 - End-to-end encryption, content scanning, and any peer authorization beyond the
   store's own: the store authenticates access, and Harbor adds no layer above it.
 
-Deferred until a trigger (see section 18): Range and media streaming, and
-multipart upload.
+All capabilities described here are implemented; section 18 lists the remaining
+operational constraints.
 
 ## 3. Architecture
 
@@ -346,9 +346,10 @@ Details to get right, per the reference and Go SDK:
 - The canonical `uri_pathname` is the request path as the SDK uses it
   (`URL.Path`); entity values use COS's `safeURLEncode`, which also encodes
   `! ' ( ) *`.
-- A COS presigned URL is a **simple upload only**: one object, at most 5 GiB, no
-  multipart. A larger upload needs multipart and, in broker mode, a negotiated
-  part flow.
+- A COS **presigned** URL is a simple upload only: one object, at most 5 GiB, no
+  multipart. A store writing an object directly uses the multipart API past one
+  part, so only broker presigned transfers of that size need a negotiated part
+  flow.
 - Temporary credentials are supported via `x-cos-security-token` (header, or
   query param when presigned); the reference recommends temporary credentials
   for presigning.
@@ -629,7 +630,9 @@ The `reference` target can be hosted two ways:
 - **Harbor's own ingest endpoint**: `upload.base` is
   `<agent base_url>/agents/<id>/storage/in/`. The sender PUTs directly to Harbor
   (reachable because it is already calling Harbor), then sends the URL; Harbor
-  already holds the bytes and does not fetch at all.
+  already holds the bytes and does not fetch at all. The same endpoint answers a
+  GET (with `Range`) by streaming a stored object back, so a peer that reads
+  through it can stream a large object instead of materializing it whole.
 
 `auth: none` means no credential is required to PUT, not that the ingest is
 unbounded: the `media_types` and `maxBytes` policies and rate/quota limits still
@@ -829,6 +832,35 @@ within a shared trust domain):
 For `local` with a `serve_base_url`, `upload.base` is that HTTP URL instead, so a
 peer without the mount can upload.
 
+### 7.8 Caller-provided ingest
+
+A caller that wants response files larger than the inline threshold sends its
+own ingest target in the request metadata, because A2A does not expose the
+caller's card. The key is `harbor.ingest`, shaped like a `reference` `upload`
+object:
+
+```json
+{ "harbor.ingest": {
+  "base": "https://caller.example/in/",
+  "method": "PUT",
+  "key": "{sha256}",
+  "reference": "https://caller.example/pub/",
+  "maxInlineBytes": 1048576
+} }
+```
+
+The sender uploads a large artifact to `base + key` and emits
+`FilePart(url = reference + key)` (`reference` defaults to `base`);
+`maxInlineBytes`, when set, caps the effective inline threshold so the sender
+never inlines a size the caller would reject. Without `harbor.ingest` the sender
+assumes nothing and inlines (section 8). The extension schema is documented in
+`extensions/storage.md`.
+
+Harbor can also serve its own ingest endpoint at
+`<base_url>/agents/<id>/storage/in/`; an operator points `upload.base` at it to
+receive files without an external store (the bytes are stored via the configured
+backend).
+
 ## 8. Sender side (outbound artifacts)
 
 Rework `emitChanges`, `emitImageArtifacts`, `emitFileArtifacts`, and
@@ -858,7 +890,8 @@ and emit `a2a.NewFileURLPart(uri, mediaType)`. A consumer that supplied no
   the reference (section 7.5). Content addressing still deduplicates and makes
   verification possible.
 - Upload failure: when the file is within the inline bound, fall back to inline;
-  otherwise skip the single artifact and record `storage_error` in the metadata.
+  otherwise emit a lightweight artifact whose metadata carries `storage_error`,
+  naming the file that was dropped.
   The task still completes, so a transient storage fault does not fail the whole
   task.
 
@@ -1044,7 +1077,6 @@ Each step is triggered by a current need; nothing is built ahead of demand.
 7. `cos` backend (Tencent COS native REST API; no S3 SDK).
 
 ## 18. Known limitations and future triggers
-
 - Only the receiver-driven model is supported: to use out-of-band transfer, a
   receiver must advertise an `ingest` contract. When none is advertised the
   sender assumes no file capability and uses the A2A baseline (inline); it does
@@ -1056,10 +1088,14 @@ Each step is triggered by a current need; nothing is built ahead of demand.
 - `local` is same-host or NFS only; `file://` is not reachable across hosts.
 - The consumer does no scheme dispatch; an unhandled URI fails fast rather than
   silently.
-- No Range or media streaming: a large video is materialized whole. Added when a
-  concrete media case appears.
-- Multipart upload is not implemented; COS and S3 presigned/simple uploads cap
-  at about 5 GiB, so a larger transfer needs multipart (and, in broker mode, a
-  negotiated part flow).
+- Range and media streaming: a store exposes ranged reads (`GetRange`) and
+  sizing (`Size`), and the ingest endpoint serves a stored object over GET with
+  `Range` (`http.ServeContent`), so a large object can be streamed without
+  materializing it whole. All built-in backends support both.
+- Multipart upload is implemented for S3 and COS objects written directly by a
+  store (Harbor's own ingest): an object larger than one part (16 MiB) is
+  uploaded through the multipart API, so those stores have no single-PUT size
+  cap. The broker's presigned peer targets remain single requests, so a
+  broker-mode transfer over about 5 GiB still needs a negotiated part flow.
 - A broker's presigned upload target is bearer-like: anyone holding it can upload
   until it expires. Access control is the store's, not Harbor's.

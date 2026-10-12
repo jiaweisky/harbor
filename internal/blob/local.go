@@ -44,11 +44,12 @@ func (s *localStore) Reserve(context.Context, string, string, int64) (UploadTarg
 }
 
 func (s *localStore) Put(ctx context.Context, name, mediaType string, r io.Reader, size int64) (string, error) {
-	data, err := io.ReadAll(r)
+	f, _, sum, err := spool(r)
 	if err != nil {
 		return "", fmt.Errorf("blob: local put: %w", err)
 	}
-	rel := contentKey(s.prefix, name, data)
+	defer func() { f.Close(); os.Remove(f.Name()) }()
+	rel := contentKeySum(s.prefix, name, sum)
 	dst, err := s.resolve(rel)
 	if err != nil {
 		return "", err
@@ -56,22 +57,84 @@ func (s *localStore) Put(ctx context.Context, name, mediaType string, r io.Reade
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", fmt.Errorf("blob: local put: %w", err)
 	}
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
+	if err := copyToFile(dst, f); err != nil {
 		return "", fmt.Errorf("blob: local put: %w", err)
 	}
 	return s.ref(rel), nil
 }
 
-func (s *localStore) Get(ctx context.Context, uri string) (io.ReadCloser, error) {
-	rel, ok := s.rel(uri)
-	if !ok {
-		return nil, ErrUnsupportedURI
+// copyToFile writes r to dst, creating or truncating it.
+func copyToFile(dst string, r io.Reader) error {
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
 	}
-	p, err := s.resolve(rel)
+	defer f.Close()
+	_, err = io.Copy(f, r)
+	return err
+}
+
+func (s *localStore) Get(_ context.Context, uri string) (io.ReadCloser, error) {
+	p, err := s.path(uri)
 	if err != nil {
 		return nil, err
 	}
-	return os.Open(p)
+	rc, err := os.Open(p)
+	if os.IsNotExist(err) {
+		return nil, ErrNotFound
+	}
+	return rc, err
+}
+
+// GetRange opens the object at uri and reads length bytes from offset.
+func (s *localStore) GetRange(_ context.Context, uri string, offset, length int64) (io.ReadCloser, error) {
+	p, err := s.path(uri)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(p)
+	if os.IsNotExist(err) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if length < 0 {
+		return f, nil
+	}
+	return &limitedReadCloser{r: io.LimitReader(f, length), rc: f}, nil
+}
+
+// Size reports the object's size in bytes.
+func (s *localStore) Size(_ context.Context, uri string) (int64, error) {
+	p, err := s.path(uri)
+	if err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(p)
+	if os.IsNotExist(err) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+// Reference maps a relative key to its reference URI.
+func (s *localStore) Reference(key string) (string, bool) { return s.ref(key), true }
+
+// path resolves a reference URI to an absolute path confined to root.
+func (s *localStore) path(uri string) (string, error) {
+	rel, ok := s.rel(uri)
+	if !ok {
+		return "", ErrUnsupportedURI
+	}
+	return s.resolve(rel)
 }
 
 // ref renders the reference URI for a relative key.

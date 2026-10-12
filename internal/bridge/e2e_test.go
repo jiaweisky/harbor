@@ -782,7 +782,7 @@ func TestExecFileAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read arg log: %v", err)
 	}
-	if !strings.Contains(string(args), "-f ") || !strings.Contains(string(args), ".harbor/uploads") {
+	if !strings.Contains(string(args), "-f ") || !strings.Contains(string(args), filepath.Join(".a2a", "attachments")) {
 		t.Fatalf("args = %q, want -f <uploaded file>", args)
 	}
 	if strings.Contains(string(args), "saved to") {
@@ -1141,8 +1141,11 @@ func TestPromptFromParts(t *testing.T) {
 		}
 	}
 
-	uploaded := filepath.Join(root, ".harbor", "uploads", "1-notes.txt")
-	if b, err := os.ReadFile(uploaded); err != nil || string(b) != "file body" {
+	matches, err := filepath.Glob(filepath.Join(root, ".a2a", "attachments", "*", "1-notes.txt"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("uploaded file glob: err=%v matches=%v", err, matches)
+	}
+	if b, err := os.ReadFile(matches[0]); err != nil || string(b) != "file body" {
 		t.Fatalf("uploaded file: err=%v body=%q", err, b)
 	}
 }

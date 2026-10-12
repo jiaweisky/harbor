@@ -75,27 +75,28 @@ type SessionStore interface {
 
 // CLIExecutor turns a coding-agent CLI session into A2A task events.
 type CLIExecutor struct {
-	launcher      agent.Launcher
-	sessions      SessionStore
-	live          *agent.LiveSessions
-	workspace     *workspace.Resolver
-	timeout       time.Duration // total task timeout; 0 disables
-	idleTimeout   time.Duration // fail a task with no output for this long; 0 disables
-	keepalive     time.Duration // emit a keepalive when quiet for this long; 0 disables
-	breaker       *breaker      // nil disables
-	tasks         sync.Map      // taskID -> *taskState (all per-task transient state)
-	maxTurns      int
-	fileArtifacts bool          // emit a per-file artifact for each changed file
-	store         blob.Store    // file data plane; nil disables it
-	uploadClient  *http.Client  // sender-side client; nil uses the default
-	inboundMedia  string        // spool | inline
-	inlineMax     int64         // sender inline threshold; 0 disables reference uploads
-	maxBytes      int64         // largest accepted reference (broker)
-	mediaTypes    []string      // allowed ingest media types
-	downloadTO    time.Duration // bound on reading a reference; 0 disables
-	taskLookup    func(context.Context, a2a.TaskID) (*a2a.Task, bool)
-	idem          *idemCache // messageId -> taskID (duplicate-send guard)
-	metrics       *agentMetrics
+	launcher        agent.Launcher
+	sessions        SessionStore
+	live            *agent.LiveSessions
+	workspace       *workspace.Resolver
+	timeout         time.Duration // total task timeout; 0 disables
+	idleTimeout     time.Duration // fail a task with no output for this long; 0 disables
+	keepalive       time.Duration // emit a keepalive when quiet for this long; 0 disables
+	breaker         *breaker      // nil disables
+	tasks           sync.Map      // taskID -> *taskState (all per-task transient state)
+	maxTurns        int
+	fileArtifacts   bool          // emit a per-file artifact for each changed file
+	store           blob.Store    // file data plane; nil disables it
+	uploadClient    *http.Client  // sender-side client; nil uses the default
+	inboundMedia    string        // spool | inline
+	inlineMax       int64         // sender inline threshold; 0 disables reference uploads
+	maxBytes        int64         // largest accepted reference (broker)
+	maxArtifactRead int64         // largest file inlined as an artifact; 0 uses the default
+	mediaTypes      []string      // allowed ingest media types
+	downloadTO      time.Duration // bound on reading a reference; 0 disables
+	taskLookup      func(context.Context, a2a.TaskID) (*a2a.Task, bool)
+	idem            *idemCache // messageId -> taskID (duplicate-send guard)
+	metrics         *agentMetrics
 }
 
 // idemCache is a bounded messageId -> taskID map used to make repeated sends
@@ -1066,9 +1067,17 @@ func (e *CLIExecutor) emitDiff(ec *a2asrv.ExecutorContext, res changes.Result, e
 	emit(evt)
 }
 
-// maxArtifactReadBytes bounds how much of a single changed file is read into
-// memory before it is inlined or uploaded.
-const maxArtifactReadBytes = 256 << 20
+// defaultArtifactReadLimit is the default bound on how much of a single changed
+// file is read into memory before it is inlined or uploaded.
+const defaultArtifactReadLimit = 256 << 20
+
+// maxArtifactBytes is the effective inline-read bound for this executor.
+func (e *CLIExecutor) artifactReadLimit() int64 {
+	if e.maxArtifactRead > 0 {
+		return e.maxArtifactRead
+	}
+	return defaultArtifactReadLimit
+}
 
 // maxDiffReadBytes bounds the captured diff before it is uploaded or truncated.
 const maxDiffReadBytes = 32 << 20
@@ -1128,18 +1137,28 @@ func (e *CLIExecutor) emitFileArtifacts(
 	}
 }
 
+// uploadOutcome reports what uploadFile did with a changed file.
+type uploadOutcome int
+
+const (
+	fileInlined      uploadOutcome = iota // no target, or within the inline bound
+	fileUploaded                          // uploaded and referenced
+	fileUploadFailed                      // an upload was attempted and failed
+)
+
 // emitChangedFile emits one artifact for a changed file. A file larger than the
 // inline threshold is uploaded to the consumer's ingest target (when one was
-// supplied) and referenced; otherwise it is inlined as raw bytes. It returns
-// false only when the consumer has gone away (so the caller should stop
-// emitting); unreadable or oversized files are skipped (returns true).
+// supplied) and referenced; otherwise it is inlined as raw bytes. A file that
+// could neither be uploaded nor inlined is reported with a storage_error rather
+// than dropped. It returns false only when the consumer has gone away.
 func (e *CLIExecutor) emitChangedFile(
 	ec *a2asrv.ExecutorContext, dir, rel, artifactName, media string,
 	emit func(a2a.Event) bool,
 ) bool {
 	// Prefer a streaming upload (the file never enters memory); otherwise inline
 	// a bounded read of it.
-	if ref, sha, size, ok := e.uploadFile(ec, dir, rel, media); ok {
+	ref, sha, size, outcome := e.uploadFile(ec, dir, rel, media)
+	if outcome == fileUploaded {
 		part := a2a.NewFileURLPart(a2a.URL(ref), media)
 		part.Filename = filepath.Base(rel)
 		part.Metadata = map[string]any{"sha256": sha, "size": size}
@@ -1148,45 +1167,61 @@ func (e *CLIExecutor) emitChangedFile(
 		evt.Artifact.Metadata = map[string]any{"path": rel}
 		return emit(evt)
 	}
-	data, ok := readChangedFile(dir, rel, maxArtifactReadBytes)
+	data, ok := readChangedFile(dir, rel, e.artifactReadLimit())
 	if !ok {
+		if outcome == fileUploadFailed {
+			return emit(e.storageErrorArtifact(ec, rel, artifactName))
+		}
 		return true
 	}
 	return emit(e.fileArtifact(ec, rel, artifactName, media, data))
 }
 
+// storageErrorArtifact reports a file that was neither uploaded nor inlined, so
+// the client learns which file was dropped. The task still completes.
+func (e *CLIExecutor) storageErrorArtifact(
+	ec *a2asrv.ExecutorContext, rel, artifactName string,
+) *a2a.TaskArtifactUpdateEvent {
+	part := a2a.NewTextPart(fmt.Sprintf("[file: %s] could not be transferred to storage", filepath.Base(rel)))
+	evt := a2a.NewArtifactEvent(ec, part)
+	evt.Artifact.Name = artifactName
+	evt.Artifact.Metadata = map[string]any{"path": rel, "storage_error": true}
+	return evt
+}
+
 // uploadFile streams a changed file to the consumer's ingest target when it
 // exceeds the inline threshold and a target was supplied. It returns the
-// reference, content hash, and size; ok is false when the caller should inline.
+// reference, content hash, and size when uploaded; otherwise the outcome tells
+// the caller whether to inline.
 func (e *CLIExecutor) uploadFile(
 	ec *a2asrv.ExecutorContext, dir, rel, media string,
-) (ref, sha string, size int64, ok bool) {
+) (ref, sha string, size int64, outcome uploadOutcome) {
 	path, err := safePath(dir, rel)
 	if err != nil {
-		return "", "", 0, false
+		return "", "", 0, fileInlined
 	}
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return "", "", 0, false
+		return "", "", 0, fileInlined
 	}
 	t, limit, ok := e.uploadTarget(ec)
 	if !ok || limit <= 0 || info.Size() <= limit {
-		return "", "", 0, false
+		return "", "", 0, fileInlined
 	}
 	sha, err = hashFile(path)
 	if err != nil {
-		return "", "", 0, false
+		return "", "", 0, fileInlined
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return "", "", 0, false
+		return "", "", 0, fileInlined
 	}
 	defer f.Close()
 	ref, ok = e.putToTarget(t, media, applyKeyRule(t.keyRule, sha), f, info.Size())
 	if !ok {
-		return "", "", 0, false
+		return "", "", 0, fileUploadFailed
 	}
-	return ref, sha, info.Size(), true
+	return ref, sha, info.Size(), fileUploaded
 }
 
 // fileArtifact builds the inline artifact for a changed file.
@@ -1255,11 +1290,17 @@ func (e *CLIExecutor) putToTarget(t consumerIngest, media, key string, r io.Read
 	if media != "" {
 		target.Headers = map[string]string{"Content-Type": media}
 	}
-	if err := blob.Upload(context.Background(), e.uploadClient, target, r, size); err != nil {
+	ref, err := blob.Upload(context.Background(), e.uploadClient, target, r, size)
+	if err != nil {
 		slog.Warn("artifact upload failed; inlining instead", "key", key, "err", err)
 		return "", false
 	}
-	return strings.TrimRight(t.readBase(), "/") + "/" + key, true
+	if ref == "" {
+		// The receiver reported no reference (a plain object store), so form it
+		// from the advertised read base and key.
+		ref = strings.TrimRight(t.readBase(), "/") + "/" + key
+	}
+	return ref, true
 }
 
 // inlineLimit is the effective inline threshold: the local default, capped by
@@ -1388,7 +1429,8 @@ func (e *CLIExecutor) toRequest(ctx context.Context, ec *a2asrv.ExecutorContext)
 	if err != nil {
 		return nil, err
 	}
-	in, err := e.promptFromParts(ctx, ec.Message, dir)
+	attach := filepath.Join(dir, ".a2a", "attachments", turnDir(ec))
+	in, err := e.promptFromParts(ctx, ec.Message, attach)
 	if err != nil {
 		return nil, err
 	}
@@ -1426,13 +1468,21 @@ func contextKey(ec *a2asrv.ExecutorContext) string {
 	return ec.User.Name + "\x00" + ec.ContextID
 }
 
+// turnDir is the per-turn subdirectory inbound attachments are materialized
+// into, derived from the task id so turns do not overwrite each other in the
+// shared workspace.
+func turnDir(ec *a2asrv.ExecutorContext) string {
+	id := filepath.Base(string(ec.TaskID))
+	if id == "" || id == "." || id == ".." || id == string(filepath.Separator) {
+		return "turn"
+	}
+	return id
+}
+
 func isWaitingForInput(ec *a2asrv.ExecutorContext) bool {
 	return ec.StoredTask != nil && ec.StoredTask.Status.State == a2a.TaskStateInputRequired
 }
 
-// answerWithoutRunning reports whether a request is answered from existing
-// state instead of starting a CLI run: a repeated message returns the earlier
-// task, and a message to a finished task returns it unchanged.
 // handleStorageRequest answers a broker request (a storage/upload-slot-request
 // DataPart) with a presigned target, without starting a CLI. It reports whether
 // the message was a storage request.
@@ -1466,7 +1516,7 @@ func (e *CLIExecutor) reserve(ctx context.Context, req map[string]any) (map[stri
 		return nil, errors.New("storage is not configured")
 	}
 	name := stringField(req, "name")
-	mediaType := stringField(req, "mediaType")
+	mediaType := mediaTypeFor(name, stringField(req, "mediaType"))
 	size := int64Field(req, "size")
 	if e.maxBytes > 0 && size > e.maxBytes {
 		return nil, fmt.Errorf("file size %d exceeds the limit %d", size, e.maxBytes)
@@ -1551,6 +1601,9 @@ func int64Field(m map[string]any, key string) int64 {
 	return 0
 }
 
+// answerWithoutRunning reports whether a request is answered from existing
+// state instead of starting a CLI run: a repeated message returns the earlier
+// task, and a message to a finished task returns it unchanged.
 func (e *CLIExecutor) answerWithoutRunning(
 	ctx context.Context, ec *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool,
 ) bool {

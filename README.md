@@ -145,13 +145,10 @@ For an agent with id `<id>`:
 | `/.well-known/agents.json` | aggregate discovery: a JSON array of all cards (used by codebuddy) |
 | `/healthz`, `/readyz`, `/metrics` | liveness, readiness (JSON), Prometheus metrics |
 
-Set `agents[].grpc_listen: "127.0.0.1:50051"` to additionally serve that agent
-over gRPC; the card then declares the gRPC interface.
-
-With `server.auth.mode: bearer`, the invocation endpoints (JSON-RPC, REST, gRPC)
-require `Authorization: Bearer <token>`; cards and discovery stay public. A
-non-loopback `server.listen` (or `grpc_listen`) with `auth.mode: none` refuses to
-start unless `server.allow_insecure: true`.
+With `server.auth.mode: bearer`, the invocation endpoints (JSON-RPC, REST) require
+`Authorization: Bearer <token>`; cards and discovery stay public. A non-loopback
+`server.listen` with `auth.mode: none` refuses to start unless
+`server.allow_insecure: true`.
 
 ## Configuration
 
@@ -235,7 +232,6 @@ full reference. Durations use Go syntax (`30s`, `30m`, `1h`).
 | `regex.text` | string | for `parser: regex` | — | line regex with one capture group |
 | `server_url` | string | no | — | `server`: connect to an existing instance instead of spawning |
 | `server_protocol` | string | no | `http` | `server`: `http` \| `acp` \| `acp-streamable-http` |
-| `grpc_listen` | string | no | — | also serve this agent over gRPC at `host:port` |
 | `allow_dangerous` | bool | no | `false` | enable the CLI's dangerous/permission-bypass flag |
 | `interaction` | string | no | `auto` | `auto` \| `interactive` \| `non-interactive`: whether CLI permission/plan prompts surface as A2A `input-required` |
 | `sdk_capabilities` | bool | no | `false` | `stream-json`: declare `askUserQuestion` before the first prompt |

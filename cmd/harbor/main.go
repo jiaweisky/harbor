@@ -47,15 +47,6 @@ func run() error {
 	); err != nil {
 		return fmt.Errorf("refusing to start: %w", err)
 	}
-	for i := range cfg.Agents {
-		addr := cfg.Agents[i].GRPCListen
-		if addr == "" {
-			continue
-		}
-		if err := bridge.RequireAuthOnExposedBind(addr, cfg.Server.Auth.Mode, cfg.Server.AllowInsecure); err != nil {
-			return fmt.Errorf("refusing to start: %w", err)
-		}
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -119,18 +110,7 @@ func run() error {
 		}
 		serveErr <- srv.ListenAndServe()
 	}()
-	for _, gs := range servers.GRPC {
-		lis, err := net.Listen("tcp", gs.Addr)
-		if err != nil {
-			return fmt.Errorf("grpc listen %s: %w", gs.Addr, err)
-		}
-		go func(gs *server.GRPCServer, lis net.Listener) {
-			if err := gs.Server.Serve(lis); err != nil {
-				serveErr <- fmt.Errorf("grpc serve %s: %w", gs.Addr, err)
-			}
-		}(gs, lis)
-	}
-	slog.Info("harbor listening", "addr", cfg.Server.Listen, "discovery", server.DiscoveryPath, "grpc", len(servers.GRPC))
+	slog.Info("harbor listening", "addr", cfg.Server.Listen, "discovery", server.DiscoveryPath)
 
 	select {
 	case <-ctx.Done():
@@ -138,9 +118,6 @@ func run() error {
 		slog.Info("shutting down", "timeout", shutdownTimeout)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		for _, gs := range servers.GRPC {
-			gs.Server.GracefulStop()
-		}
 		return srv.Shutdown(shutdownCtx)
 	case err := <-serveErr:
 		if errors.Is(err, http.ErrServerClosed) {

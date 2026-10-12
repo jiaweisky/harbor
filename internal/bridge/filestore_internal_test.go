@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/blob"
+	"github.com/jiaweisky/harbor/internal/config"
 )
 
 // fakeStore serves fixed bytes for known reference URIs.
@@ -113,11 +115,58 @@ func TestUploadArtifact(t *testing.T) {
 	}
 }
 
+func TestUploadArtifactUsesReturnedReference(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Harbor-Reference", "s3://bucket/harbor/ab/xyz")
+	}))
+	defer srv.Close()
+
+	e := &CLIExecutor{inlineMax: 1}
+	ec := &a2asrv.ExecutorContext{Message: &a2a.Message{Metadata: map[string]any{
+		"harbor.ingest": map[string]any{"base": srv.URL, "method": "PUT", "reference": "http://read/base"},
+	}}}
+	ref := e.uploadArtifact(ec, "out.txt", "text/plain", []byte("large payload"))
+	if ref != "s3://bucket/harbor/ab/xyz" {
+		t.Fatalf("ref = %q, want the receiver-reported reference", ref)
+	}
+}
+
 func TestUploadArtifactInlinesWithoutTarget(t *testing.T) {
 	e := &CLIExecutor{inlineMax: 1}
 	ec := &a2asrv.ExecutorContext{Message: &a2a.Message{}}
 	if ref := e.uploadArtifact(ec, "out.txt", "text/plain", []byte("data")); ref != "" {
 		t.Fatal("expected no upload without a consumer target")
+	}
+}
+
+func TestEmitChangedFileStorageError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "big.bin"), []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	// inlineMax 1 forces an upload; maxArtifactRead 1 makes the file too large to
+	// inline, so a failed upload must surface a storage_error.
+	e := &CLIExecutor{inlineMax: 1, maxArtifactRead: 1}
+	ec := &a2asrv.ExecutorContext{Message: &a2a.Message{Metadata: map[string]any{
+		"harbor.ingest": map[string]any{"base": srv.URL},
+	}}}
+	var got *a2a.TaskArtifactUpdateEvent
+	e.emitChangedFile(ec, dir, "big.bin", "file", "application/octet-stream", func(ev a2a.Event) bool {
+		if a, ok := ev.(*a2a.TaskArtifactUpdateEvent); ok {
+			got = a
+		}
+		return true
+	})
+	if got == nil {
+		t.Fatal("expected a storage_error artifact")
+	}
+	if got.Artifact.Metadata["storage_error"] != true {
+		t.Fatalf("artifact metadata = %v, want storage_error", got.Artifact.Metadata)
 	}
 }
 
@@ -130,6 +179,41 @@ func TestFileArtifactMetadata(t *testing.T) {
 	}
 	if sum, _ := meta["sha256"].(string); len(sum) != 64 {
 		t.Fatalf("sha256 = %v", meta["sha256"])
+	}
+}
+
+func TestInlineBoundary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	e := &CLIExecutor{inlineMax: 10}
+	ec := &a2asrv.ExecutorContext{Message: &a2a.Message{Metadata: map[string]any{
+		"harbor.ingest": map[string]any{"base": srv.URL},
+	}}}
+	if ref := e.uploadArtifact(ec, "x.txt", "text/plain", make([]byte, 10)); ref != "" {
+		t.Fatal("a file at the inline limit should inline")
+	}
+	if ref := e.uploadArtifact(ec, "x.txt", "text/plain", make([]byte, 11)); ref == "" {
+		t.Fatal("a file above the inline limit should upload")
+	}
+}
+
+func TestMaterializeMaxBytes(t *testing.T) {
+	e := &CLIExecutor{store: fakeStore{data: map[string]string{"s3://b/x": "0123456789"}}, maxBytes: 5}
+	if _, err := e.materializeReference(context.Background(), "s3://b/x", "", t.TempDir(), "x"); err == nil {
+		t.Fatal("expected a size-limit error")
+	}
+}
+
+func TestInboundMediaTypeRejected(t *testing.T) {
+	e := &CLIExecutor{
+		launcher:   stubLauncher{caps: agent.Capabilities{InputText: true, InputFile: true}},
+		mediaTypes: []string{"text/*"},
+	}
+	p := a2a.NewRawPart([]byte("x"))
+	p.MediaType = "application/pdf"
+	msg := a2a.NewMessage(a2a.MessageRoleUser, p)
+	if _, err := e.promptFromParts(context.Background(), msg, t.TempDir()); err == nil {
+		t.Fatal("expected an unsupported media type error")
 	}
 }
 
@@ -174,6 +258,54 @@ func TestIngestHandler(t *testing.T) {
 	}
 	if st.name != "x.txt" || st.body != "payload" {
 		t.Fatalf("stored name=%q body=%q", st.name, st.body)
+	}
+}
+
+func TestIngestHandlerServesRange(t *testing.T) {
+	const base = "http://harbor.test/agents/a/storage/in"
+	st, err := blob.New(config.StorageConfig{
+		Backend: "local",
+		Local:   config.LocalStoreConfig{Root: t.TempDir(), ServeBaseURL: base},
+	})
+	if err != nil {
+		t.Fatalf("blob.New: %v", err)
+	}
+	h := IngestHandler(st)
+
+	put := httptest.NewRecorder()
+	h.ServeHTTP(put, httptest.NewRequest(http.MethodPut, "/agents/a/storage/in/a.txt", strings.NewReader("hello world")))
+	if put.Code != http.StatusNoContent {
+		t.Fatalf("put status = %d", put.Code)
+	}
+	ref := put.Header().Get("X-Harbor-Reference")
+	if !strings.HasPrefix(ref, base+"/") {
+		t.Fatalf("reference = %q", ref)
+	}
+
+	get := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, strings.TrimPrefix(ref, "http://harbor.test"), nil)
+	req.Header.Set("Range", "bytes=6-10")
+	h.ServeHTTP(get, req)
+	if get.Code != http.StatusPartialContent {
+		t.Fatalf("get status = %d, body = %q", get.Code, get.Body.String())
+	}
+	if get.Body.String() != "world" {
+		t.Fatalf("range body = %q, want %q", get.Body.String(), "world")
+	}
+}
+
+func TestIngestHandlerGetMissing(t *testing.T) {
+	st, err := blob.New(config.StorageConfig{
+		Backend: "local",
+		Local:   config.LocalStoreConfig{Root: t.TempDir(), ServeBaseURL: "http://harbor.test/agents/a/storage/in"},
+	})
+	if err != nil {
+		t.Fatalf("blob.New: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	IngestHandler(st).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents/a/storage/in/harbor/de/deadbeef.txt", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
 
@@ -236,6 +368,28 @@ func TestBrokerReserve(t *testing.T) {
 	}
 	if slot == nil || slot["reference"] != "s3://b/k" || slot["uploadUrl"] != "https://store/presigned" {
 		t.Fatalf("slot = %v", slot)
+	}
+}
+
+func TestBrokerReserveInfersMediaType(t *testing.T) {
+	e := &CLIExecutor{
+		store:      fakeStore{target: blob.UploadTarget{URL: "https://store/x", Reference: "s3://b/k"}},
+		mediaTypes: []string{"text/*"},
+	}
+	ec := &a2asrv.ExecutorContext{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewDataPart(map[string]any{
+		"kind": kindUploadSlotRequest, "name": "notes.txt", "size": float64(10),
+	}))}
+	var slot map[string]any
+	e.handleStorageRequest(context.Background(), ec, func(ev a2a.Event, _ error) bool {
+		if u, ok := ev.(*a2a.TaskArtifactUpdateEvent); ok {
+			if d, ok := u.Artifact.Parts[0].Data().(map[string]any); ok {
+				slot = d
+			}
+		}
+		return true
+	})
+	if slot == nil {
+		t.Fatal("a filename with a known extension should infer an accepted media type")
 	}
 }
 

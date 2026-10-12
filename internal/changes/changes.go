@@ -51,18 +51,44 @@ func Capture(dir string, base Baseline, maxBytes int) Result {
 	return captureHashes(dir, base, maxBytes)
 }
 
+// ignoredDirs are directories Harbor writes into the workspace (inbound
+// attachments); they are not the task's own changes and must be excluded.
+var ignoredDirs = []string{".a2a", ".harbor"}
+
+// excludePathspecs returns git exclude pathspecs for the ignored directories.
+func excludePathspecs() []string {
+	out := make([]string, 0, len(ignoredDirs))
+	for _, d := range ignoredDirs {
+		out = append(out, ":(exclude)"+d)
+	}
+	return out
+}
+
+// isIgnoredDir reports whether name is one of Harbor's own directories.
+func isIgnoredDir(name string) bool {
+	for _, d := range ignoredDirs {
+		if d == name {
+			return true
+		}
+	}
+	return false
+}
+
 func captureGit(dir string, base Baseline, maxBytes int) Result {
 	var b strings.Builder
 	// The trailing "." pathspec scopes the diff to dir, so changes outside a
-	// nested working directory are not attributed to this task.
+	// nested working directory are not attributed to this task; the exclude
+	// pathspecs drop Harbor's own attachment directories.
 	args := []string{"diff"}
 	if base.head != "" {
 		args = append(args, base.head)
 	}
 	args = append(args, "--", ".")
+	args = append(args, excludePathspecs()...)
 	b.WriteString(gitOutput(dir, args...))
 
-	status := gitLines(dir, "status", "--porcelain", "--", ".")
+	statusArgs := append([]string{"status", "--porcelain", "--", "."}, excludePathspecs()...)
+	status := gitLines(dir, statusArgs...)
 	b.WriteString(untrackedSection(dir))
 
 	diff := b.String()
@@ -104,7 +130,8 @@ func captureHashes(dir string, base Baseline, maxBytes int) Result {
 }
 
 func untrackedSection(dir string) string {
-	untracked := gitLines(dir, "ls-files", "--others", "--exclude-standard", "--", ".")
+	args := append([]string{"ls-files", "--others", "--exclude-standard", "--", "."}, excludePathspecs()...)
+	untracked := gitLines(dir, args...)
 	if len(untracked) == 0 {
 		return ""
 	}
@@ -184,7 +211,7 @@ func hashFiles(dir string) map[string]string {
 			return nil
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" {
+			if d.Name() == ".git" || isIgnoredDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil

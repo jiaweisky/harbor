@@ -143,15 +143,8 @@ func appendDataBlock(blocks []string, v any) []string {
 func (e *CLIExecutor) materializeFile(
 	ctx context.Context, p *a2a.Part, dir string, n int, caps agent.Capabilities,
 ) (ref, path string, err error) {
-	if strings.HasPrefix(strings.ToLower(p.MediaType), "image/") {
-		if !supportsMIME(caps.InputImage, p.MediaType) {
-			return "", "", fmt.Errorf("%w: image %s", errUnsupportedContent, p.MediaType)
-		}
-	} else if !caps.InputFile {
-		return "", "", fmt.Errorf("%w: file %s", errUnsupportedContent, p.MediaType)
-	}
-	if len(e.mediaTypes) > 0 && p.MediaType != "" && !mediaAllowed(e.mediaTypes, p.MediaType) {
-		return "", "", fmt.Errorf("%w: %s", errUnsupportedContent, p.MediaType)
+	if err := checkMedia(caps, p, e.mediaTypes); err != nil {
+		return "", "", err
 	}
 
 	name := safeFilename(p.Filename, n)
@@ -175,6 +168,44 @@ func (e *CLIExecutor) materializeFile(
 		return text + " saved to " + pth, pth, nil
 	}
 	return text + " " + string(p.URL()), "", nil
+}
+
+// checkMedia rejects a part the agent cannot accept: an image whose MIME type it
+// does not advertise, any non-image file without file-input support, or a media
+// type outside the media_types policy.
+func checkMedia(caps agent.Capabilities, p *a2a.Part, allowed []string) error {
+	if strings.HasPrefix(strings.ToLower(p.MediaType), "image/") {
+		if !supportsMIME(caps.InputImage, p.MediaType) {
+			return fmt.Errorf("%w: image %s", errUnsupportedContent, p.MediaType)
+		}
+	} else if !caps.InputFile {
+		return fmt.Errorf("%w: file %s", errUnsupportedContent, p.MediaType)
+	}
+	if len(allowed) > 0 {
+		if mt := effectiveMediaType(p); mt != "" && !mediaAllowed(allowed, mt) {
+			return fmt.Errorf("%w: %s", errUnsupportedContent, mt)
+		}
+	}
+	return nil
+}
+
+// effectiveMediaType is the part's declared media type, or one inferred from its
+// filename extension.
+func effectiveMediaType(p *a2a.Part) string {
+	return mediaTypeFor(p.Filename, p.MediaType)
+}
+
+// mediaTypeFor returns the declared media type, or one inferred from the file
+// name's extension.
+func mediaTypeFor(name, declared string) string {
+	if declared != "" {
+		return declared
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	if m, ok := imageMediaTypes[ext]; ok {
+		return m
+	}
+	return textMediaTypes[ext]
 }
 
 // materializeReference streams a store reference into dir, enforcing the size
@@ -232,8 +263,8 @@ var imageExt = map[string]string{
 	"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp",
 }
 
-// writeUpload writes data under dir/.harbor/uploads, falling back to the system
-// temp directory when the task has no working directory.
+// writeUpload writes data under the attachments directory dir, falling back to
+// the system temp directory when the task has no working directory.
 func writeUpload(dir, name string, data []byte) (string, error) {
 	path, err := uploadPath(dir, name)
 	if err != nil {
@@ -245,17 +276,16 @@ func writeUpload(dir, name string, data []byte) (string, error) {
 	return path, nil
 }
 
-// uploadPath returns the materialization path under dir/.harbor/uploads,
-// creating the directory.
+// uploadPath returns the materialization path under the attachments directory
+// dir, creating it.
 func uploadPath(dir, name string) (string, error) {
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	uploads := filepath.Join(dir, ".harbor", "uploads")
-	if err := os.MkdirAll(uploads, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	return filepath.Join(uploads, name), nil
+	return filepath.Join(dir, name), nil
 }
 
 // safeFilename reduces a client-supplied name to a single path element, falling

@@ -502,7 +502,7 @@ Exposure methods (a2a-go):
 
 - `a2asrv.NewStaticAgentCardHandler(card)` mounted at `/.well-known/agent-card.json`;
 - Multiple agents: `/agents/{id}/.well-known/agent-card.json` + `/agents/{id}/` (JSON-RPC handler, **with a trailing slash**, consistent with the card url);
-- **Transports**: JSON-RPC (default), HTTP+JSON (A2A REST, `a2asrv.NewRESTHandler`, mounted at `<agent>/rest/`), and gRPC (`a2agrpc.NewHandler`, with one listener per `agents[].grpc_listen`). All three bindings are declared in the AgentCard's `supportedInterfaces`.
+- **Transports**: JSON-RPC (default) and HTTP+JSON (A2A REST, `a2asrv.NewRESTHandler`, mounted at `<agent>/rest/`). Both bindings are declared in the AgentCard's `supportedInterfaces`.
 - **Protocol version fixed to A2A v1.0** (`ProtocolVersion: a2a.Version`): when `A2A-Version` does not match, `ErrVersionNotSupported` is returned.
 
 #### 6.1.1 Compatibility Discovery Endpoint (codebuddy)
@@ -1597,7 +1597,6 @@ type AgentConfig struct {
     Args           []string          `yaml:"args"`        // for acp, the ACP subcommand (opencode defaults from the profile)
     ServerURL      string            `yaml:"server_url"`       // server: connect to an existing instance instead of spawning
     ServerProtocol string            `yaml:"server_protocol"`  // server: http (default) | acp | acp-streamable-http
-    GRPCListen     string            `yaml:"grpc_listen"`      // optional: A2A gRPC listen address
     Env            map[string]string `yaml:"env"`
     AllowDangerous bool              `yaml:"allow_dangerous"`
     SDKCaps        bool              `yaml:"sdk_capabilities"`  // stream-json: declare askUserQuestion before the first prompt

@@ -6,10 +6,12 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -31,6 +33,7 @@ type s3Store struct {
 	pathStyle    bool
 	prefix       string
 	presignTTL   time.Duration
+	partSize     int
 	client       *http.Client
 }
 
@@ -50,7 +53,7 @@ func newS3Store(cfg config.StorageConfig) (Store, error) {
 		scheme: scheme, endpoint: strings.TrimRight(endpoint, "/"), bucket: cfg.S3.Bucket,
 		region: cfg.S3.Region, accessKey: cfg.S3.AccessKey, secretKey: cfg.S3.SecretKey,
 		sessionToken: cfg.S3.SessionToken, pathStyle: cfg.S3.PathStyle,
-		prefix: cfg.Prefix, presignTTL: cfg.S3.PresignTTL, client: client,
+		prefix: cfg.Prefix, presignTTL: cfg.S3.PresignTTL, partSize: s3PartSize, client: client,
 	}, nil
 }
 
@@ -73,28 +76,133 @@ func (s *s3Store) Reserve(_ context.Context, name, mediaType string, _ int64) (U
 	return t, nil
 }
 
+// s3PartSize is the multipart chunk size. Objects larger than one part use the
+// S3 multipart upload API, so the single-PUT size cap does not apply.
+const s3PartSize = 16 << 20
+
 func (s *s3Store) Put(ctx context.Context, name, mediaType string, r io.Reader, size int64) (string, error) {
-	data, err := io.ReadAll(r)
+	f, n, sum, err := spool(r)
 	if err != nil {
 		return "", fmt.Errorf("blob: s3 put: %w", err)
 	}
-	key := contentKey(s.prefix, name, data)
-	req, err := s.request(ctx, http.MethodPut, key, bytes.NewReader(data), mediaType)
-	if err != nil {
+	defer func() { f.Close(); os.Remove(f.Name()) }()
+	key := contentKeySum(s.prefix, name, sum)
+	if n <= int64(s.partSize) {
+		if err := s.putSingle(ctx, key, mediaType, f, n); err != nil {
+			return "", err
+		}
+		return s.uri(key), nil
+	}
+	if err := s.putMultipart(ctx, key, mediaType, f, n); err != nil {
 		return "", err
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("blob: s3 put: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", fmt.Errorf("blob: s3 put: status %d", resp.StatusCode)
 	}
 	return s.uri(key), nil
 }
 
+// putSingle sends one PUT for the whole object.
+func (s *s3Store) putSingle(ctx context.Context, key, mediaType string, body io.Reader, size int64) error {
+	resp, err := s.do(ctx, http.MethodPut, s.objectURL(key), body, mediaType, size)
+	if err != nil {
+		return fmt.Errorf("blob: s3 put: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return checkStatus(resp, "s3 put")
+}
+
+// s3Multipart adapts s3Store to the multipart driver for one object.
+type s3Multipart struct {
+	store     *s3Store
+	key       string
+	mediaType string
+}
+
+func (m s3Multipart) begin(ctx context.Context) (string, error) {
+	return m.store.createMultipart(ctx, m.key, m.mediaType)
+}
+func (m s3Multipart) putPart(ctx context.Context, id string, n int, data []byte) (string, error) {
+	return m.store.uploadPart(ctx, m.key, id, n, data)
+}
+func (m s3Multipart) complete(ctx context.Context, id string, parts []part) error {
+	return m.store.completeMultipart(ctx, m.key, id, parts)
+}
+func (m s3Multipart) abort(ctx context.Context, id string) { m.store.abortMultipart(ctx, m.key, id) }
+
+// putMultipart streams size bytes from f as parts under one S3 multipart upload.
+func (s *s3Store) putMultipart(ctx context.Context, key, mediaType string, f io.Reader, size int64) error {
+	return uploadMultipart(ctx, s3Multipart{store: s, key: key, mediaType: mediaType}, s.partSize, size, f)
+}
+
+func (s *s3Store) createMultipart(ctx context.Context, key, mediaType string) (string, error) {
+	resp, err := s.do(ctx, http.MethodPost, s.objectURL(key)+"?uploads", nil, mediaType, 0)
+	if err != nil {
+		return "", fmt.Errorf("blob: s3 create multipart: %w", err)
+	}
+	defer resp.Body.Close()
+	if err := checkStatus(resp, "s3 create multipart"); err != nil {
+		return "", err
+	}
+	var out struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.NewDecoder(resp.Body).Decode(&out); err != nil || out.UploadID == "" {
+		return "", fmt.Errorf("blob: s3 create multipart: bad response")
+	}
+	return out.UploadID, nil
+}
+
+func (s *s3Store) uploadPart(ctx context.Context, key, uploadID string, n int, data []byte) (string, error) {
+	uri := fmt.Sprintf("%s?partNumber=%d&uploadId=%s", s.objectURL(key), n, url.QueryEscape(uploadID))
+	resp, err := s.do(ctx, http.MethodPut, uri, bytes.NewReader(data), "", 0)
+	if err != nil {
+		return "", fmt.Errorf("blob: s3 upload part: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if err := checkStatus(resp, "s3 upload part"); err != nil {
+		return "", err
+	}
+	return strings.Trim(resp.Header.Get("ETag"), `"`), nil
+}
+
+func (s *s3Store) completeMultipart(ctx context.Context, key, uploadID string, parts []part) error {
+	var b strings.Builder
+	b.WriteString("<CompleteMultipartUpload>")
+	for _, p := range parts {
+		fmt.Fprintf(&b, "<Part><PartNumber>%d</PartNumber><ETag>%q</ETag></Part>", p.number, p.etag)
+	}
+	b.WriteString("</CompleteMultipartUpload>")
+	uri := s.objectURL(key) + "?uploadId=" + url.QueryEscape(uploadID)
+	resp, err := s.do(ctx, http.MethodPost, uri, strings.NewReader(b.String()), "application/xml", 0)
+	if err != nil {
+		return fmt.Errorf("blob: s3 complete multipart: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return checkStatus(resp, "s3 complete multipart")
+}
+
+// abortMultipart discards an in-progress upload; its failure is not fatal.
+func (s *s3Store) abortMultipart(ctx context.Context, key, uploadID string) {
+	uri := s.objectURL(key) + "?uploadId=" + url.QueryEscape(uploadID)
+	if resp, err := s.do(ctx, http.MethodDelete, uri, nil, "", 0); err == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+}
+
 func (s *s3Store) Get(ctx context.Context, uri string) (io.ReadCloser, error) {
+	return s.fetch(ctx, uri, "", 0)
+}
+
+// GetRange reads length bytes from offset, using an HTTP Range request.
+func (s *s3Store) GetRange(ctx context.Context, uri string, offset, length int64) (io.ReadCloser, error) {
+	return s.fetch(ctx, uri, rangeSpec(offset, length), offset)
+}
+
+// fetch issues a signed GET with an optional Range header. A 200 reply to a
+// non-zero range offset means the range was ignored.
+func (s *s3Store) fetch(ctx context.Context, uri, rangeHeader string, offset int64) (io.ReadCloser, error) {
 	key, ok := s.keyFromURI(uri)
 	if !ok {
 		return nil, ErrUnsupportedURI
@@ -103,22 +211,55 @@ func (s *s3Store) Get(ctx context.Context, uri string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("blob: s3 get: %w", err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+	if err := objectError(resp, offset, "s3 get"); err != nil {
 		resp.Body.Close()
-		return nil, fmt.Errorf("blob: s3 get: status %d", resp.StatusCode)
+		return nil, err
 	}
 	return resp.Body, nil
 }
 
+// Size reports the object's size via a HEAD request.
+func (s *s3Store) Size(ctx context.Context, uri string) (int64, error) {
+	key, ok := s.keyFromURI(uri)
+	if !ok {
+		return 0, ErrUnsupportedURI
+	}
+	req, err := s.request(ctx, http.MethodHead, key, nil, "")
+	if err != nil {
+		return 0, err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("blob: s3 head: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if err := objectError(resp, 0, "s3 head"); err != nil {
+		return 0, err
+	}
+	return resp.ContentLength, nil
+}
+
+// Reference maps a key to its s3:// reference URI.
+func (s *s3Store) Reference(key string) (string, bool) { return s.uri(key), true }
+
 // request builds a SigV4-signed request, using UNSIGNED-PAYLOAD so the body can
 // stream.
 func (s *s3Store) request(ctx context.Context, method, key string, body io.Reader, mediaType string) (*http.Request, error) {
-	u := s.objectURL(key)
-	req, err := http.NewRequestWithContext(ctx, method, u, body)
+	return s.build(ctx, method, s.objectURL(key), body, mediaType)
+}
+
+// build creates and signs a request against an arbitrary object URL, which may
+// carry query parameters (as the multipart upload calls do).
+func (s *s3Store) build(ctx context.Context, method, uri string, body io.Reader, mediaType string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, uri, body)
 	if err != nil {
 		return nil, err
 	}
@@ -127,6 +268,20 @@ func (s *s3Store) request(ctx context.Context, method, key string, body io.Reade
 	}
 	s.sign(req, time.Now().UTC())
 	return req, nil
+}
+
+// do signs and sends a request against an arbitrary object URL. A positive size
+// declares the body length, so the body is not sent chunked (which object stores
+// reject for a file body).
+func (s *s3Store) do(ctx context.Context, method, uri string, body io.Reader, mediaType string, size int64) (*http.Response, error) {
+	req, err := s.build(ctx, method, uri, body, mediaType)
+	if err != nil {
+		return nil, err
+	}
+	if size > 0 {
+		req.ContentLength = size
+	}
+	return s.client.Do(req)
 }
 
 // presign builds a query-signed URL for method/key.
@@ -185,9 +340,15 @@ func (s *s3Store) sign(req *http.Request, now time.Time) {
 }
 
 func (s *s3Store) signingKey(t time.Time) []byte {
-	k := hmacSHA256([]byte("AWS4"+s.secretKey), t.Format("20060102"))
-	k = hmacSHA256(k, s.region)
-	k = hmacSHA256(k, "s3")
+	return sigV4SigningKey(s.secretKey, s.region, "s3", t)
+}
+
+// sigV4SigningKey derives the SigV4 signing key for a secret, region, service,
+// and date.
+func sigV4SigningKey(secret, region, service string, t time.Time) []byte {
+	k := hmacSHA256([]byte("AWS4"+secret), t.Format("20060102"))
+	k = hmacSHA256(k, region)
+	k = hmacSHA256(k, service)
 	return hmacSHA256(k, "aws4_request")
 }
 
