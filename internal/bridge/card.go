@@ -102,18 +102,9 @@ func BuildCard(
 	}
 	caps := ln.Capabilities()
 
-	displayName := info.DisplayName
-	if displayName == "" {
-		displayName = ln.Name()
-	}
-
 	version := info.Version
 	if version == "" {
 		version = "0.1.0"
-	}
-	description := info.Description
-	if description == "" {
-		description = "Remote A2A wrapper for the " + displayName + " coding agent CLI"
 	}
 	in := caps.InputModes()
 	if len(in) == 0 {
@@ -125,8 +116,8 @@ func BuildCard(
 	}
 
 	card := &a2a.AgentCard{
-		Name:        "Harbor/" + displayName,
-		Description: description,
+		Name:        info.DisplayName,
+		Description: info.Description,
 		Version:     version,
 		SupportedInterfaces: []*a2a.AgentInterface{
 			{

@@ -19,11 +19,41 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+func TestAgentCardFieldsRequired(t *testing.T) {
+	displayName := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    description: "Test agent."
+`)
+	_, err := config.Load(displayName)
+	if err == nil || !strings.Contains(err.Error(), "display_name is required") {
+		t.Fatalf("expected a display_name error, got %v", err)
+	}
+
+	description := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    display_name: "CodeBuddy"
+`)
+	_, err = config.Load(description)
+	if err == nil || !strings.Contains(err.Error(), "description is required") {
+		t.Fatalf("expected a description error, got %v", err)
+	}
+}
+
 func TestExecRequiresPromptTemplate(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: exec
     args: ["-p", "--output-format", "stream-json"]
@@ -39,6 +69,8 @@ func TestExecWithPromptTemplateIsValid(t *testing.T) {
 version: 1
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -53,6 +85,8 @@ func TestCodexProfileDefaultOutputSchemaArgs(t *testing.T) {
 version: 1
 agents:
   - id: cx
+    display_name: "cx"
+    description: "Test agent for the cx CLI."
     binary: codex
     integration: exec
     args: ["exec", "--json", "{{.Prompt}}"]
@@ -72,6 +106,8 @@ func TestOpencodeProfileDefaultFileArgs(t *testing.T) {
 version: 1
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -91,6 +127,8 @@ func TestServerProtocolValidation(t *testing.T) {
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: server
     server_protocol: acp
@@ -103,6 +141,8 @@ agents:
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: server
     server_protocol: acp-streamable-http
@@ -115,6 +155,8 @@ agents:
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: server
     server_protocol: grpc
@@ -130,6 +172,8 @@ func TestInteractionValidation(t *testing.T) {
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     interaction: `+mode+`
@@ -147,6 +191,8 @@ agents:
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
 `)
@@ -162,6 +208,8 @@ agents:
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     interaction: sometimes
@@ -175,6 +223,8 @@ agents:
 version: 1
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     interaction: interactive
@@ -190,6 +240,8 @@ func TestACPProfileFillsDefaultArgs(t *testing.T) {
 version: 1
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: acp
 `)
@@ -207,6 +259,8 @@ func TestACPRequiresArgs(t *testing.T) {
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: acp
 `)
@@ -221,6 +275,8 @@ func TestUnknownIntegrationIsRejected(t *testing.T) {
 version: 1
 agents:
   - id: x
+    display_name: "x"
+    description: "Test agent for the x CLI."
     binary: b
     integration: bogus
 `)
@@ -242,6 +298,8 @@ func TestProfileFillsDefaultIntegration(t *testing.T) {
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: /usr/local/bin/codebuddy
     args: ["-p"]
 `)
@@ -259,6 +317,8 @@ func TestProfileRejectsUnsupportedIntegration(t *testing.T) {
 version: 1
 agents:
   - id: c
+    display_name: "c"
+    description: "Test agent for the c CLI."
     binary: claude
     integration: exec
     args: ["{{.Prompt}}"]
@@ -274,6 +334,8 @@ func TestUnknownBinaryRequiresIntegration(t *testing.T) {
 version: 1
 agents:
   - id: x
+    display_name: "x"
+    description: "Test agent for the x CLI."
     binary: my-bot
 `)
 	_, err := config.Load(path)
@@ -287,6 +349,8 @@ func TestLimitsParsed(t *testing.T) {
 version: 1
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -312,6 +376,8 @@ sandbox:
   isolation: worktree
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -329,6 +395,8 @@ server:
   store: bogus
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -346,6 +414,8 @@ server:
   store: sqlite
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -363,6 +433,8 @@ server:
   agent_inactivity_timeout: 30s
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -381,6 +453,8 @@ func TestAgentWorkdirMustExist(t *testing.T) {
 version: 1
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -397,6 +471,8 @@ func TestInheritEnvDefaultsTrue(t *testing.T) {
 version: 1
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -417,6 +493,8 @@ sandbox:
   inherit_env: false
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -438,6 +516,8 @@ sandbox:
     image: harbor/claude:latest
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -466,6 +546,8 @@ sandbox:
     network: none
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -485,6 +567,8 @@ sandbox:
     network: host
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -500,6 +584,8 @@ func TestCodexProfileDefaultImageArgs(t *testing.T) {
 version: 1
 agents:
   - id: codex
+    display_name: "codex"
+    description: "Test agent for the codex CLI."
     binary: codex
     integration: exec
     args: ["exec", "{{.Prompt}}"]
@@ -531,6 +617,8 @@ sandbox:
   require_container_for_dangerous: true
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     allow_dangerous: true
@@ -546,6 +634,8 @@ sandbox:
   container: { image: "harbor/cb:latest" }
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     allow_dangerous: true
@@ -560,6 +650,8 @@ func TestForkFlagDefaultsFromProfile(t *testing.T) {
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     args: ["-p"]
@@ -578,6 +670,7 @@ func TestCardOverrideConfig(t *testing.T) {
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
     binary: codebuddy
     integration: stream-json
     args: ["-p"]
@@ -607,6 +700,8 @@ func TestSkillsRequireIDNameDescription(t *testing.T) {
 version: 1
 agents:
   - id: cb
+    display_name: "cb"
+    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     args: ["-p"]
@@ -627,6 +722,8 @@ telemetry:
   insecure: true
 agents:
   - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]

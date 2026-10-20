@@ -742,8 +742,8 @@ are orthogonal to this design.
 
 ```json
 {
-  "name": "Harbor/codebuddy",
-  "description": "Remote A2A wrapper for the codebuddy coding agent CLI",
+  "name": "codebuddy",
+  "description": "CodeBuddy answers questions about the Harbor project.",
   "version": "2.161.4",
   "supportedInterfaces": [
     { "url": "https://harbor.example.com/agents/codebuddy/",      "protocolBinding": "JSONRPC",   "protocolVersion": "1.0" },

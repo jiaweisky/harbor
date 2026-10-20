@@ -1806,7 +1806,7 @@ func TestCardUsesDisplayName(t *testing.T) {
 	info := ln.Probe(context.Background())
 	info.DisplayName = "CodeBuddy Pro"
 	card := bridge.BuildCard(ln, info, "http://example/agents/cb/", false)
-	if card.Name != "Harbor/CodeBuddy Pro" {
+	if card.Name != "CodeBuddy Pro" {
 		t.Fatalf("card name = %q", card.Name)
 	}
 }

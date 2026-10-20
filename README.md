@@ -222,8 +222,8 @@ full reference. Durations use Go syntax (`30s`, `30m`, `1h`).
 | `id` | string | **yes** | — | agent id (route/card/skill base) |
 | `binary` | string | **yes** | — | CLI executable (name or path) |
 | `integration` | string | for unknown binaries | profile default | `exec` \| `stream-json` \| `acp` \| `server` |
-| `display_name` | string | no | `id` | card `name` (`Harbor/<display_name>`) |
-| `description` | string | no | template | card description text |
+| `display_name` | string | **yes** | — | card `name` text |
+| `description` | string | **yes** | — | card description text |
 | `version` | string | no | probed | card version (skips probing) |
 | `workdir` | string | no | Harbor cwd | project dir the CLI is started in (its project root); must exist |
 | `args` | string[] | exec/acp rules | — | launch args. `exec` must contain `{{.Prompt}}`; `acp` needs the ACP subcommand |
@@ -282,6 +282,7 @@ Optional; when omitted, the card advertises an empty skills list.
   binary: codebuddy
   integration: stream-json
   args: ["-p"]
+  display_name: "CodeBuddy"
   description: "CodeBuddy is a helpful software-development assistant."
   skills:
     - id: code-review

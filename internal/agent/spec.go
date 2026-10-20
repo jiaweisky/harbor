@@ -9,7 +9,7 @@ import (
 type Info struct {
 	Name        string
 	DisplayName string
-	Description string // card description override; empty uses the default template
+	Description string // card description text
 	Skills      []Skill
 	Version     string
 	Path        string

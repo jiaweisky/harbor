@@ -299,8 +299,7 @@ type AgentConfig struct {
 	// CLI profile's list. They are sent as native content blocks when the
 	// integration supports structured input, otherwise via ImageArgs.
 	InputImage []string `yaml:"input_image"`
-	// Description overrides the agent card's description. Empty uses the default
-	// template ("Remote A2A wrapper for the <name> coding agent CLI").
+	// Description is the agent card's description text.
 	Description string `yaml:"description"`
 	// Skills lists the skills advertised on the agent card. When empty, no
 	// skills are advertised (the A2A "skills" field is still present).
@@ -706,6 +705,12 @@ func validateAgent(i int, a *AgentConfig) error {
 	}
 	if a.Binary == "" {
 		return fmt.Errorf("agent %q: binary is required", a.ID)
+	}
+	if a.DisplayName == "" {
+		return fmt.Errorf("agent %q: display_name is required", a.ID)
+	}
+	if a.Description == "" {
+		return fmt.Errorf("agent %q: description is required", a.ID)
 	}
 	if a.Workdir != "" {
 		info, err := os.Stat(a.Workdir)

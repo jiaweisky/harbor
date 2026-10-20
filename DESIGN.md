@@ -456,13 +456,9 @@ Each agent generates a card; `stream-json`/`server` modes declare streaming capa
 ```go
 func CardFor(a agent.Launcher, info agent.Info, endpoint string) *a2a.AgentCard {
     caps := a.Capabilities() // effective capabilities, projected onto the card
-    desc := info.Description // agents[].description override
-    if desc == "" {
-        desc = "Remote A2A wrapper for the " + a.Name() + " coding agent CLI"
-    }
     return &a2a.AgentCard{
-        Name:        "Harbor/" + a.Name(),
-        Description: desc,
+        Name:        info.DisplayName, // agents[].display_name, required
+        Description: info.Description, // agents[].description, required
         Version:     info.Version,
         SupportedInterfaces: []*a2a.AgentInterface{
             {
