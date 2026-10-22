@@ -388,6 +388,116 @@ agents:
 	}
 }
 
+func TestArtifactInlineMaxBytesMustNotBeNegative(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  artifact_inline_max_bytes: -1
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "artifact_inline_max_bytes") {
+		t.Fatalf("expected an artifact_inline_max_bytes error, got %v", err)
+	}
+}
+
+func TestSandboxArtifactSettings(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  non_image_file_artifacts: true
+  artifact_inline_max_bytes: 1234
+  diff_inline_max_bytes: 5678
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Sandbox.NonImageFileArtifacts {
+		t.Fatal("non_image_file_artifacts was not parsed")
+	}
+	if cfg.Sandbox.ArtifactInlineMaxBytes != 1234 {
+		t.Fatalf("artifact_inline_max_bytes = %d", cfg.Sandbox.ArtifactInlineMaxBytes)
+	}
+	if cfg.Sandbox.DiffInlineMaxBytes != 5678 {
+		t.Fatalf("diff_inline_max_bytes = %d", cfg.Sandbox.DiffInlineMaxBytes)
+	}
+}
+
+func TestDiffInlineMaxBytesMustNotBeNegative(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  diff_inline_max_bytes: -1
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "diff_inline_max_bytes") {
+		t.Fatalf("expected a diff_inline_max_bytes error, got %v", err)
+	}
+}
+
+func TestNonGitChangeGlobs(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  non_git_change_globs: ["src/**", "*.md"]
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Sandbox.NonGitChangeGlobs) != 2 {
+		t.Fatalf("globs = %v", cfg.Sandbox.NonGitChangeGlobs)
+	}
+}
+
+func TestNonGitChangeGlobsRejectsInvalidPatterns(t *testing.T) {
+	for _, glob := range []string{"/tmp/**", "../outside/**", "src/../secret", "src/..", "src/["} {
+		path := writeConfig(t, `
+version: 1
+sandbox:
+  non_git_change_globs: ["`+glob+`"]
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+		if _, err := config.Load(path); err == nil || !strings.Contains(err.Error(), "non_git_change_globs") {
+			t.Fatalf("glob %q: expected a validation error, got %v", glob, err)
+		}
+	}
+}
+
 func TestStoreMustBeKnown(t *testing.T) {
 	path := writeConfig(t, `
 version: 1

@@ -20,7 +20,6 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
 	"github.com/jiaweisky/harbor/internal/agent"
-	"github.com/jiaweisky/harbor/internal/blob"
 	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/integration"
@@ -510,43 +509,6 @@ func TestStreamJSONPlanApproval(t *testing.T) {
 	}
 	if !strings.Contains(string(sent), `"allowed":true`) {
 		t.Fatalf("control_response = %q, want an allow", sent)
-	}
-}
-
-// TestCardStorageExtension verifies the card advertises the storage extension
-// and the file-exchange skill only when storage is configured.
-func TestCardStorageExtension(t *testing.T) {
-	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
-
-	plain := bridge.BuildCard(ln, agent.Info{Name: "cb"}, "http://example/agents/cb/", false)
-	if hasExtension(plain, bridge.StorageExtensionURI) {
-		t.Fatal("card should not advertise storage when unconfigured")
-	}
-
-	sc := config.StorageConfig{
-		Backend:        "http",
-		MediaTypes:     []string{"text/*"},
-		InlineMaxBytes: 1024,
-		Download:       config.DownloadConfig{MaxBytes: 2048},
-		HTTP:           config.HTTPStoreConfig{PutURL: "https://store.example/in/"},
-	}
-	st, err := blob.New(sc)
-	if err != nil {
-		t.Fatalf("blob.New: %v", err)
-	}
-	card := bridge.BuildCard(ln, agent.Info{Name: "cb"}, "http://example/agents/cb/", false,
-		bridge.NewStorageContract(sc, st))
-	if !hasExtension(card, bridge.StorageExtensionURI) {
-		t.Fatal("card missing the storage extension")
-	}
-	found := false
-	for _, s := range card.Skills {
-		if s.ID == "file-exchange" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("card missing the file-exchange skill")
 	}
 }
 
@@ -1532,6 +1494,7 @@ func TestImageOutputArtifact(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-image.sh"), "exec", []string{"{{.Prompt}}"}, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
 		workspace.NewResolver(root), config.LimitsConfig{})
+	exec.SetNonGitChangeGlobs([]string{"*.png"})
 	h := a2asrv.NewHandler(exec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1586,13 +1549,14 @@ func TestMaxTurnsExceeded(t *testing.T) {
 	}
 }
 
-// TestFileArtifacts verifies the opt-in per-file artifact for a changed file.
-func TestFileArtifacts(t *testing.T) {
+// TestNonImageFileArtifacts verifies the opt-in per-file artifact for a changed
+// non-image file.
+func TestNonImageFileArtifacts(t *testing.T) {
 	repo := gitRepo(t)
 	ln := newLauncher(t, scriptPath(t, "fake-mutate.sh"), "exec", nil, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
 		workspace.NewResolver(repo), config.LimitsConfig{})
-	exec.SetFileArtifacts(true)
+	exec.SetNonImageFileArtifacts(true)
 	h := a2asrv.NewHandler(exec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

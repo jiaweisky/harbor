@@ -21,6 +21,6 @@ go.work.sum
 # Local opencode session state
 .opencode/
 
-# Runtime file-exchange attachment dirs (written into a project workdir)
+# Runtime A2A attachment dirs (written into a project workdir)
 .a2a/
 .harbor/

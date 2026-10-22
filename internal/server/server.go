@@ -4,7 +4,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,7 +20,6 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/jiaweisky/harbor/internal/agent"
-	"github.com/jiaweisky/harbor/internal/blob"
 	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/integration"
@@ -113,18 +111,8 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 	})
 	inactivity := inactivityTimeout(cfg.Server)
 
-	blobStore, err := blob.New(cfg.Storage)
-	if err != nil {
-		_ = closeAll(closers)
-		return nil, fmt.Errorf("storage: %w", err)
-	}
-	if blob.CanReap(blobStore) && cfg.Storage.Retention > 0 {
-		go reapObjects(ctx, blobStore.(blob.Reaper), cfg.Storage.Retention)
-	}
-
 	b := &agentBuilder{
 		cfg:            cfg,
-		store:          blobStore,
 		auth:           auth,
 		bearer:         cfg.Server.Auth.Mode == "bearer",
 		rl:             newRateLimiter(cfg.Server.RateLimit, cfg.Server.Auth.Mode == "bearer"),
@@ -216,7 +204,6 @@ func inactivityTimeout(sc config.ServerConfig) time.Duration {
 // server, accumulating them for the assembled Servers.
 type agentBuilder struct {
 	cfg            *config.Config
-	store          blob.Store
 	auth           func(http.Handler) http.Handler
 	bearer         bool
 	rl             *rateLimiter
@@ -259,17 +246,10 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	resolver := workspace.NewResolverWithIsolation(ac.Workdir,
 		b.cfg.Sandbox.Isolation, b.cfg.Sandbox.IsolationRoot)
 	exec := bridge.NewCLIExecutor(ln, sessions, agent.NewLiveSessions(), resolver, ac.Limits)
-	exec.SetFileArtifacts(b.cfg.Sandbox.FileArtifacts)
-	if b.store != nil {
-		exec.SetStore(b.store)
-		exec.SetInboundMedia(b.cfg.Storage.InboundMedia)
-		exec.SetInlineMaxBytes(b.cfg.Storage.InlineMaxBytes)
-		exec.SetStoragePolicy(b.cfg.Storage.Download.MaxBytes, b.cfg.Storage.MediaTypes)
-		exec.SetDownloadTimeout(b.cfg.Storage.Download.Timeout)
-		if client, err := blob.NewClient(b.cfg.Storage.HTTP.TLS); err == nil {
-			exec.SetUploadClient(client)
-		}
-	}
+	exec.SetNonImageFileArtifacts(b.cfg.Sandbox.NonImageFileArtifacts)
+	exec.SetArtifactInlineMaxBytes(b.cfg.Sandbox.ArtifactInlineMaxBytes)
+	exec.SetDiffInlineMaxBytes(b.cfg.Sandbox.DiffInlineMaxBytes)
+	exec.SetNonGitChangeGlobs(b.cfg.Sandbox.NonGitChangeGlobs)
 	exec.SetTaskLookup(b.taskLookup)
 	// Enable the keepalive only when the agent also has a Harbor-side bound, so
 	// that suppressing the server watchdog for a long silent step does not leave
@@ -280,18 +260,13 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	handler := a2asrv.NewHandler(exec, b.handlerOptions...)
 
 	path := AgentPath(ac.ID)
-	contract := bridge.NewStorageContract(b.cfg.Storage, b.store)
-	card := bridge.BuildCard(ln, info, EndpointURL(b.cfg.Server.BaseURL, ac.ID), b.bearer, contract)
+	card := bridge.BuildCard(ln, info, EndpointURL(b.cfg.Server.BaseURL, ac.ID), b.bearer)
 	limit := b.cfg.Server.MaxRequestBytes
 	b.mux.Handle(path, b.auth(b.rl.middleware(ac.ID, maxBytes(limit, a2asrv.NewJSONRPCHandler(handler)))))
 	// The HTTP+JSON (A2A REST) binding, mounted under the agent's base path.
 	rest := http.StripPrefix(path+bridge.RESTMount, a2asrv.NewRESTHandler(handler))
 	b.mux.Handle(path+bridge.RESTPath, b.auth(b.rl.middleware(ac.ID, maxBytes(limit, rest))))
 	b.mux.Handle(path+".well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(card))
-	if b.store != nil {
-		// The agent's own ingest endpoint, for when its card advertises this path.
-		b.mux.Handle(path+bridge.IngestMount, b.auth(b.rl.middleware(ac.ID, bridge.IngestHandler(b.store))))
-	}
 
 	b.cards = append(b.cards, card)
 	b.execs = append(b.execs, exec)
@@ -350,34 +325,6 @@ func maxBytes(n int64, next http.Handler) http.Handler {
 	})
 }
 
-// reapObjects periodically removes store objects older than ttl, for backends
-// without their own lifecycle policy. It stops when ctx is canceled.
-func reapObjects(ctx context.Context, r blob.Reaper, ttl time.Duration) {
-	interval := ttl / 2
-	if interval < time.Minute {
-		interval = time.Minute
-	}
-	if interval > time.Hour {
-		interval = time.Hour
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			n, err := r.Reap(ctx, ttl)
-			if errors.Is(err, blob.ErrUnsupportedURI) {
-				return // this backend has no lifecycle policy of its own
-			}
-			if err == nil && n > 0 {
-				slog.Info("reaped stale storage objects", "count", n)
-			}
-		}
-	}
-}
-
 // metricsHandler exposes per-agent task counters and breaker state in the
 // Prometheus text exposition format.
 func metricsHandler(execs []*bridge.CLIExecutor) http.HandlerFunc {
@@ -388,7 +335,6 @@ func metricsHandler(execs []*bridge.CLIExecutor) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		bridge.WritePrometheus(w, snaps)
-		blob.WritePrometheus(w)
 	}
 }
 

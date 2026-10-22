@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	github.com/a2aproject/a2a-go/v2 v2.6.0
+	github.com/bmatcuk/doublestar/v4 v4.10.3
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.47.0

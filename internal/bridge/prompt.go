@@ -1,13 +1,9 @@
 package bridge
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,16 +18,14 @@ import (
 // never spawns a process.
 var errUnsupportedContent = errors.New("unsupported content type")
 
-// errStorage indicates the data plane could not read or verify a reference.
-var errStorage = errors.New("storage error")
-
 // promptFromParts assembles the normalized input from a message's parts: an
 // ordered list of text blocks, native image inputs, and attachable file paths.
 // Text parts become blocks, structured data parts become standalone JSON blocks,
-// raw image parts the CLI can accept become native image blocks, and other file
-// parts are materialized into dir, attached via their path (caps.AttachFiles)
-// or named in a block. Parts the agent cannot accept are rejected.
-func (e *CLIExecutor) promptFromParts(ctx context.Context, m *a2a.Message, dir string) (promptInput, error) {
+// raw image parts the CLI can accept become native image blocks, other raw file
+// parts are materialized into dir and attached via their path or named in a
+// block, and URL file parts are passed through as text and metadata. Raw parts
+// the agent cannot accept are rejected.
+func (e *CLIExecutor) promptFromParts(m *a2a.Message, dir string) (promptInput, error) {
 	var in promptInput
 	if m == nil {
 		return in, errNoText
@@ -49,7 +43,7 @@ func (e *CLIExecutor) promptFromParts(ctx context.Context, m *a2a.Message, dir s
 			in.Blocks = appendDataBlock(in.Blocks, p.Data())
 		case p.Raw() != nil || p.URL() != "":
 			n++
-			if err := e.addFilePart(ctx, &in, p, dir, n, caps); err != nil {
+			if err := e.addFilePart(&in, p, dir, n, caps); err != nil {
 				return promptInput{}, err
 			}
 		}
@@ -57,25 +51,39 @@ func (e *CLIExecutor) promptFromParts(ctx context.Context, m *a2a.Message, dir s
 	return in, nil
 }
 
-// addFilePart classifies one raw/URL part: a native image, an image attached via
-// args, a file attached via args, or a named reference in the prompt. A URL part
-// is read through the store when one is configured.
+// addFilePart classifies one raw/URL part. URL parts are passed through as
+// text and metadata; raw parts are handled by addRawPart.
 func (e *CLIExecutor) addFilePart(
-	ctx context.Context, in *promptInput, p *a2a.Part, dir string, n int, caps agent.Capabilities,
+	in *promptInput, p *a2a.Part, dir string, n int, caps agent.Capabilities,
 ) error {
-	// spool keeps every attachment as a file path; any other mode (or no store)
-	// lets a CLI-accepted image become a native content block.
-	if e.inboundMedia != "spool" {
-		img, err := imageInput(p, caps)
-		if err != nil {
-			return err
-		}
-		if img != nil {
-			in.Images = append(in.Images, *img)
-			return nil
-		}
+	if u := p.URL(); u != "" {
+		addURLPart(in, p, string(u), n)
+		return nil
 	}
-	ref, path, err := e.materializeFile(ctx, p, dir, n, caps)
+	return e.addRawPart(in, p, dir, n, caps)
+}
+
+// addURLPart passes a URL part through as a prompt block without fetching or
+// validating it.
+func addURLPart(in *promptInput, p *a2a.Part, u string, n int) {
+	in.Blocks = appendBlock(in.Blocks, fileURLBlock(p, u, n))
+}
+
+// addRawPart classifies one raw part. A raw image the CLI accepts inline becomes
+// a native content block; other raw files are materialized and attached by path
+// or named in a block.
+func (e *CLIExecutor) addRawPart(
+	in *promptInput, p *a2a.Part, dir string, n int, caps agent.Capabilities,
+) error {
+	img, err := imageInput(p, caps)
+	if err != nil {
+		return err
+	}
+	if img != nil {
+		in.Images = append(in.Images, *img)
+		return nil
+	}
+	ref, path, err := e.materializeFile(p, dir, n, caps)
 	if err != nil {
 		return err
 	}
@@ -104,14 +112,14 @@ func isImage(p *a2a.Part) bool {
 }
 
 // imageInput returns a native image input for a raw image part the CLI accepts
-// inline, nil for non-images, URL parts, and images the CLI takes as arguments
-// (handled as file references), or an error when an image MIME is unsupported.
+// inline, nil for non-images and images the CLI takes as arguments (handled as
+// file references), or an error when an image MIME is unsupported.
 func imageInput(p *a2a.Part, caps agent.Capabilities) (*agent.Image, error) {
 	if p.Raw() == nil || !isImage(p) {
 		return nil, nil
 	}
-	if !supportsMIME(caps.InputImage, p.MediaType) {
-		return nil, fmt.Errorf("%w: image %s", errUnsupportedContent, p.MediaType)
+	if err := checkRawMedia(caps, p); err != nil {
+		return nil, err
 	}
 	if !caps.InlineImages {
 		return nil, nil // materialized and attached via image_args
@@ -136,44 +144,49 @@ func appendDataBlock(blocks []string, v any) []string {
 	return appendBlock(blocks, string(buf))
 }
 
-// materializeFile writes a file part under dir and returns a prompt line naming
-// it plus its path (empty for an unreadable URL part). Images are only accepted
-// when the agent advertises their MIME type; other files require file-input
-// support. A URL part is read through the store when one is configured.
+// materializeFile writes a raw file part under dir and returns a prompt line
+// naming it plus its path. Images are only accepted when the agent advertises
+// their MIME type; other files require file-input support.
 func (e *CLIExecutor) materializeFile(
-	ctx context.Context, p *a2a.Part, dir string, n int, caps agent.Capabilities,
+	p *a2a.Part, dir string, n int, caps agent.Capabilities,
 ) (ref, path string, err error) {
-	if err := checkMedia(caps, p, e.mediaTypes); err != nil {
+	if err := checkRawMedia(caps, p); err != nil {
 		return "", "", err
 	}
-
 	name := safeFilename(p.Filename, n)
 	if ext := imageExt[strings.ToLower(p.MediaType)]; ext != "" && filepath.Ext(name) == "" {
 		name += ext
 	}
-	text := fmt.Sprintf("[file: %s]", name)
-	if data := p.Raw(); data != nil {
-		pth, err := writeUpload(dir, fmt.Sprintf("%d-%s", n, name), data)
-		if err != nil {
-			return "", "", fmt.Errorf("materialize %s: %w", name, err)
-		}
-		return text + " saved to " + pth, pth, nil
+	text := fileLabel(name)
+	pth, err := writeUpload(dir, fmt.Sprintf("%d-%s", n, name), p.Raw())
+	if err != nil {
+		return "", "", fmt.Errorf("materialize %s: %w", name, err)
 	}
-	if u := p.URL(); u != "" && e.store != nil {
-		pth, err := e.materializeReference(ctx, string(u), metaString(p.Metadata, "sha256"),
-			dir, fmt.Sprintf("%d-%s", n, name))
-		if err != nil {
-			return "", "", fmt.Errorf("%w: %s", errStorage, u)
-		}
-		return text + " saved to " + pth, pth, nil
-	}
-	return text + " " + string(p.URL()), "", nil
+	return text + " saved to " + pth, pth, nil
 }
 
-// checkMedia rejects a part the agent cannot accept: an image whose MIME type it
-// does not advertise, any non-image file without file-input support, or a media
-// type outside the media_types policy.
-func checkMedia(caps agent.Capabilities, p *a2a.Part, allowed []string) error {
+// fileURLBlock renders a URL file part as a prompt block, preserving its name,
+// media type, URL, and metadata without fetching it.
+func fileURLBlock(p *a2a.Part, u string, n int) string {
+	text := fileLabel(safeFilename(p.Filename, n))
+	if p.MediaType != "" {
+		text += " (" + p.MediaType + ")"
+	}
+	text += " " + u
+	if len(p.Metadata) > 0 {
+		if b, err := json.Marshal(p.Metadata); err == nil {
+			text += " metadata=" + string(b)
+		}
+	}
+	return text
+}
+
+// fileLabel renders the prompt label for one file.
+func fileLabel(name string) string { return fmt.Sprintf("[file: %s]", name) }
+
+// checkRawMedia rejects a raw part the agent cannot accept: an image whose MIME
+// type it does not advertise, or a non-image file without file-input support.
+func checkRawMedia(caps agent.Capabilities, p *a2a.Part) error {
 	if strings.HasPrefix(strings.ToLower(p.MediaType), "image/") {
 		if !supportsMIME(caps.InputImage, p.MediaType) {
 			return fmt.Errorf("%w: image %s", errUnsupportedContent, p.MediaType)
@@ -181,79 +194,7 @@ func checkMedia(caps agent.Capabilities, p *a2a.Part, allowed []string) error {
 	} else if !caps.InputFile {
 		return fmt.Errorf("%w: file %s", errUnsupportedContent, p.MediaType)
 	}
-	if len(allowed) > 0 {
-		if mt := effectiveMediaType(p); mt != "" && !mediaAllowed(allowed, mt) {
-			return fmt.Errorf("%w: %s", errUnsupportedContent, mt)
-		}
-	}
 	return nil
-}
-
-// effectiveMediaType is the part's declared media type, or one inferred from its
-// filename extension.
-func effectiveMediaType(p *a2a.Part) string {
-	return mediaTypeFor(p.Filename, p.MediaType)
-}
-
-// mediaTypeFor returns the declared media type, or one inferred from the file
-// name's extension.
-func mediaTypeFor(name, declared string) string {
-	if declared != "" {
-		return declared
-	}
-	ext := strings.ToLower(filepath.Ext(name))
-	if m, ok := imageMediaTypes[ext]; ok {
-		return m
-	}
-	return textMediaTypes[ext]
-}
-
-// materializeReference streams a store reference into dir, enforcing the size
-// bound and verifying the expected sha256 (when provided), so a large file
-// never has to be buffered whole.
-func (e *CLIExecutor) materializeReference(
-	ctx context.Context, uri, wantSHA, dir, name string,
-) (string, error) {
-	if e.downloadTO > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, e.downloadTO)
-		defer cancel()
-	}
-	rc, err := e.store.Get(ctx, uri)
-	if err != nil {
-		return "", err
-	}
-	defer rc.Close()
-
-	path, err := uploadPath(dir, name)
-	if err != nil {
-		return "", err
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	src := io.Reader(rc)
-	if e.maxBytes > 0 {
-		src = io.LimitReader(rc, e.maxBytes+1)
-	}
-	n, err := io.Copy(io.MultiWriter(f, h), src)
-	if err != nil {
-		_ = os.Remove(path)
-		return "", err
-	}
-	if e.maxBytes > 0 && n > e.maxBytes {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("reference %s exceeds the size limit", uri)
-	}
-	if wantSHA != "" && hex.EncodeToString(h.Sum(nil)) != wantSHA {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("reference %s failed its integrity check", uri)
-	}
-	return path, nil
 }
 
 // imageExt maps an image MIME type to a file extension, appended when a

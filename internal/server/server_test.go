@@ -74,6 +74,60 @@ func newTestServer(t *testing.T, cfg *config.Config) *httptest.Server {
 	return httptest.NewServer(h)
 }
 
+// TestArtifactConfigWiring verifies the sandbox artifact settings reach the
+// executor: a small inline limit turns a changed file into an omitted artifact.
+func TestArtifactConfigWiring(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tracked.txt"), []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script, err := filepath.Abs(filepath.Join("..", "..", "testdata", "fake-cli", "fake-mutate.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		Version: 1,
+		Server:  config.ServerConfig{Listen: "127.0.0.1:0", BaseURL: "http://example.test"},
+		Sandbox: config.SandboxConfig{
+			NonImageFileArtifacts:  true,
+			ArtifactInlineMaxBytes: 4,
+			NonGitChangeGlobs:      []string{"*.txt"},
+		},
+		Agents: []config.AgentConfig{{
+			ID: "cb", Binary: script, Integration: "exec",
+			Args: []string{"-p", "{{.Prompt}}"}, Workdir: dir,
+		}},
+	}
+	srv := newTestServer(t, cfg)
+	defer srv.Close()
+
+	ctx := context.Background()
+	client, err := a2aclient.NewFromEndpoints(ctx, []*a2a.AgentInterface{{
+		URL:             srv.URL + "/agents/cb/rest",
+		ProtocolBinding: a2a.TransportProtocolHTTPJSON,
+		ProtocolVersion: a2a.Version,
+	}}, a2aclient.WithRESTTransport(nil))
+	if err != nil {
+		t.Fatalf("NewFromEndpoints: %v", err)
+	}
+	res, err := client.SendMessage(ctx, &a2a.SendMessageRequest{
+		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi")),
+	})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	task := res.(*a2a.Task)
+	for _, a := range task.Artifacts {
+		if a.Name != "file" {
+			continue
+		}
+		if a.Metadata["omitted"] == true {
+			return
+		}
+	}
+	t.Fatalf("no omitted file artifact; artifacts = %+v", task.Artifacts)
+}
+
 func TestRoutes(t *testing.T) {
 	srv := newTestServer(t, testConfig(t))
 	defer srv.Close()

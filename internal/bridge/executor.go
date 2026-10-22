@@ -1,7 +1,6 @@
 package bridge
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,10 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"iter"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +23,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jiaweisky/harbor/internal/agent"
-	"github.com/jiaweisky/harbor/internal/blob"
 	"github.com/jiaweisky/harbor/internal/changes"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/telemetry"
@@ -44,8 +40,6 @@ const (
 	// codeInteractionUnexpected marks a permission prompt from a non-interactive
 	// agent whose CLI was not configured to bypass permissions.
 	codeInteractionUnexpected = "interaction_unexpected"
-	// codeStorageError marks a data-plane read or write failure.
-	codeStorageError = "storage_error"
 )
 
 // Metadata keys carried on task status messages. The interaction id is both
@@ -55,13 +49,6 @@ const (
 	metaKeyErrorCode     = "harbor.errorCode"
 	metaKeyInteractionID = "harbor.interactionId"
 	metaKeySessionID     = "harbor.sessionId"
-)
-
-// DataPart kinds for the broker exchange: a sender reserves an upload slot and
-// Harbor returns a presigned target.
-const (
-	kindUploadSlotRequest = "storage/upload-slot-request"
-	kindUploadSlot        = "storage/upload-slot"
 )
 
 // errNoText is returned when an incoming message has no textual part.
@@ -75,28 +62,23 @@ type SessionStore interface {
 
 // CLIExecutor turns a coding-agent CLI session into A2A task events.
 type CLIExecutor struct {
-	launcher        agent.Launcher
-	sessions        SessionStore
-	live            *agent.LiveSessions
-	workspace       *workspace.Resolver
-	timeout         time.Duration // total task timeout; 0 disables
-	idleTimeout     time.Duration // fail a task with no output for this long; 0 disables
-	keepalive       time.Duration // emit a keepalive when quiet for this long; 0 disables
-	breaker         *breaker      // nil disables
-	tasks           sync.Map      // taskID -> *taskState (all per-task transient state)
-	maxTurns        int
-	fileArtifacts   bool          // emit a per-file artifact for each changed file
-	store           blob.Store    // file data plane; nil disables it
-	uploadClient    *http.Client  // sender-side client; nil uses the default
-	inboundMedia    string        // spool | inline
-	inlineMax       int64         // sender inline threshold; 0 disables reference uploads
-	maxBytes        int64         // largest accepted reference (broker)
-	maxArtifactRead int64         // largest file inlined as an artifact; 0 uses the default
-	mediaTypes      []string      // allowed ingest media types
-	downloadTO      time.Duration // bound on reading a reference; 0 disables
-	taskLookup      func(context.Context, a2a.TaskID) (*a2a.Task, bool)
-	idem            *idemCache // messageId -> taskID (duplicate-send guard)
-	metrics         *agentMetrics
+	launcher               agent.Launcher
+	sessions               SessionStore
+	live                   *agent.LiveSessions
+	workspace              *workspace.Resolver
+	timeout                time.Duration // total task timeout; 0 disables
+	idleTimeout            time.Duration // fail a task with no output for this long; 0 disables
+	keepalive              time.Duration // emit a keepalive when quiet for this long; 0 disables
+	breaker                *breaker      // nil disables
+	tasks                  sync.Map      // taskID -> *taskState (all per-task transient state)
+	maxTurns               int
+	nonImageArtifacts      bool     // emit an artifact for each changed non-image file
+	artifactInlineMaxBytes int64    // max changed-file bytes inlined; 0 uses the default
+	diffInlineMaxBytes     int64    // max diff bytes; 0 uses the default
+	nonGitChangeGlobs      []string // opt-in globs for change capture outside git
+	taskLookup             func(context.Context, a2a.TaskID) (*a2a.Task, bool)
+	idem                   *idemCache // messageId -> taskID (duplicate-send guard)
+	metrics                *agentMetrics
 }
 
 // idemCache is a bounded messageId -> taskID map used to make repeated sends
@@ -276,31 +258,23 @@ func NewCLIExecutor(
 	}
 }
 
-// SetFileArtifacts enables emitting a per-file artifact for each changed file.
-func (e *CLIExecutor) SetFileArtifacts(on bool) { e.fileArtifacts = on }
+// SetNonImageFileArtifacts enables emitting a per-file artifact for each changed
+// non-image file.
+func (e *CLIExecutor) SetNonImageFileArtifacts(on bool) { e.nonImageArtifacts = on }
 
-// SetStore installs the file data-plane store; nil disables it.
-func (e *CLIExecutor) SetStore(s blob.Store) { e.store = s }
+// SetArtifactInlineMaxBytes bounds how much of one changed file is inlined into a
+// file or image artifact; 0 uses the default.
+func (e *CLIExecutor) SetArtifactInlineMaxBytes(n int64) { e.artifactInlineMaxBytes = n }
 
-// SetUploadClient sets the HTTP client used to reach a consumer's upload target.
-func (e *CLIExecutor) SetUploadClient(c *http.Client) { e.uploadClient = c }
+// SetDiffInlineMaxBytes bounds the captured diff before it is truncated; 0 uses
+// the default.
+func (e *CLIExecutor) SetDiffInlineMaxBytes(n int64) { e.diffInlineMaxBytes = n }
 
-// SetInboundMedia selects how inbound attachments reach the model (spool|inline).
-func (e *CLIExecutor) SetInboundMedia(mode string) { e.inboundMedia = mode }
-
-// SetInlineMaxBytes sets the sender's inline threshold: an outbound artifact
-// larger than this is uploaded to the consumer's ingest target (when one is
-// supplied) instead of inlined. 0 keeps the legacy fixed caps.
-func (e *CLIExecutor) SetInlineMaxBytes(n int64) { e.inlineMax = n }
-
-// SetStoragePolicy sets the ingest bounds the broker enforces.
-func (e *CLIExecutor) SetStoragePolicy(maxBytes int64, mediaTypes []string) {
-	e.maxBytes = maxBytes
-	e.mediaTypes = mediaTypes
+// SetNonGitChangeGlobs enables non-git change capture for the given relative
+// glob patterns; an empty list disables it.
+func (e *CLIExecutor) SetNonGitChangeGlobs(globs []string) {
+	e.nonGitChangeGlobs = append([]string(nil), globs...)
 }
-
-// SetDownloadTimeout bounds reading a reference; 0 disables it.
-func (e *CLIExecutor) SetDownloadTimeout(d time.Duration) { e.downloadTO = d }
 
 // SetKeepaliveInterval makes the executor emit a lightweight working update
 // when the CLI has been silent for this long, so a liveness watchdog does not
@@ -352,9 +326,6 @@ func (e *CLIExecutor) Snapshot() MetricsSnapshot {
 func (e *CLIExecutor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
 		taskID := string(ec.TaskID)
-		if e.handleStorageRequest(ctx, ec, yield) {
-			return
-		}
 		if e.answerWithoutRunning(ctx, ec, yield) {
 			return
 		}
@@ -458,7 +429,7 @@ func (e *CLIExecutor) start(
 	}
 	st.setLock(e.workspace.Lock(req.WorkDir))
 	if req.WorkDir != "" {
-		st.setBaseline(changes.Snapshot(req.WorkDir))
+		st.setBaseline(changes.Snapshot(req.WorkDir, e.nonGitChangeGlobs...))
 	}
 	e.launchAndPump(ctx, st, ec, taskID, req, false, yield)
 }
@@ -1020,8 +991,9 @@ func (e *CLIExecutor) fail(
 	e.forget(taskID)
 }
 
-// emitChanges captures the task's working-tree changes and emits them as a
-// "changes" artifact. It is a no-op when there is no baseline or no diff.
+// emitChanges captures the task's working-tree changes and emits the file,
+// image, and diff artifacts they produce. It is a no-op when there is no
+// baseline or the workspace cannot be resolved.
 func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool) {
 	st := e.loadState(taskID)
 	if st == nil {
@@ -1035,12 +1007,9 @@ func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emi
 	if err != nil || dir == "" {
 		return
 	}
-	res := changes.Capture(dir, base, maxDiffReadBytes)
-	// Surface changed image files (for example a text-to-image result) as raw
-	// image artifacts, alongside the textual diff.
-	e.emitImageArtifacts(ec, dir, res.Files, emit)
-	if e.fileArtifacts {
-		e.emitFileArtifacts(ec, dir, res.Files, emit)
+	res := changes.Capture(dir, base, e.diffInlineLimit())
+	if !e.emitChangedFiles(ec, dir, res.Files, emit) {
+		return
 	}
 	if res.Diff == "" {
 		return
@@ -1048,39 +1017,45 @@ func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emi
 	e.emitDiff(ec, res, emit)
 }
 
-// emitDiff delivers the change diff: uploaded and referenced when it exceeds the
-// inline threshold and a consumer target is available, else inlined as text.
+// emitDiff delivers the change diff inline as text.
 func (e *CLIExecutor) emitDiff(ec *a2asrv.ExecutorContext, res changes.Result, emit func(a2a.Event) bool) {
 	data := []byte(res.Diff)
-	var part *a2a.Part
-	if ref := e.uploadArtifact(ec, "changes.diff", "text/x-diff", data); ref != "" {
-		part = a2a.NewFileURLPart(a2a.URL(ref), "text/x-diff")
-		part.Filename = "changes.diff"
-	} else {
-		part = a2a.NewTextPart(res.Diff)
+	part := a2a.NewTextPart(res.Diff)
+	format := "summary"
+	if res.Unified {
 		part.MediaType = "text/x-diff"
+		format = "unified"
+	} else {
+		part.MediaType = "text/plain"
 	}
 	part.Metadata = digestMeta(data)
-	evt := a2a.NewArtifactEvent(ec, part)
-	evt.Artifact.Name = "changes"
-	evt.Artifact.Metadata = map[string]any{"files": toAnySlice(res.Files), "truncated": res.Truncated}
-	emit(evt)
+	emit(artifactEvent(ec, "changes", part, map[string]any{
+		"files": toAnySlice(res.Files), "truncated": res.Truncated, "format": format,
+	}))
 }
 
 // defaultArtifactReadLimit is the default bound on how much of a single changed
-// file is read into memory before it is inlined or uploaded.
+// file is read into memory before it is inlined.
 const defaultArtifactReadLimit = 256 << 20
 
-// maxArtifactBytes is the effective inline-read bound for this executor.
-func (e *CLIExecutor) artifactReadLimit() int64 {
-	if e.maxArtifactRead > 0 {
-		return e.maxArtifactRead
+// artifactInlineLimit is the effective inline bound for one changed file.
+func (e *CLIExecutor) artifactInlineLimit() int64 {
+	if e.artifactInlineMaxBytes > 0 {
+		return e.artifactInlineMaxBytes
 	}
 	return defaultArtifactReadLimit
 }
 
-// maxDiffReadBytes bounds the captured diff before it is uploaded or truncated.
-const maxDiffReadBytes = 32 << 20
+// defaultDiffInlineMaxBytes bounds the captured diff before it is truncated.
+const defaultDiffInlineMaxBytes = 32 << 20
+
+// diffInlineLimit is the effective diff bound.
+func (e *CLIExecutor) diffInlineLimit() int64 {
+	if e.diffInlineMaxBytes > 0 {
+		return e.diffInlineMaxBytes
+	}
+	return defaultDiffInlineMaxBytes
+}
 
 // imageMediaTypes maps a lower-case file extension to its image MIME type. It
 // covers the formats the supported CLIs produce.
@@ -1099,129 +1074,75 @@ var textMediaTypes = map[string]string{
 	".sh": "text/plain", ".html": "text/html", ".css": "text/css",
 }
 
-// emitImageArtifacts emits one image artifact per changed image file in the
-// task's working directory (inlined, or a URL reference when uploaded), so a
-// generated image reaches the client as an image part rather than a diff line.
-func (e *CLIExecutor) emitImageArtifacts(
+// emitChangedFiles emits artifacts for changed images and, when enabled, for
+// changed non-image files. It returns false when the consumer has gone away.
+func (e *CLIExecutor) emitChangedFiles(
 	ec *a2asrv.ExecutorContext, dir string, files []string, emit func(a2a.Event) bool,
-) {
+) bool {
 	for _, rel := range files {
-		media, ok := imageMediaTypes[strings.ToLower(filepath.Ext(rel))]
+		name, media, ok := artifactForFile(rel, e.nonImageArtifacts)
 		if !ok {
 			continue
 		}
-		if !e.emitChangedFile(ec, dir, rel, "image", media, emit) {
-			return
+		if !e.emitChangedFile(ec, dir, rel, name, media, emit) {
+			return false
 		}
 	}
+	return true
 }
 
-// emitFileArtifacts emits one file artifact per changed non-image file (inlined,
-// or a URL reference when uploaded), so a client receives the produced files,
-// not only a diff.
-func (e *CLIExecutor) emitFileArtifacts(
-	ec *a2asrv.ExecutorContext, dir string, files []string, emit func(a2a.Event) bool,
-) {
-	for _, rel := range files {
-		ext := strings.ToLower(filepath.Ext(rel))
-		if _, isImage := imageMediaTypes[ext]; isImage {
-			continue // already emitted as an image artifact
-		}
-		media, ok := textMediaTypes[ext]
-		if !ok {
-			media = "application/octet-stream"
-		}
-		if !e.emitChangedFile(ec, dir, rel, "file", media, emit) {
-			return
-		}
+// artifactForFile classifies one changed path as an image artifact, an optional
+// non-image file artifact, or neither.
+func artifactForFile(rel string, includeNonImage bool) (name, media string, ok bool) {
+	ext := strings.ToLower(filepath.Ext(rel))
+	if media, ok := imageMediaTypes[ext]; ok {
+		return "image", media, true
 	}
+	if !includeNonImage {
+		return "", "", false
+	}
+	media, ok = textMediaTypes[ext]
+	if !ok {
+		media = "application/octet-stream"
+	}
+	return "file", media, true
 }
 
-// uploadOutcome reports what uploadFile did with a changed file.
-type uploadOutcome int
-
-const (
-	fileInlined      uploadOutcome = iota // no target, or within the inline bound
-	fileUploaded                          // uploaded and referenced
-	fileUploadFailed                      // an upload was attempted and failed
-)
-
-// emitChangedFile emits one artifact for a changed file. A file larger than the
-// inline threshold is uploaded to the consumer's ingest target (when one was
-// supplied) and referenced; otherwise it is inlined as raw bytes. A file that
-// could neither be uploaded nor inlined is reported with a storage_error rather
-// than dropped. It returns false only when the consumer has gone away.
+// emitChangedFile inlines one changed file as a raw artifact, or emits an
+// omitted notice when it cannot be read or exceeds the inline limit. It returns
+// false only when the consumer has gone away.
 func (e *CLIExecutor) emitChangedFile(
 	ec *a2asrv.ExecutorContext, dir, rel, artifactName, media string,
 	emit func(a2a.Event) bool,
 ) bool {
-	// Prefer a streaming upload (the file never enters memory); otherwise inline
-	// a bounded read of it.
-	ref, sha, size, outcome := e.uploadFile(ec, dir, rel, media)
-	if outcome == fileUploaded {
-		part := a2a.NewFileURLPart(a2a.URL(ref), media)
-		part.Filename = filepath.Base(rel)
-		part.Metadata = map[string]any{"sha256": sha, "size": size}
-		evt := a2a.NewArtifactEvent(ec, part)
-		evt.Artifact.Name = artifactName
-		evt.Artifact.Metadata = map[string]any{"path": rel}
-		return emit(evt)
-	}
-	data, ok := readChangedFile(dir, rel, e.artifactReadLimit())
+	data, ok := readChangedFile(dir, rel, e.artifactInlineLimit())
 	if !ok {
-		if outcome == fileUploadFailed {
-			return emit(e.storageErrorArtifact(ec, rel, artifactName))
+		path, err := safePath(dir, rel)
+		if err != nil {
+			return true
 		}
-		return true
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return true // deleted or otherwise not a file
+		}
+		return emit(e.omittedFileArtifact(ec, rel, artifactName, info.Size()))
 	}
 	return emit(e.fileArtifact(ec, rel, artifactName, media, data))
 }
 
-// storageErrorArtifact reports a file that was neither uploaded nor inlined, so
-// the client learns which file was dropped. The task still completes.
-func (e *CLIExecutor) storageErrorArtifact(
-	ec *a2asrv.ExecutorContext, rel, artifactName string,
+// omittedFileArtifact reports a changed file that could not be inlined, so the
+// client learns which file was dropped and why.
+func (e *CLIExecutor) omittedFileArtifact(
+	ec *a2asrv.ExecutorContext, rel, artifactName string, size int64,
 ) *a2a.TaskArtifactUpdateEvent {
-	part := a2a.NewTextPart(fmt.Sprintf("[file: %s] could not be transferred to storage", filepath.Base(rel)))
-	evt := a2a.NewArtifactEvent(ec, part)
-	evt.Artifact.Name = artifactName
-	evt.Artifact.Metadata = map[string]any{"path": rel, "storage_error": true}
-	return evt
-}
-
-// uploadFile streams a changed file to the consumer's ingest target when it
-// exceeds the inline threshold and a target was supplied. It returns the
-// reference, content hash, and size when uploaded; otherwise the outcome tells
-// the caller whether to inline.
-func (e *CLIExecutor) uploadFile(
-	ec *a2asrv.ExecutorContext, dir, rel, media string,
-) (ref, sha string, size int64, outcome uploadOutcome) {
-	path, err := safePath(dir, rel)
-	if err != nil {
-		return "", "", 0, fileInlined
+	reason := "unreadable"
+	if size > e.artifactInlineLimit() {
+		reason = fmt.Sprintf("size %d exceeds the %d-byte inline limit", size, e.artifactInlineLimit())
 	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", "", 0, fileInlined
-	}
-	t, limit, ok := e.uploadTarget(ec)
-	if !ok || limit <= 0 || info.Size() <= limit {
-		return "", "", 0, fileInlined
-	}
-	sha, err = hashFile(path)
-	if err != nil {
-		return "", "", 0, fileInlined
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", "", 0, fileInlined
-	}
-	defer f.Close()
-	ref, ok = e.putToTarget(t, media, applyKeyRule(t.keyRule, sha), f, info.Size())
-	if !ok {
-		return "", "", 0, fileUploadFailed
-	}
-	return ref, sha, info.Size(), fileUploaded
+	part := a2a.NewTextPart(fmt.Sprintf("[file: %s] not delivered: %s", filepath.Base(rel), reason))
+	return artifactEvent(ec, artifactName, part, map[string]any{
+		"path": rel, "omitted": true, "size": size,
+	})
 }
 
 // fileArtifact builds the inline artifact for a changed file.
@@ -1232,9 +1153,16 @@ func (e *CLIExecutor) fileArtifact(
 	part.MediaType = media
 	part.Filename = filepath.Base(rel)
 	part.Metadata = digestMeta(data)
+	return artifactEvent(ec, artifactName, part, map[string]any{"path": rel})
+}
+
+// artifactEvent builds an artifact update event with its name and metadata.
+func artifactEvent(
+	ec *a2asrv.ExecutorContext, name string, part *a2a.Part, meta map[string]any,
+) *a2a.TaskArtifactUpdateEvent {
 	evt := a2a.NewArtifactEvent(ec, part)
-	evt.Artifact.Name = artifactName
-	evt.Artifact.Metadata = map[string]any{"path": rel}
+	evt.Artifact.Name = name
+	evt.Artifact.Metadata = meta
 	return evt
 }
 
@@ -1249,127 +1177,12 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// hashFile streams path and returns its hex SHA-256.
-func hashFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// uploadTarget returns the consumer's ingest target and the effective inline
-// limit, reporting false when no target was supplied.
-func (e *CLIExecutor) uploadTarget(ec *a2asrv.ExecutorContext) (consumerIngest, int64, bool) {
-	t, ok := ingestTarget(ec)
-	if !ok {
-		return consumerIngest{}, 0, false
-	}
-	return t, e.inlineLimit(t), true
-}
-
-// uploadArtifact uploads in-memory data (the diff) to the consumer's ingest
-// target when it exceeds the inline threshold, returning the reference or "".
-func (e *CLIExecutor) uploadArtifact(ec *a2asrv.ExecutorContext, rel, media string, data []byte) string {
-	t, limit, ok := e.uploadTarget(ec)
-	if !ok || limit <= 0 || int64(len(data)) <= limit {
-		return ""
-	}
-	ref, _ := e.putToTarget(t, media, applyKeyRule(t.keyRule, sha256Hex(data)), bytes.NewReader(data), int64(len(data)))
-	return ref
-}
-
-// putToTarget uploads r to the target under key and returns the reference.
-func (e *CLIExecutor) putToTarget(t consumerIngest, media, key string, r io.Reader, size int64) (string, bool) {
-	target := blob.UploadTarget{URL: strings.TrimRight(t.base, "/") + "/" + key, Method: t.method}
-	if media != "" {
-		target.Headers = map[string]string{"Content-Type": media}
-	}
-	ref, err := blob.Upload(context.Background(), e.uploadClient, target, r, size)
-	if err != nil {
-		slog.Warn("artifact upload failed; inlining instead", "key", key, "err", err)
-		return "", false
-	}
-	if ref == "" {
-		// The receiver reported no reference (a plain object store), so form it
-		// from the advertised read base and key.
-		ref = strings.TrimRight(t.readBase(), "/") + "/" + key
-	}
-	return ref, true
-}
-
-// inlineLimit is the effective inline threshold: the local default, capped by
-// the consumer's advertised maximum when it is smaller.
-func (e *CLIExecutor) inlineLimit(t consumerIngest) int64 {
-	limit := e.inlineMax
-	if t.maxInline > 0 && (limit <= 0 || t.maxInline < limit) {
-		limit = t.maxInline
-	}
-	return limit
-}
-
 // safePath joins dir and rel, rejecting absolute paths and traversal.
 func safePath(dir, rel string) (string, error) {
 	if filepath.IsAbs(rel) || strings.HasPrefix(filepath.Clean(rel), "..") {
 		return "", fmt.Errorf("unsafe path %q", rel)
 	}
 	return filepath.Join(dir, rel), nil
-}
-
-// consumerIngest is a caller-supplied target for response files.
-type consumerIngest struct {
-	base      string
-	method    string
-	keyRule   string
-	reference string // read base; empty means base
-	maxInline int64  // consumer's max inline size; 0 means unspecified
-}
-
-// ingestTarget reads the caller's ingest target from the request metadata
-// (harbor.ingest = {base, method, key, reference, maxInlineBytes}).
-func ingestTarget(ec *a2asrv.ExecutorContext) (consumerIngest, bool) {
-	v, ok := mergeMetadata(ec)["harbor.ingest"].(map[string]any)
-	if !ok {
-		return consumerIngest{}, false
-	}
-	base, _ := v["base"].(string)
-	if base == "" {
-		return consumerIngest{}, false
-	}
-	method, _ := v["method"].(string)
-	key, _ := v["key"].(string)
-	ref, _ := v["reference"].(string)
-	return consumerIngest{
-		base: base, method: method, keyRule: key, reference: ref,
-		maxInline: int64Field(v, "maxInlineBytes"),
-	}, true
-}
-
-// readBase returns the base the reference is read from.
-func (c consumerIngest) readBase() string {
-	if c.reference != "" {
-		return c.reference
-	}
-	return c.base
-}
-
-// applyKeyRule renders the object key from the consumer's rule and a content
-// hash. An empty or {sha256} rule uses the hash; any other rule is a prefix that
-// also carries the hash, so distinct files never collide.
-func applyKeyRule(rule, hash string) string {
-	switch {
-	case rule == "":
-		return hash
-	case strings.Contains(rule, "{sha256}"):
-		return strings.ReplaceAll(rule, "{sha256}", hash)
-	default:
-		return strings.Trim(rule, "/") + "/" + hash
-	}
 }
 
 // readChangedFile reads a changed file inside dir when rel is a safe relative
@@ -1430,7 +1243,7 @@ func (e *CLIExecutor) toRequest(ctx context.Context, ec *a2asrv.ExecutorContext)
 		return nil, err
 	}
 	attach := filepath.Join(dir, ".a2a", "attachments", turnDir(ec))
-	in, err := e.promptFromParts(ctx, ec.Message, attach)
+	in, err := e.promptFromParts(ec.Message, attach)
 	if err != nil {
 		return nil, err
 	}
@@ -1481,124 +1294,6 @@ func turnDir(ec *a2asrv.ExecutorContext) string {
 
 func isWaitingForInput(ec *a2asrv.ExecutorContext) bool {
 	return ec.StoredTask != nil && ec.StoredTask.Status.State == a2a.TaskStateInputRequired
-}
-
-// handleStorageRequest answers a broker request (a storage/upload-slot-request
-// DataPart) with a presigned target, without starting a CLI. It reports whether
-// the message was a storage request.
-func (e *CLIExecutor) handleStorageRequest(
-	ctx context.Context, ec *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool,
-) bool {
-	req := storageDataPart(ec.Message, kindUploadSlotRequest)
-	if req == nil {
-		return false
-	}
-	if !yield(a2a.NewSubmittedTask(ec, ec.Message), nil) {
-		return true
-	}
-	slot, err := e.reserve(ctx, req)
-	if err != nil {
-		yield(failedStatus(ec, codeUnsupportedContent, err.Error()), nil)
-		return true
-	}
-	evt := a2a.NewArtifactEvent(ec, a2a.NewDataPart(slot))
-	evt.Artifact.Name = "upload-slot"
-	if !yield(evt, nil) {
-		return true
-	}
-	yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil), nil)
-	return true
-}
-
-// reserve validates a broker request and returns the upload-slot payload.
-func (e *CLIExecutor) reserve(ctx context.Context, req map[string]any) (map[string]any, error) {
-	if e.store == nil {
-		return nil, errors.New("storage is not configured")
-	}
-	name := stringField(req, "name")
-	mediaType := mediaTypeFor(name, stringField(req, "mediaType"))
-	size := int64Field(req, "size")
-	if e.maxBytes > 0 && size > e.maxBytes {
-		return nil, fmt.Errorf("file size %d exceeds the limit %d", size, e.maxBytes)
-	}
-	if !mediaAllowed(e.mediaTypes, mediaType) {
-		return nil, fmt.Errorf("media type %q is not accepted", mediaType)
-	}
-	t, err := e.store.Reserve(ctx, name, mediaType, size)
-	if err != nil {
-		return nil, err
-	}
-	slot := map[string]any{
-		"kind":      kindUploadSlot,
-		"uploadUrl": t.URL,
-		"method":    t.Method,
-		"reference": t.Ref(),
-	}
-	if len(t.Headers) > 0 {
-		slot["headers"] = t.Headers
-	}
-	if !t.Expires.IsZero() {
-		slot["expiresAt"] = t.Expires.UTC().Format(time.RFC3339)
-	}
-	return slot, nil
-}
-
-// storageDataPart returns the DataPart value carrying the given kind, if any.
-func storageDataPart(m *a2a.Message, kind string) map[string]any {
-	if m == nil {
-		return nil
-	}
-	for _, p := range m.Parts {
-		d, ok := p.Data().(map[string]any)
-		if !ok {
-			continue
-		}
-		if k, _ := d["kind"].(string); k == kind {
-			return d
-		}
-	}
-	return nil
-}
-
-func stringField(m map[string]any, key string) string {
-	v, _ := m[key].(string)
-	return v
-}
-
-// mediaAllowed reports whether mime matches any allowlist pattern, where a
-// pattern may be an exact type, a subtype wildcard ("text/*"), or "*/*".
-func mediaAllowed(patterns []string, mime string) bool {
-	mime = strings.ToLower(strings.TrimSpace(mime))
-	if mime == "" {
-		return false
-	}
-	for _, p := range patterns {
-		p = strings.ToLower(strings.TrimSpace(p))
-		switch {
-		case p == "*/*" || p == mime:
-			return true
-		case strings.HasSuffix(p, "/*") && strings.HasPrefix(mime, strings.TrimSuffix(p, "*")):
-			return true
-		}
-	}
-	return false
-}
-
-// int64Field reads a numeric field that may decode as int, float64, or
-// json.Number.
-func int64Field(m map[string]any, key string) int64 {
-	switch v := m[key].(type) {
-	case int64:
-		return v
-	case int:
-		return int64(v)
-	case float64:
-		return int64(v)
-	case json.Number:
-		n, _ := v.Int64()
-		return n
-	}
-	return 0
 }
 
 // answerWithoutRunning reports whether a request is answered from existing
@@ -1694,8 +1389,6 @@ func codeForRequestError(err error) string {
 	switch {
 	case errors.Is(err, errNoText), errors.Is(err, errUnsupportedContent):
 		return codeUnsupportedContent
-	case errors.Is(err, errStorage):
-		return codeStorageError
 	default:
 		return codeInternal
 	}

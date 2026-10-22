@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -39,6 +40,9 @@ func TestCaptureGit(t *testing.T) {
 	}
 
 	res := changes.Capture(dir, base, 0)
+	if !res.Unified {
+		t.Fatal("git capture should be a unified diff")
+	}
 	if !strings.Contains(res.Diff, "+new") {
 		t.Fatalf("diff missing modification:\n%s", res.Diff)
 	}
@@ -55,7 +59,7 @@ func TestCaptureNonGit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	base := changes.Snapshot(dir)
+	base := changes.Snapshot(dir, "*.txt")
 
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("changed"), 0o644); err != nil {
 		t.Fatal(err)
@@ -65,11 +69,54 @@ func TestCaptureNonGit(t *testing.T) {
 	}
 
 	res := changes.Capture(dir, base, 0)
+	if res.Unified {
+		t.Fatal("non-git capture should be a summary")
+	}
 	if !strings.Contains(res.Diff, "# modified:") || !strings.Contains(res.Diff, "a.txt") {
 		t.Fatalf("summary missing modification:\n%s", res.Diff)
 	}
 	if !strings.Contains(res.Diff, "# added:") || !strings.Contains(res.Diff, "b.txt") {
 		t.Fatalf("summary missing addition:\n%s", res.Diff)
+	}
+}
+
+func TestCaptureGitRename(t *testing.T) {
+	dir := t.TempDir()
+	git(t, dir, "init")
+	if err := os.WriteFile(filepath.Join(dir, "old name.txt"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", ".")
+	git(t, dir, "commit", "-m", "init")
+
+	base := changes.Snapshot(dir)
+	git(t, dir, "mv", "old name.txt", "new name.txt")
+	res := changes.Capture(dir, base, 0)
+	if !contains(res.Files, "new name.txt") {
+		t.Fatalf("files = %v, want the rename target", res.Files)
+	}
+}
+
+func TestCaptureGitUntrackedWithNewline(t *testing.T) {
+	dir := t.TempDir()
+	git(t, dir, "init")
+	if err := os.WriteFile(filepath.Join(dir, "tracked.txt"), []byte("tracked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", ".")
+	git(t, dir, "commit", "-m", "init")
+
+	base := changes.Snapshot(dir)
+	name := "weird\nname.txt"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := changes.Capture(dir, base, 0)
+	if !contains(res.Files, name) {
+		t.Fatalf("files = %v, want %q", res.Files, name)
+	}
+	if !strings.Contains(res.Diff, strconv.Quote(name)) {
+		t.Fatalf("diff missing quoted untracked path:\n%s", res.Diff)
 	}
 }
 
@@ -108,6 +155,21 @@ func TestCaptureIgnoresHarborDirs(t *testing.T) {
 	}
 }
 
+func TestCaptureTruncatesDiff(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := changes.Snapshot(dir, "*.txt")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := changes.Capture(dir, base, 5)
+	if !res.Truncated || !strings.HasSuffix(res.Diff, "... (truncated)") {
+		t.Fatalf("truncated = %v, diff = %q", res.Truncated, res.Diff)
+	}
+}
+
 func TestCaptureNonGitIgnoresHarborDirs(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("old"), 0o644); err != nil {
@@ -120,7 +182,7 @@ func TestCaptureNonGitIgnoresHarborDirs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(uploads, "1-x.txt"), []byte("note"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	base := changes.Snapshot(dir)
+	base := changes.Snapshot(dir, "**")
 
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("changed"), 0o644); err != nil {
 		t.Fatal(err)
@@ -135,6 +197,54 @@ func TestCaptureNonGitIgnoresHarborDirs(t *testing.T) {
 	}
 	if strings.Contains(res.Diff, ".harbor") {
 		t.Fatalf("summary leaked Harbor's attachments:\n%s", res.Diff)
+	}
+}
+
+func TestCaptureNonGitDisabledByDefault(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := changes.Snapshot(dir)
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := changes.Capture(dir, base, 0)
+	if res.Diff != "" || len(res.Files) != 0 {
+		t.Fatalf("non-git capture without globs = %+v, want empty", res)
+	}
+}
+
+func TestCaptureNonGitGlobsOnlyMatching(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "a.txt"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docs", "b.md"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := changes.Snapshot(dir, "src/**")
+	if err := os.WriteFile(filepath.Join(dir, "src", "a.txt"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docs", "b.md"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "c.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := changes.Capture(dir, base, 0)
+	if !contains(res.Files, "src/a.txt") || !contains(res.Files, "src/c.txt") {
+		t.Fatalf("files = %v, want only src matches", res.Files)
+	}
+	if contains(res.Files, "docs/b.md") {
+		t.Fatalf("files = %v, want docs/b.md excluded", res.Files)
 	}
 }
 
