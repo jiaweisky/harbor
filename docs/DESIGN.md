@@ -691,16 +691,17 @@ A coding agent only makes sense inside a **real codebase**, and a CLI treats its
 
 The core output of a coding agent is **code changes**, which must be delivered as an artifact rather than only as final text.
 
-- **Baseline snapshot**: record a baseline at task start — for a git repository take `HEAD` + `git status --porcelain`; for a non-git directory record the hashes of files within `workDir`.
-- **Produce the diff**: at terminal state (or after a tool reports an edit), compute the changes: for git use `git diff <base>` (including tracked) + untracked files; for non-git compare against the baseline hashes to generate a unified diff.
+- **Baseline snapshot**: record a baseline at task start — for a git repository store `HEAD`; for a non-git directory record the hashes of `sandbox.non_git_change_globs` matches only (unset disables non-git capture).
+- **Produce the diff**: at terminal state (or after a tool reports an edit), compute the changes: for git use `git diff <base>` (including tracked) + untracked files; for non-git compare against the baseline hashes to generate an added/modified/removed summary.
 - **artifact form**:
-  - **diff artifact**: `Name="changes"`, `TextPart` (mime `text/x-diff`) or, for large changes, `FilePart` (URL, served by Harbor);
-  - **per-file artifact (already implemented, optional)**: when `sandbox.file_artifacts: true`, in addition to the diff, each changed file is emitted as its own `FilePart` (MIME determined by extension, single file ≤1MiB, images not duplicated);
-  - `Artifact.Metadata = {"agent","base","files":[...],"truncated":bool}`.
+  - **diff artifact**: `Name="changes"`, `TextPart`; git unified diffs use `text/x-diff`, non-git summaries use `text/plain`; bounded by `sandbox.diff_inline_max_bytes` (default 32 MiB);
+  - **per-file artifact (already implemented, optional)**: when `sandbox.non_image_file_artifacts: true`, in addition to the diff, each changed non-image file is emitted as its own `FilePart` (MIME determined by extension, bounded by `sandbox.artifact_inline_max_bytes`, default 256 MiB; image artifacts are always emitted). Outside git, change capture is opt-in via `sandbox.non_git_change_globs`; unset/empty disables diffs and file/image artifacts for that workdir;
+  - diff artifact metadata: `{"files":[...],"truncated":bool,"format":"unified"|"summary"}`; file/image artifacts use `{"path":...}`; an omitted artifact adds `{"omitted":true,"size":...}`.
 - **Streaming vs finalization**: by default it is delivered **once at finalization** (stable); if the CLI can report per-file edits (tool_result carrying a path), `ArtifactUpdateEvent` can be emitted incrementally per file.
 - **Boundary**: only collect changes within the resolved workdir; very long diffs are trimmed and marked `truncated`; binaries report only paths.
 - In coordination with §6.7: in `worktree` mode the diff is relative to that context's baseline.
 - **Concurrency affects diff reliability**: in `shared` mode, concurrent runs in the same directory mix in others' changes → the diff is unreliable; production should use `worktree` or lock by directory (§6.7).
+- **Planned git snapshot**: replace the HEAD-only baseline with a per-task shadow snapshot repository and baseline/current git trees, so pre-existing dirty/untracked changes are excluded and untracked content is included. See `SNAPSHOT-DESIGN.md`.
 
 ### 6.9 Request Metadata and Error-Code Contract
 
@@ -791,7 +792,7 @@ type Capabilities struct {
 
 > A2A only understands MIME and cannot express "only accepts an image **path** or raw bytes". The **form** of the input (raw / URL / local path) is supplemented through extension parameters.
 >
-> **Interaction extension URI**: `https://github.com/jiaweisky/harbor/extensions/interaction/v1` (`extensions/interaction.md` in the repo provides the JSON schema). It is declared in the Card only when `Permission==interactive || AskQuestion || PlanApproval`; clients that do not support the extension fall back to text Q&A.
+> **Interaction extension URI**: `https://github.com/jiaweisky/harbor/extensions/interaction/v1` (`docs/interaction.md` in the repo provides the JSON schema). It is declared in the Card only when `Permission==interactive || AskQuestion || PlanApproval`; clients that do not support the extension fall back to text Q&A.
 
 ### 7.4 Interaction Normalization (permission / ask question / plan)
 
@@ -824,7 +825,7 @@ The three kinds of "questions" have different semantics; they are unified into a
 | Does not support interaction | Determined by configuration policy (pre-authorize / auto-deny / bypass); **never emits** `input-required`; the Card declares unsupported. |
 | Client can only send text | The question is presented as text + an option list; structured answers are available only to clients supporting the extension. |
 
-**Already implemented**: interaction normalization is implemented on both the **ACP** and **stream-json** paths — the `input-required` message carries both a human-readable `TextPart` and a structured `DataPart` (`{kind,id,action,target,risk,options,resume}`); the answer may use an isomorphic `DataPart` (Harbor validates `id`, rejecting a mismatch) or plain text as a fallback; the Card declares the extension `https://github.com/jiaweisky/harbor/extensions/interaction/v1` (schema in `extensions/interaction.md`) when interaction capability exists.
+**Already implemented**: interaction normalization is implemented on both the **ACP** and **stream-json** paths — the `input-required` message carries both a human-readable `TextPart` and a structured `DataPart` (`{kind,id,action,target,risk,options,resume}`); the answer may use an isomorphic `DataPart` (Harbor validates `id`, rejecting a mismatch) or plain text as a fallback; the Card declares the extension `https://github.com/jiaweisky/harbor/extensions/interaction/v1` (schema in `docs/interaction.md`) when interaction capability exists.
 
 - **ACP**: `session/request_permission` → `input-required` (answered with an optionId).
 - **stream-json**: `control_request` with `request.subtype="can_use_tool"` (the actual permission/question channel in claude/codebuddy headless mode), dispatched by `tool_name`:
@@ -847,9 +848,9 @@ The three kinds of "questions" have different semantics; they are unified into a
 
 Key point: **capability validation up front** — if the media type/interaction in the request is not within the effective capabilities, immediately return with `ErrUnsupportedContentType` / a rejected state, and **do not** start the CLI and fail afterward.
 
-**Already implemented**: the Executor assembles the input by part type — each `TextPart`/`DataPart` (the latter as JSON) becomes an **independent content block** under stream-json (`EncodeStreamJSONBlocks`) and is merged into the prompt text under exec; `FilePart(raw)` is persisted to `<workDir>/.harbor/uploads/` and **attached via `agents[].file_args`** (`{{.File}}` → path; the opencode profile defaults to `-f {{.File}}`, which real-machine testing shows passes the file content to the model) — when `file_args` is unconfigured it falls back to "giving the path in the prompt"; `FilePart(URL)` directly references the URL. **Capability validation up front**: when an image MIME is not within `InputImage`, or a file is sent without `InputFile`, it returns `unsupported_content` and does not start the CLI; `InputModes()` projects `application/octet-stream` when `InputFile`.
+**Already implemented**: the Executor assembles the input by part type — each `TextPart`/`DataPart` (the latter as JSON) becomes an **independent content block** under stream-json (`EncodeStreamJSONBlocks`) and is merged into the prompt text under exec; `FilePart(raw)` is persisted to `<workDir>/.a2a/attachments/<turn>/` and **attached via `agents[].file_args`** (`{{.File}}` → path; the opencode profile defaults to `-f {{.File}}`, which real-machine testing shows passes the file content to the model) — when `file_args` is unconfigured it falls back to "giving the path in the prompt"; `FilePart(URL)` directly references the URL. **Capability validation up front** applies to raw parts: when an image MIME is not within `InputImage`, or a file is sent without `InputFile`, it returns `unsupported_content` and does not start the CLI. URL parts are passed through as text (including their metadata) without being fetched or validated. `InputModes()` projects `application/octet-stream` when `InputFile`.
 
-**Image input (already implemented, codebuddy's stream-json)**: once the profile's `InputImage` (png/jpeg/gif/webp) is declared, images in `FilePart(raw)` are **no longer persisted** but sent as a native **image content block** (base64) with the first user message over stdin, so the model sees the pixels directly; URL images are still handled by reference. Real-machine testing with codebuddy: sending a pure red PNG → answered `Red`. claude's stream-json input returns `[Unsupported Image]` for images, so `InputImage` is **not** declared for it (images fall back to persisting + path reference).
+**Image input (already implemented, codebuddy's stream-json)**: once the profile's `InputImage` (png/jpeg/gif/webp) is declared, images in `FilePart(raw)` are **no longer persisted** but sent as a native **image content block** (base64) with the first user message over stdin, so the model sees the pixels directly; URL images are passed through as text and metadata. Real-machine testing with codebuddy: sending a pure red PNG → answered `Red`. claude's stream-json input returns `[Unsupported Image]` for images, so `InputImage` is **not** declared for it (images fall back to persisting + path reference).
 
 **Image output (already implemented)**: at task end, in addition to the existing diff, `emitChanges` emits **newly added/changed image files** in the workdir (by extension png/jpg/jpeg/gif/webp, each ≤8MiB) as **raw image artifacts** (`FilePart`, with `MediaType`/`Filename`/`path` metadata) — so text-to-image results (e.g. images persisted by codebuddy `--text-to-image-model`) reach the client as images rather than merely as diff lines. `Profile.OutputImage` declares the producible image MIME, projected via `Capabilities.OutputImage` into the card's `defaultOutputModes` (already declared for codebuddy). Note: the mechanism is generic workdir monitoring and is not bound to a specific CLI.
 
@@ -1200,14 +1201,15 @@ harbor/
 │   ├── artifact/               # change capture / diff -> A2A artifact
 │   ├── sandbox/                # workdir / env / container
 │   └── store/                  # taskstore / sessionstore / live sessions
-├── extensions/
+├── docs/
+│   ├── DESIGN.md               # this document
+│   ├── SNAPSHOT-DESIGN.md      # planned git snapshot baseline
 │   └── interaction.md          # interaction extension JSON schema
 ├── examples/
 │   ├── agents.yaml
 │   └── client/                 # a2a client call examples
 ├── testdata/fake-cli/          # fake CLI scripts (deterministic tests)
-├── go.mod
-└── DESIGN.md
+└── go.mod
 ```
 
 ---
@@ -1573,8 +1575,11 @@ type SandboxConfig struct {
     StateDir       string           `yaml:"state_dir"`       // orphan process records
     Container      *ContainerConfig `yaml:"container"`       // optional strong isolation
     RequireContainerForDangerous bool `yaml:"require_container_for_dangerous"` // dangerous-mode hardening
-    FileArtifacts                 bool   `yaml:"file_artifacts"`               // per-file artifacts
-    RawStreamDir                  string `yaml:"raw_stream_dir"`               // raw stream output dir
+    NonImageFileArtifacts         bool   `yaml:"non_image_file_artifacts"`    // per-file non-image artifacts
+    ArtifactInlineMaxBytes        int64    `yaml:"artifact_inline_max_bytes"`   // max bytes inlined per artifact
+    DiffInlineMaxBytes            int64    `yaml:"diff_inline_max_bytes"`       // max diff bytes before truncation
+    NonGitChangeGlobs             []string `yaml:"non_git_change_globs"`      // opt-in non-git change patterns
+    RawStreamDir                  string `yaml:"raw_stream_dir"`              // raw stream output dir
     RawStreamCompress             bool   `yaml:"raw_stream_compress"`          // gzip raw stream files
 }
 
