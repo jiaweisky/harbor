@@ -87,15 +87,15 @@ func (l interactionLauncher) Capabilities() agent.Capabilities { return l.caps }
 // forces prompts to be surfaced; non-interactive drops them so the card does not
 // advertise the interaction extension and the executor fails if the CLI still
 // prompts.
-func applyInteractionMode(ln agent.Launcher, mode string) (agent.Launcher, error) {
+func applyInteractionMode(ln agent.Launcher, mode config.Interaction) (agent.Launcher, error) {
 	caps := ln.Capabilities()
 	switch mode {
-	case "", "auto":
+	case "", config.InteractionAuto:
 		return ln, nil
-	case "interactive":
+	case config.InteractionInteractive:
 		caps.Permission = agent.PermInteractive
 		caps.InputRequiredResume = true
-	case "non-interactive":
+	case config.InteractionNonInteractive:
 		caps.Permission = agent.PermFlagOnly
 		caps.InputRequiredResume = false
 		caps.PlanApproval = false

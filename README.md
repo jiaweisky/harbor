@@ -155,6 +155,31 @@ With `server.auth.mode: bearer`, the invocation endpoints (JSON-RPC, REST) requi
 `examples/agents.yaml` is a commented starting point; the tables below are the
 full reference. Durations use Go syntax (`30s`, `30m`, `1h`).
 
+### Environment expansion
+
+Values may reference the process environment: `$NAME`, `${NAME}`,
+`${NAME:-default}` and `${NAME:=default}`. Variable names start with a letter or
+underscore, so `$1` and `${1}` are left as-is. A bare `$` that starts a valid name
+is always a reference, so write a literal dollar as `$$` (for example `$$schema`).
+A reference must name a set variable unless it has a non-empty default;
+otherwise loading fails. A variable that is set but empty is used as-is.
+Expansion covers the whole file, comments included, so a reference written in a
+comment must resolve too (or be escaped with `$$`). Quote
+the YAML scalar holding a reference (for example `token: "${HARBOR_TOKEN}"`) so
+the substituted value cannot introduce new YAML structure. Which quote to use
+depends on the value: double quotes interpret escapes, so single-quote values
+containing backslashes (Windows paths such as `'C:\work'`) or `"`, and double an
+embedded `'` inside single quotes. An unquoted value containing `: ` or ` #` is
+rejected or truncated, and a newline in a value is folded to a space. Names are
+matched exactly, including on Windows, and `:=` behaves like `:-`: nothing is
+assigned back to the environment.
+
+A default value must be a literal; a variable inside a default
+(`${NAME:-$HOME/bin}`) is not expanded, so keep such defaults literal or resolve
+them in the surrounding environment. `${NAME:?message}` is not recognized as an
+error form: with `NAME` set it yields its value, otherwise the load fails as for
+any unset reference.
+
 ### Top level
 
 | key | type | required | default | meaning |

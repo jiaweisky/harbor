@@ -19,6 +19,151 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+func TestLoadExpandsEnvironment(t *testing.T) {
+	t.Setenv("HARBOR_TEST_DESCRIPTION", "from env")
+	t.Setenv("HARBOR_TEST_TOKEN", "s3cret")
+	t.Setenv("HARBOR_TEST_EMPTY", "")
+	t.Setenv("HARBOR_TEST_NESTED", "${HARBOR_TEST_TOKEN}")
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    display_name: "cb"
+    description: "${HARBOR_TEST_DESCRIPTION}"
+    binary: codebuddy
+    integration: stream-json
+    env:
+      TOKEN: "$HARBOR_TEST_TOKEN"
+      LOG_LEVEL: "${HARBOR_TEST_UNSET_9F3C:-info}"
+      FALLBACK: "${HARBOR_TEST_EMPTY:-fallback}"
+      SET_EMPTY: "${HARBOR_TEST_EMPTY}"
+      LITERAL: "$${HARBOR_TEST_TOKEN}"
+      DOLLAR: "$$"
+      JSON_SCHEMA: "$$schema"
+      POSITIONAL: "$1"
+      BRACED_DIGIT: "${1}"
+      NESTED: "${HARBOR_TEST_NESTED}"
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	agent := cfg.Agents[0]
+	if agent.Description != "from env" {
+		t.Errorf("description = %q, want %q", agent.Description, "from env")
+	}
+	want := map[string]string{
+		"TOKEN":        "s3cret",
+		"LOG_LEVEL":    "info",
+		"FALLBACK":     "fallback",
+		"SET_EMPTY":    "",
+		"LITERAL":      "${HARBOR_TEST_TOKEN}",
+		"DOLLAR":       "$",
+		"JSON_SCHEMA":  "$schema",
+		"POSITIONAL":   "$1",
+		"BRACED_DIGIT": "${1}",
+		"NESTED":       "${HARBOR_TEST_TOKEN}",
+	}
+	for key, value := range want {
+		if got := agent.Env[key]; got != value {
+			t.Errorf("env[%s] = %q, want %q", key, got, value)
+		}
+	}
+}
+
+func TestLoadRejectsMalformedEnvironmentReference(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    display_name: "cb"
+    description: "Test agent."
+    binary: codebuddy
+    integration: stream-json
+    env:
+      TOKEN: "${HARBOR_TEST_UNSET_9F3C"
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "config: closing brace") {
+		t.Fatalf("expected a config expansion error, got %v", err)
+	}
+}
+
+func TestLoadRejectsUnsetEnvironmentReference(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    display_name: "cb"
+    description: "Test agent."
+    binary: codebuddy
+    integration: stream-json
+    env:
+      TOKEN: "${HARBOR_TEST_UNSET_9F3C}"
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "not set") {
+		t.Fatalf("expected an unset-variable error, got %v", err)
+	}
+}
+
+func TestLoadQuotedEnvironmentValues(t *testing.T) {
+	cases := []struct {
+		name  string
+		ref   string
+		value string
+		want  string
+	}{
+		{"double quotes keep specials", `"${HARBOR_QUOTE_VALUE}"`, "a: b #c", "a: b #c"},
+		{"single quotes keep backslashes", `'${HARBOR_QUOTE_VALUE}'`, `C:\work\dir`, `C:\work\dir`},
+		{"single quotes keep double quotes", `'${HARBOR_QUOTE_VALUE}'`, `he said "hi"`, `he said "hi"`},
+		{"newline folds to space", `"${HARBOR_QUOTE_VALUE}"`, "a\nb", "a b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HARBOR_QUOTE_VALUE", tc.value)
+			path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    display_name: "cb"
+    description: `+tc.ref+`
+    binary: codebuddy
+    integration: stream-json
+`)
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := cfg.Agents[0].Description; got != tc.want {
+				t.Errorf("description = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadUnquotedEnvironmentValueNeedsQuoting(t *testing.T) {
+	t.Setenv("HARBOR_QUOTE_VALUE", "a: b")
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    display_name: "cb"
+    description: ${HARBOR_QUOTE_VALUE}
+    binary: codebuddy
+    integration: stream-json
+`)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected a YAML error for an unquoted value containing \"a: b\"")
+	}
+}
+
+func TestExampleConfigLoads(t *testing.T) {
+	if _, err := config.Load("../../examples/agents.yaml"); err != nil {
+		t.Fatalf("examples/agents.yaml: %v", err)
+	}
+}
+
 func TestAgentCardFieldsRequired(t *testing.T) {
 	displayName := writeConfig(t, `
 version: 1
@@ -167,7 +312,9 @@ agents:
 }
 
 func TestInteractionValidation(t *testing.T) {
-	for _, mode := range []string{"auto", "interactive", "non-interactive"} {
+	for _, mode := range []config.Interaction{
+		config.InteractionAuto, config.InteractionInteractive, config.InteractionNonInteractive,
+	} {
 		path := writeConfig(t, `
 version: 1
 agents:
@@ -176,7 +323,7 @@ agents:
     description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
-    interaction: `+mode+`
+    interaction: `+string(mode)+`
 `)
 		cfg, err := config.Load(path)
 		if err != nil {
@@ -200,7 +347,7 @@ agents:
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.Agents[0].Interaction != "auto" {
+	if cfg.Agents[0].Interaction != config.InteractionAuto {
 		t.Fatalf("default interaction = %q, want auto", cfg.Agents[0].Interaction)
 	}
 
@@ -640,7 +787,7 @@ agents:
 	if ct == nil {
 		t.Fatal("container config was dropped")
 	}
-	if ct.Network != "none" {
+	if ct.Network != config.NetworkNone {
 		t.Errorf("network = %q, want none", ct.Network)
 	}
 	if ct.Runtime != "docker" {

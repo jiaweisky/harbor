@@ -545,7 +545,7 @@ func TestNonInteractivePermissionFails(t *testing.T) {
 }
 
 // launcherWithInteraction builds a stream-json launcher with an interaction mode.
-func launcherWithInteraction(t *testing.T, script, mode string) agent.Launcher {
+func launcherWithInteraction(t *testing.T, script string, mode config.Interaction) agent.Launcher {
 	t.Helper()
 	ln, err := integration.New(config.AgentConfig{
 		ID: "cb", Binary: script, Integration: config.IntegrationStreamJSON, Interaction: mode,
@@ -1783,8 +1783,11 @@ func TestRequireAuthOnExposedBind(t *testing.T) {
 		wantErr       bool
 	}{
 		{"loopback no auth", "127.0.0.1:8080", "none", false, false},
+		{"loopback range no auth", "127.0.0.2:8080", "none", false, false},
 		{"localhost no auth", "localhost:8080", "none", false, false},
+		{"ipv6 loopback no auth", "[::1]:8080", "none", false, false},
 		{"exposed no auth", "0.0.0.0:8080", "none", false, true},
+		{"ipv6 exposed no auth", "[::]:8080", "none", false, true},
 		{"empty host no auth", ":8080", "none", false, true}, // empty host binds all interfaces
 		{"exposed with bearer", "0.0.0.0:8080", "bearer", false, false},
 		{"exposed but allow_insecure", "0.0.0.0:8080", "none", true, false},

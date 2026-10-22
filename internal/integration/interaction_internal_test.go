@@ -29,7 +29,7 @@ func TestApplyInteractionMode(t *testing.T) {
 	}
 
 	// auto (and unset) keep the integration default.
-	for _, mode := range []string{"", "auto"} {
+	for _, mode := range []config.Interaction{"", config.InteractionAuto} {
 		got, err := applyInteractionMode(stubLauncher{interactive}, mode)
 		if err != nil {
 			t.Fatalf("applyInteractionMode(%q): %v", mode, err)

@@ -24,18 +24,12 @@ func isLoopback(listen string) bool {
 	if err != nil {
 		host = listen
 	}
-	switch host {
-	case "127.0.0.1", "localhost", "::1":
+	if host == "localhost" {
 		return true
 	}
-	// Empty host (":8080") binds all interfaces -> treat as non-loopback.
-	if host == "" {
-		return false
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		return true
-	}
-	return false
+	// An empty host (":8080") binds all interfaces; ParseIP returns nil for it.
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // BearerMiddleware enforces "Authorization: Bearer <token>" against a token set.

@@ -9,8 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/a8m/envsubst"
 	"github.com/bmatcuk/doublestar/v4"
 	"gopkg.in/yaml.v3"
+
+	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
 // Config is the root configuration.
@@ -84,12 +87,12 @@ type AuthConfig struct {
 
 // SandboxConfig configures workspace and env constraints.
 type SandboxConfig struct {
-	Isolation     string           `yaml:"isolation"`      // shared | worktree | copy
-	IsolationRoot string           `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
-	InheritEnv    *bool            `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
-	CLIHome       string           `yaml:"cli_home"`       // optional root for the CLI's config/home
-	StateDir      string           `yaml:"state_dir"`      // runtime state (orphan tracking); default under the temp dir
-	Container     *ContainerConfig `yaml:"container"`      // optional strong isolation: run each CLI in a container
+	Isolation     workspace.Isolation `yaml:"isolation"`      // shared | worktree | copy
+	IsolationRoot string              `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
+	InheritEnv    *bool               `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
+	CLIHome       string              `yaml:"cli_home"`       // optional root for the CLI's config/home
+	StateDir      string              `yaml:"state_dir"`      // runtime state (orphan tracking); default under temp dir
+	Container     *ContainerConfig    `yaml:"container"`      // optional strong isolation: run each CLI in a container
 	// RequireContainerForDangerous refuses to start when an agent has
 	// allow_dangerous while no container sandbox is configured (optional hardening).
 	RequireContainerForDangerous bool `yaml:"require_container_for_dangerous"`
@@ -113,14 +116,22 @@ type SandboxConfig struct {
 	RawStreamCompress bool `yaml:"raw_stream_compress"`
 }
 
+// Network selects the container network mode.
+type Network string
+
+const (
+	NetworkNone   Network = "none"
+	NetworkBridge Network = "bridge"
+)
+
 // ContainerConfig runs each CLI inside a container for filesystem and network
 // isolation. The task working directory (and the CLI home, when set) are
 // bind-mounted at their host paths, so paths inside the container match the host
 // and the CLI reaches exactly the task's files.
 type ContainerConfig struct {
-	Image   string `yaml:"image"`
-	Network string `yaml:"network"` // none | bridge; default none
-	Runtime string `yaml:"runtime"` // container runtime binary; default docker
+	Image   string  `yaml:"image"`
+	Network Network `yaml:"network"` // none | bridge; default none
+	Runtime string  `yaml:"runtime"` // container runtime binary; default docker
 }
 
 // InheritEnvEnabled reports whether child processes inherit the parent
@@ -192,6 +203,16 @@ func integrationNames(vals []Integration) string {
 	return strings.Join(names, ", ")
 }
 
+// Interaction selects how the CLI's permission/plan/question prompts are
+// surfaced.
+type Interaction string
+
+const (
+	InteractionAuto           Interaction = "auto"
+	InteractionInteractive    Interaction = "interactive"
+	InteractionNonInteractive Interaction = "non-interactive"
+)
+
 // AgentConfig configures one exposed coding-agent CLI.
 type AgentConfig struct {
 	ID             string            `yaml:"id"`
@@ -237,7 +258,7 @@ type AgentConfig struct {
 	// Interaction controls whether the CLI's permission/plan/question prompts are
 	// surfaced as A2A input-required. auto (default) derives it from the
 	// integration; interactive forces it on; non-interactive turns it off.
-	Interaction string        `yaml:"interaction"`
+	Interaction Interaction   `yaml:"interaction"`
 	Session     SessionConfig `yaml:"session"`
 	Limits      LimitsConfig  `yaml:"limits"`
 }
@@ -367,9 +388,14 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	expanded, err := expandEnv(string(b))
+	// Expand environment references before decoding: $NAME, ${NAME},
+	// ${NAME:-default} and ${NAME:=default}; "$$" escapes a literal dollar.
+	// A reference must name a set variable unless it carries a non-empty
+	// default, so a missing value fails the load; a name may not start with a
+	// digit, so "$1" stays literal.
+	expanded, err := envsubst.BytesRestrictedNoDigit(b, true, false, true)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("config: %w", err)
 	}
 	var cfg Config
 	dec := yaml.NewDecoder(bytes.NewReader(expanded))
@@ -384,42 +410,6 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// expandEnv substitutes ${NAME} and ${NAME:-default} from the process
-// environment; a literal "${" is written "$${".
-func expandEnv(s string) ([]byte, error) {
-	var out bytes.Buffer
-	for i := 0; i < len(s); {
-		switch {
-		case strings.HasPrefix(s[i:], "$${"):
-			out.WriteString("${")
-			i += 3
-		case strings.HasPrefix(s[i:], "${"):
-			end := strings.IndexByte(s[i+2:], '}')
-			if end < 0 {
-				return nil, fmt.Errorf("config: unterminated ${")
-			}
-			out.WriteString(lookupEnv(s[i+2 : i+2+end]))
-			i += 2 + end + 1
-		default:
-			out.WriteByte(s[i])
-			i++
-		}
-	}
-	return out.Bytes(), nil
-}
-
-// lookupEnv resolves a ${NAME} or ${NAME:-default} expression.
-func lookupEnv(expr string) string {
-	name, def, hasDefault := strings.Cut(expr, ":-")
-	if v, ok := os.LookupEnv(name); ok {
-		return v
-	}
-	if hasDefault {
-		return def
-	}
-	return ""
-}
-
 // MustLoad is Load that panics on error.
 func MustLoad(path string) *Config {
 	cfg, err := Load(path)
@@ -430,60 +420,76 @@ func MustLoad(path string) *Config {
 }
 
 func (c *Config) applyDefaults() {
+	c.applyServerDefaults()
+	c.applyTelemetryDefaults()
+	c.applySandboxDefaults()
+	for i := range c.Agents {
+		applyAgentDefaults(&c.Agents[i])
+	}
+}
+
+func (c *Config) applyServerDefaults() {
 	if c.Server.Listen == "" {
 		c.Server.Listen = "127.0.0.1:8080"
 	}
 	if c.Server.Auth.Mode == "" {
 		c.Server.Auth.Mode = "none"
 	}
+}
+
+func (c *Config) applyTelemetryDefaults() {
 	if c.Telemetry.ServiceName == "" {
 		c.Telemetry.ServiceName = "harbor"
 	}
+}
+
+func (c *Config) applySandboxDefaults() {
 	if c.Sandbox.Isolation == "" {
-		c.Sandbox.Isolation = "shared"
+		c.Sandbox.Isolation = workspace.IsolationShared
 	}
 	if c.Sandbox.StateDir == "" {
 		c.Sandbox.StateDir = filepath.Join(os.TempDir(), "harbor")
 	}
 	if ct := c.Sandbox.Container; ct != nil {
 		if ct.Network == "" {
-			ct.Network = "none"
+			ct.Network = NetworkNone
 		}
 		if ct.Runtime == "" {
 			ct.Runtime = "docker"
 		}
 	}
-	for i := range c.Agents {
-		a := &c.Agents[i]
-		if a.Interaction == "" {
-			a.Interaction = "auto"
-		}
-		if p, ok := LookupProfile(a.Binary); ok {
-			if a.Integration == "" {
-				a.Integration = p.Integration
-			}
-			if a.Parser == "" {
-				a.Parser = p.Parser
-			}
-			if a.Integration == IntegrationACP && len(a.Args) == 0 {
-				a.Args = append([]string(nil), p.ACPArgs...)
-			}
-			if a.Session.ForkFlag == "" {
-				a.Session.ForkFlag = p.ForkFlag
-			}
-			if len(a.OutputSchemaArgs) == 0 {
-				a.OutputSchemaArgs = append([]string(nil), p.OutputSchemaArgs...)
-			}
-			if len(a.FileArgs) == 0 {
-				a.FileArgs = append([]string(nil), p.FileArgs...)
-			}
-			if len(a.ImageArgs) == 0 {
-				a.ImageArgs = append([]string(nil), p.ImageArgs...)
-			}
-			if len(a.InputImage) == 0 {
-				a.InputImage = append([]string(nil), p.InputImage...)
-			}
-		}
+}
+
+func applyAgentDefaults(a *AgentConfig) {
+	if a.Interaction == "" {
+		a.Interaction = InteractionAuto
+	}
+	p, ok := LookupProfile(a.Binary)
+	if !ok {
+		return
+	}
+	if a.Integration == "" {
+		a.Integration = p.Integration
+	}
+	if a.Parser == "" {
+		a.Parser = p.Parser
+	}
+	if a.Integration == IntegrationACP && len(a.Args) == 0 {
+		a.Args = append([]string(nil), p.ACPArgs...)
+	}
+	if a.Session.ForkFlag == "" {
+		a.Session.ForkFlag = p.ForkFlag
+	}
+	defaultStrings(&a.OutputSchemaArgs, p.OutputSchemaArgs)
+	defaultStrings(&a.FileArgs, p.FileArgs)
+	defaultStrings(&a.ImageArgs, p.ImageArgs)
+	defaultStrings(&a.InputImage, p.InputImage)
+}
+
+// defaultStrings replaces an empty dst with a copy of src.
+func defaultStrings(dst *[]string, src []string) {
+	if len(*dst) == 0 {
+		*dst = append([]string(nil), src...)
 	}
 }
 
@@ -549,8 +555,8 @@ func (c *Config) validateSandbox() error {
 		}
 	}
 	switch c.Sandbox.Isolation {
-	case "shared":
-	case "worktree", "copy":
+	case workspace.IsolationShared:
+	case workspace.IsolationWorktree, workspace.IsolationCopy:
 		if c.Sandbox.IsolationRoot == "" {
 			return fmt.Errorf("sandbox.isolation_root is required for isolation %q", c.Sandbox.Isolation)
 		}
@@ -562,7 +568,7 @@ func (c *Config) validateSandbox() error {
 			return fmt.Errorf("sandbox.container.image is required")
 		}
 		switch ct.Network {
-		case "none", "bridge":
+		case NetworkNone, NetworkBridge:
 		default:
 			return fmt.Errorf("sandbox.container.network must be one of none, bridge; got %q", ct.Network)
 		}
@@ -638,14 +644,14 @@ func validateAgent(i int, a *AgentConfig) error {
 		)
 	}
 	switch a.Interaction {
-	case "auto", "interactive", "non-interactive":
+	case InteractionAuto, InteractionInteractive, InteractionNonInteractive:
 	default:
 		return fmt.Errorf(
 			"agent %q: interaction must be one of auto, interactive, non-interactive; got %q",
 			a.ID, a.Interaction,
 		)
 	}
-	if a.Interaction == "interactive" &&
+	if a.Interaction == InteractionInteractive &&
 		a.Integration != IntegrationStreamJSON && a.Integration != IntegrationACP {
 		return fmt.Errorf(
 			"agent %q: interaction \"interactive\" requires a pausable integration (%q or %q); got %q",

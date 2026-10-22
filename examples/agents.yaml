@@ -1,5 +1,10 @@
 # Harbor agent configuration.
 # Full reference: see the "Configuration" section of README.md.
+#
+# Environment references are expanded before YAML parsing, comments included.
+# A reference must resolve unless it has a non-empty literal default, and a
+# variable inside a default is not expanded. Quote scalars that contain
+# references and single-quote Windows paths.
 version: 1
 
 server:

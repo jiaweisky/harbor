@@ -14,11 +14,13 @@ import (
 	"sync"
 )
 
-// Isolation strategies.
+// Isolation selects how per-context working directories are provisioned.
+type Isolation string
+
 const (
-	IsolationShared   = "shared"
-	IsolationWorktree = "worktree"
-	IsolationCopy     = "copy"
+	IsolationShared   Isolation = "shared"
+	IsolationWorktree Isolation = "worktree"
+	IsolationCopy     Isolation = "copy"
 )
 
 // Resolver returns the working directory for a task from the agent's configured
@@ -28,7 +30,7 @@ type Resolver struct {
 	// workdir is the configured project directory (the directory the CLI is
 	// started in). Empty means the CLI inherits Harbor's working directory.
 	workdir   string
-	isolation string
+	isolation Isolation
 	isoRoot   string
 
 	mu    sync.Mutex
@@ -43,7 +45,7 @@ func NewResolver(workdir string) *Resolver {
 
 // NewResolverWithIsolation creates a resolver with an isolation strategy.
 // worktree/copy need isolationRoot, where per-context copies are created.
-func NewResolverWithIsolation(workdir, isolation, isolationRoot string) *Resolver {
+func NewResolverWithIsolation(workdir string, isolation Isolation, isolationRoot string) *Resolver {
 	if isolation == "" {
 		isolation = IsolationShared
 	}

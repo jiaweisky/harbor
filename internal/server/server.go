@@ -62,7 +62,7 @@ func containerSpec(s config.SandboxConfig, workdir string) *agent.ContainerSpec 
 	return &agent.ContainerSpec{
 		Runtime: s.Container.Runtime,
 		Image:   s.Container.Image,
-		Network: s.Container.Network,
+		Network: string(s.Container.Network),
 		Mounts:  mounts,
 	}
 }
