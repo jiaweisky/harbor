@@ -264,10 +264,12 @@ Container settings are deployer-owned: Harbor passes `image`, `runtime`, and
 prompt-injected agent under those choices, not the deployer who wrote them. The
 runtime's default network applies unless `extra_args` overrides it. Runtime
 availability is platform-specific: `docker` runs natively on Linux and through
-Docker Desktop on macOS/Windows; `podman` natively on Linux and through `podman
-machine` on macOS/Windows; `nerdctl` requires containerd and is Linux-only. At
-startup Harbor checks the platform, probes `<runtime> info`, and fails startup
-when the binary or daemon/VM is unavailable.
+Docker Desktop on macOS; `podman` natively on Linux and through `podman machine`
+on macOS; `nerdctl` requires containerd and is Linux-only. On Windows, run
+Harbor in WSL: native Windows cannot bind-mount host paths unchanged into a
+Linux container, so startup rejects the container sandbox there. At startup
+Harbor checks the platform, probes `<runtime> info`, and fails startup when the
+binary or daemon/VM is unavailable.
 
 ### `telemetry`
 
@@ -401,6 +403,6 @@ curl -s http://127.0.0.1:8080/agents/codebuddy/.well-known/agent-card.json | jq
 - **New output format (no code change):** use `exec` with `parser: regex`.
 - **New parser or adapter (Go):** register a parser via
   `internal/parser.RegisterParser` or a full CLI adapter via
-  `integration.RegisterAdapter` (compile-time `init()`); see docs/DESIGN.md §8.
+  `cli.Register` (compile-time `init()`); see docs/DESIGN.md §8.
 - **Runtime adapter plugin:** build a Go plugin exporting `Register()` and list
   it under `plugins:` (optional, requires cgo on linux/darwin/freebsd).

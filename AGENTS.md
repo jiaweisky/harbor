@@ -34,6 +34,16 @@ Wording should make the reader **trust that the implementation is reliable**; do
 - `make build`, `make vet`, `make test` (with `-race`), `make lint`.
 - `golangci-lint` must be built by **Go ≥ the version of the module's `go` directive**; a binary of a lower version will refuse to run or crash.
 
+## Slash Commands for Code Review
+
+Project-scoped opencode commands live in `.opencode/command/<name>.md`; the filename without the extension is the command name. All review commands are read-only: they do not modify code, commit, or push.
+
+- `/review-code <file|directory|package>` — review the existing code in the given target, without reading diffs. The target is required; when omitted, the command asks for it instead of scanning the repository. Example: `/review-code internal/sandbox/sandbox.go`.
+- `/review-diff [focus]` — review the current uncommitted changes (staged, unstaged, and untracked). The optional focus narrows the review, for example `/review-diff sandbox Windows support`. Use it before landing changes; it reports whether the diff is mergeable.
+- `/review-layout <file|package>` — review declaration order, receiver-method grouping, package-level function placement, file cohesion, naming, comments, and blank-line usage. It does not review general correctness. Example: `/review-layout internal/sandbox`.
+
+Each command reports findings as P0-P3 with `file:line` references and states which checks were run. Request fixes explicitly after the review when changes are wanted.
+
 ## Git: do not commit automatically
 
 **Never commit automatically.** Run `git commit` only when the current request explicitly says to commit; otherwise leave the changes uncommitted (staged or unstaged) for review. Never `git push` unless explicitly asked.
