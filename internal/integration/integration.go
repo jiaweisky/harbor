@@ -12,40 +12,32 @@ import (
 	"strings"
 
 	"github.com/jiaweisky/harbor/internal/acp"
-	"github.com/jiaweisky/harbor/internal/adapters"
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/cli"
-	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/parser"
 	versionutil "github.com/jiaweisky/harbor/internal/version"
 )
 
 // Options controls how a launcher's processes are run.
-type Options struct {
-	// InheritEnv passes the parent environment to the CLI when true.
-	InheritEnv bool
-	// CLIHome, when set, redirects the CLI's HOME and config roots under it.
-	CLIHome string
-	// Container, when set, runs each CLI inside a container for isolation.
-	Container *agent.ContainerSpec
-	// Runtime supplies orphan tracking and raw stream logging (may be nil).
-	Runtime *agent.Runtime
-	// Ctx bounds a long-running server process (integration "server"); nil uses
-	// a background context.
-	Ctx context.Context
+type Options = cli.Options
+
+// AgentSpecSource is implemented by config.AgentConfig and core.AgentSpec.
+type AgentSpecSource interface {
+	Spec() core.AgentSpec
 }
 
 // Build probes the CLI and constructs a launcher. A missing binary yields a
 // disabled Info with no error; an unsupported version yields an error so the
 // agent is refused rather than run against an unknown binary.
-func Build(ctx context.Context, ac config.AgentConfig, opts Options) (agent.Launcher, agent.Info, error) {
+func Build(ctx context.Context, src AgentSpecSource, opts Options) (agent.Launcher, agent.Info, error) {
+	ac := src.Spec()
 	path, err := exec.LookPath(ac.Binary)
 	if err != nil {
 		return nil, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Enabled: false, Err: err}, nil
 	}
 
-	profile, known := cli.Lookup(ac.Binary)
+	profile, known := cli.LookupProfile(ac.Binary)
 	ver := ac.Version // an explicit override is kept verbatim
 	if ver == "" && known {
 		ver = agent.DetectVersion(ctx, path, profile.VersionArgs)
@@ -70,10 +62,9 @@ func Build(ctx context.Context, ac config.AgentConfig, opts Options) (agent.Laun
 	}
 	// Harbor does not gate on its own credential guess: the CLI decides whether
 	// it can run, so a CLI that starts standalone is served as-is.
-	spec := ac.Spec()
 	return ln, agent.Info{
-		Name: spec.ID, DisplayName: spec.DisplayName, Description: spec.Description,
-		Skills: infoSkills(spec), Path: path, Enabled: true, Version: ver,
+		Name: ac.ID, DisplayName: ac.DisplayName, Description: ac.Description,
+		Skills: infoSkills(ac), Path: path, Enabled: true, Version: ver,
 	}, nil
 }
 
@@ -126,22 +117,22 @@ func infoSkills(ac core.AgentSpec) []agent.Skill {
 	return out
 }
 
-// New constructs a Launcher for the given agent config and applies the
+// New constructs a Launcher for the given spec source and applies the
 // configured interaction mode to its capabilities. When the integration is
 // empty it is resolved from the CLI's known profile.
-func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
-	spec := ac.Spec()
-	ln, err := buildLauncher(spec, opts)
+func New(src AgentSpecSource, opts Options) (agent.Launcher, error) {
+	ac := src.Spec()
+	ln, err := buildLauncher(ac, opts)
 	if err != nil {
 		return nil, err
 	}
-	return applyInteractionMode(ln, spec.Interaction)
+	return applyInteractionMode(ln, ac.Interaction)
 }
 
 // buildLauncher builds the integration-specific launcher without the
 // interaction override.
 func buildLauncher(ac core.AgentSpec, opts Options) (agent.Launcher, error) {
-	profile, known := cli.Lookup(ac.Binary)
+	profile, known := cli.LookupProfile(ac.Binary)
 
 	integ := ac.Integration
 	if known {
@@ -150,7 +141,7 @@ func buildLauncher(ac core.AgentSpec, opts Options) (agent.Launcher, error) {
 			integ = profile.Integration
 		case !profile.Supports(integ):
 			return nil, fmt.Errorf("binary %q does not support integration %q (supported: %s)",
-				ac.Binary, integ, config.IntegrationNames(profile.Supported))
+				ac.Binary, integ, core.IntegrationNames(profile.Supported))
 		}
 	}
 	ac.Integration = integ // a dedicated adapter reads the resolved integration
@@ -169,12 +160,9 @@ func buildLauncher(ac core.AgentSpec, opts Options) (agent.Launcher, error) {
 
 	// A dedicated adapter registered for this CLI (see adapters.go, or any
 	// package's init) takes precedence for the integrations it handles.
-	if build, ok := LookupAdapter(filepath.Base(ac.Binary)); ok {
-		ln, err := build(ac, AdapterOptions{
-			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
-			Container: opts.Container, Runtime: opts.Runtime, Lifecycle: opts.Ctx,
-		})
-		if !errors.Is(err, ErrUnhandled) {
+	if desc, ok := cli.LookupDescriptor(filepath.Base(ac.Binary)); ok && desc.Build != nil {
+		ln, err := desc.Build(ac, opts)
+		if !errors.Is(err, cli.ErrUnhandled) {
 			return ln, err
 		}
 	}
@@ -206,9 +194,9 @@ func buildLauncher(ac core.AgentSpec, opts Options) (agent.Launcher, error) {
 		)
 	default:
 		if known {
-			return nil, fmt.Errorf("binary %q supports %s", ac.Binary, config.IntegrationNames(profile.Supported))
+			return nil, fmt.Errorf("binary %q supports %s", ac.Binary, core.IntegrationNames(profile.Supported))
 		}
-		return nil, fmt.Errorf("unknown integration %q; set one of %s", integ, config.IntegrationList())
+		return nil, fmt.Errorf("unknown integration %q; set one of %s", integ, core.IntegrationList())
 	}
 }
 
@@ -263,10 +251,7 @@ func acpLauncher(
 // CLI, or an unverifiable one for a generic CLI. The probed version lets the
 // adapter branch on version-specific behavior.
 func authenticator(ac core.AgentSpec) agent.Authenticator {
-	if a, ok := adapters.AuthFor(ac.Binary, ac.Version); ok {
-		return a
-	}
-	return adapters.Unverified()
+	return cli.AuthFor(ac.Binary, ac.Version)
 }
 
 // streamJSONCaps describes a CLI driven over its structured, duplex stream mode.

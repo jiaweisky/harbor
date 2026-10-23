@@ -51,7 +51,7 @@ func requireCodebuddy(t *testing.T) {
 func TestRealCodebuddyStreamJSON(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationStreamJSON,
 		Args: []string{
 			"-p", "--input-format", "stream-json",
 			"--output-format", "stream-json", "--include-partial-messages",
@@ -64,7 +64,7 @@ func TestRealCodebuddyStreamJSON(t *testing.T) {
 func TestRealCodebuddyResume(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationStreamJSON,
 		Args: []string{
 			"-p", "--input-format", "stream-json",
 			"--output-format", "stream-json", "--include-partial-messages",
@@ -83,7 +83,7 @@ func TestRealCodebuddyResume(t *testing.T) {
 func TestRealCodebuddyACP(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationACP,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationACP,
 		Args: []string{"--acp"},
 	})
 	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")
@@ -94,7 +94,7 @@ func TestRealCodebuddyACP(t *testing.T) {
 func TestRealCodebuddyACPResume(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationACP,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationACP,
 		Args: []string{"--acp"},
 	})
 	m1 := message("reply with the single word: alpha")
@@ -109,7 +109,7 @@ func TestRealCodebuddyACPResume(t *testing.T) {
 func TestRealCodebuddyExec(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationExec,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationExec,
 		Args: []string{"-p", "{{.Prompt}}"},
 	})
 	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")
@@ -118,7 +118,7 @@ func TestRealCodebuddyExec(t *testing.T) {
 func TestRealCodebuddyServer(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationServer,
 	})
 	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")
 }
@@ -126,8 +126,8 @@ func TestRealCodebuddyServer(t *testing.T) {
 func TestRealCodebuddyServerACP(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
-		ServerProtocol: config.ServerProtocolACP,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationServer,
+		ServerProtocol: core.ServerProtocolACP,
 	})
 	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")
 }
@@ -138,8 +138,8 @@ func TestRealCodebuddyServerACP(t *testing.T) {
 func TestRealCodebuddyACPStreamableHTTP(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
-		ServerProtocol: config.ServerProtocolACPStreamableHTTP,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationServer,
+		ServerProtocol: core.ServerProtocolACPStreamableHTTP,
 	})
 	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")
 }
@@ -167,7 +167,7 @@ func TestRealCodebuddyServerACPTool(t *testing.T) {
 func TestRealCodebuddyServerResume(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationServer,
 	})
 	m1 := message("reply with the single word: alpha")
 	m1.ContextID = "real-cb-serve-resume"
@@ -183,7 +183,7 @@ func TestRealCodebuddyServerResume(t *testing.T) {
 func TestRealCodebuddyImage(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationStreamJSON,
 		Args: []string{
 			"-p", "--input-format", "stream-json",
 			"--output-format", "stream-json", "--include-partial-messages",
@@ -224,7 +224,7 @@ func testRedPNG(t *testing.T) []byte {
 func TestRealCodebuddyStructuredOutput(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationStreamJSON,
 		Args: []string{
 			"-p", "--input-format", "stream-json",
 			"--output-format", "stream-json", "--include-partial-messages",
@@ -252,7 +252,7 @@ func TestRealCodebuddyStructuredOutput(t *testing.T) {
 func TestRealCodebuddyPermission(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationStreamJSON,
 		Args: []string{
 			"-p", "--input-format", "stream-json",
 			"--output-format", "stream-json", "--include-partial-messages",
@@ -283,7 +283,7 @@ func TestRealCodebuddyPermission(t *testing.T) {
 func TestRealCodebuddyQuestion(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationStreamJSON,
 		SDKCaps: true,
 		Args: []string{
 			"-p", "--input-format", "stream-json",
@@ -316,7 +316,7 @@ func TestRealCodebuddyQuestion(t *testing.T) {
 func TestRealCodebuddyElicitation(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationStreamJSON,
 		SDKCaps: true,
 		Args: []string{
 			"-p", "--input-format", "stream-json",
@@ -361,7 +361,7 @@ func TestRealCodebuddyElicitation(t *testing.T) {
 func TestRealCodebuddyPlanApproval(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationStreamJSON,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationStreamJSON,
 		Args: []string{
 			"-p", "--input-format", "stream-json",
 			"--output-format", "stream-json", "--include-partial-messages",
@@ -391,7 +391,7 @@ func TestRealCodebuddyPlanApproval(t *testing.T) {
 func TestRealCodebuddyServerBashTool(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationServer,
 	})
 	prompt := "Use your shell (Bash) tool to run the command `echo $((6 * 7))`, " +
 		"then reply with only the command's output."
@@ -404,7 +404,7 @@ func TestRealCodebuddyServerFileTool(t *testing.T) {
 	requireCodebuddy(t)
 	target := filepath.Join(t.TempDir(), "output.txt")
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationServer,
 	})
 	prompt := fmt.Sprintf(
 		"Use your file-writing tool to create the file %q whose exact contents are "+
@@ -427,7 +427,7 @@ func TestRealCodebuddyServerResumeToolContext(t *testing.T) {
 	requireCodebuddy(t)
 	target := filepath.Join(t.TempDir(), "counter.txt")
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationServer,
 	})
 
 	m1 := message(fmt.Sprintf(
@@ -456,7 +456,7 @@ func TestRealCodebuddyServerResumeToolContext(t *testing.T) {
 func TestRealCodebuddyServerCancel(t *testing.T) {
 	requireCodebuddy(t)
 	h := codebuddyHandler(t, config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationServer,
 	})
 	cancelRunningTask(t, h, "Use the Bash tool to run the command: sleep 90 ; then reply done.")
 }

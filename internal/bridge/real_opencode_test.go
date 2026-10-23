@@ -54,7 +54,7 @@ func TestRealOpencodeExec(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	h := opencodeHandler(t, ctx, config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationExec,
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationExec,
 		Args:    []string{"run", "{{.Prompt}}"},
 		Session: config.SessionConfig{IDFlag: "--session", ContinueFlag: "--continue"},
 	})
@@ -66,7 +66,7 @@ func TestRealOpencodeServer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	h := opencodeHandler(t, ctx, config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationServer,
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationServer,
 	})
 	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")
 }
@@ -76,7 +76,7 @@ func TestRealOpencodeACP(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	h := opencodeHandler(t, ctx, config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationACP,
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationACP,
 		Args: []string{"acp"},
 	})
 	sendAndExpect(t, h, message("reply with the single word: pong"), "pong")

@@ -13,18 +13,19 @@ import (
 )
 
 // init registers the built-in dedicated adapters. Each handles one CLI's complex
-// integrations (acp, server) and returns ErrUnhandled for the generic
-// framing (stream-json, exec) handled by New. An external CLI can add itself the
-// same way, from its own package's init, without editing this file.
+// integrations (acp, server) and returns cli.ErrUnhandled for the generic
+// framing (stream-json, exec) handled by New. External CLIs register their
+// builder with cli.AttachBuilder (known binary) or cli.Register (new binary)
+// from their own package's init, without editing this file.
 func init() {
-	RegisterAdapter("opencode", buildOpencode)
-	RegisterAdapter("codebuddy", buildCodebuddy)
-	RegisterAdapter("codex", buildCodex)
+	cli.AttachBuilder("opencode", buildOpencode)
+	cli.AttachBuilder("codebuddy", buildCodebuddy)
+	cli.AttachBuilder("codex", buildCodex)
 }
 
 // buildOpencode builds the dedicated launchers for the opencode CLI: ACP over
 // stdio and its HTTP server.
-func buildOpencode(ac core.AgentSpec, opts AdapterOptions) (agent.Launcher, error) {
+func buildOpencode(ac core.AgentSpec, opts cli.Options) (agent.Launcher, error) {
 	switch ac.Integration {
 	case core.IntegrationACP:
 		return acp.NewLauncher(acp.Config{
@@ -34,21 +35,21 @@ func buildOpencode(ac core.AgentSpec, opts AdapterOptions) (agent.Launcher, erro
 			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.Version,
 		}), nil
 	case core.IntegrationServer:
-		return opencode.NewServerLauncher(opts.Lifecycle, opencode.Config{
+		return opencode.NewServerLauncher(opts.Ctx, opencode.Config{
 			Name: ac.ID, Binary: ac.Binary, BaseURL: ac.ServerURL,
 			Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			Container: opts.Container, Runtime: opts.Runtime, Auth: authenticator(ac),
 			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.Version,
 		}), nil
 	default:
-		return nil, ErrUnhandled
+		return nil, cli.ErrUnhandled
 	}
 }
 
 // buildCodebuddy builds the dedicated launchers for the codebuddy CLI: ACP over
 // stdio, the HTTP API server, and ACP over HTTP (--serve or the standalone
 // streamable-http transport).
-func buildCodebuddy(ac core.AgentSpec, opts AdapterOptions) (agent.Launcher, error) {
+func buildCodebuddy(ac core.AgentSpec, opts cli.Options) (agent.Launcher, error) {
 	switch ac.Integration {
 	case core.IntegrationACP:
 		return acp.NewLauncher(acp.Config{
@@ -72,26 +73,26 @@ func buildCodebuddy(ac core.AgentSpec, opts AdapterOptions) (agent.Launcher, err
 				Headers: http.Header{"X-CodeBuddy-Request": {"1"}},
 				Auth:    authenticator(ac), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 				Container: opts.Container, Runtime: opts.Runtime, VersionArgs: profileVersionArgs(ac),
-				VersionOverride: ac.Version, Lifecycle: opts.Lifecycle,
+				VersionOverride: ac.Version, Lifecycle: opts.Ctx,
 			}), nil
 		}
-		return codebuddy.NewServerLauncher(opts.Lifecycle, codebuddy.Config{
+		return codebuddy.NewServerLauncher(opts.Ctx, codebuddy.Config{
 			Name: ac.ID, Binary: ac.Binary, BaseURL: ac.ServerURL,
 			Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			Container: opts.Container, Runtime: opts.Runtime, Auth: authenticator(ac),
 			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.Version,
 		}), nil
 	default:
-		return nil, ErrUnhandled
+		return nil, cli.ErrUnhandled
 	}
 }
 
 // buildCodex builds the dedicated app-server launcher for the codex CLI.
-func buildCodex(ac core.AgentSpec, opts AdapterOptions) (agent.Launcher, error) {
+func buildCodex(ac core.AgentSpec, opts cli.Options) (agent.Launcher, error) {
 	if ac.Integration != core.IntegrationServer {
-		return nil, ErrUnhandled
+		return nil, cli.ErrUnhandled
 	}
-	return codex.NewServerLauncher(opts.Lifecycle, codex.Config{
+	return codex.NewServerLauncher(opts.Ctx, codex.Config{
 		Name: ac.ID, Binary: ac.Binary,
 		Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 		Container: opts.Container, Runtime: opts.Runtime, Auth: authenticator(ac),

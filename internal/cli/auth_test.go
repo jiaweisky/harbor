@@ -1,11 +1,11 @@
-package adapters_test
+package cli_test
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/jiaweisky/harbor/internal/adapters"
+	"github.com/jiaweisky/harbor/internal/cli"
 )
 
 func TestKnownAdapters(t *testing.T) {
@@ -20,10 +20,7 @@ func TestKnownAdapters(t *testing.T) {
 		{"codex", "CODEX_API_KEY", false},
 	}
 	for _, c := range cases {
-		auth, ok := adapters.AuthFor("/usr/local/bin/"+c.binary, "1.0")
-		if !ok {
-			t.Fatalf("AuthFor(%q) not found", c.binary)
-		}
+		auth := cli.AuthFor("/usr/local/bin/"+c.binary, "1.0")
 		home := t.TempDir()
 		if !auth.LoggedIn(home, map[string]string{c.env: "x"}) {
 			t.Errorf("%s should be logged in when %s is set", c.binary, c.env)
@@ -43,7 +40,7 @@ func TestLoggedInResolvesConfigLocations(t *testing.T) {
 
 	// Default location under the home.
 	writeFile(t, filepath.Join(home, ".claude", ".credentials.json"))
-	claude, _ := adapters.AuthFor("claude", "1.0")
+	claude := cli.AuthFor("claude", "1.0")
 	if !claude.LoggedIn(home, map[string]string{}) {
 		t.Error("claude should find credentials under the home")
 	}
@@ -61,7 +58,7 @@ func TestLoggedInResolvesConfigLocations(t *testing.T) {
 
 	codexHome := t.TempDir()
 	writeFile(t, filepath.Join(codexHome, "auth.json"))
-	codex, _ := adapters.AuthFor("codex", "1.0")
+	codex := cli.AuthFor("codex", "1.0")
 	if !codex.LoggedIn(home, map[string]string{"CODEX_HOME": codexHome}) {
 		t.Error("codex should honor CODEX_HOME")
 	}
@@ -78,7 +75,7 @@ func writeFile(t *testing.T, path string) {
 }
 
 func TestStatusParsing(t *testing.T) {
-	claude, _ := adapters.AuthFor("claude", "1.0")
+	claude := cli.AuthFor("claude", "1.0")
 	if claude.StatusArgs() == nil {
 		t.Fatal("claude should have a status command")
 	}
@@ -92,7 +89,7 @@ func TestStatusParsing(t *testing.T) {
 		t.Error("claude should parse JSON surrounded by other output")
 	}
 
-	codex, _ := adapters.AuthFor("codex", "1.0")
+	codex := cli.AuthFor("codex", "1.0")
 	if !codex.LoggedInStatus("Logged in using ChatGPT", nil) {
 		t.Error("codex should report logged in on success")
 	}
@@ -109,10 +106,10 @@ type errFake struct{}
 func (errFake) Error() string { return "failed" }
 
 func TestUnknownAdapterFallsBack(t *testing.T) {
-	if _, ok := adapters.AuthFor("my-coder", "1.0"); ok {
-		t.Fatal("unknown binary should have no registered adapter")
+	if _, ok := cli.LookupDescriptor("my-coder"); ok {
+		t.Fatal("unknown binary should have no registered descriptor")
 	}
-	auth := adapters.Unverified()
+	auth := cli.Unverified()
 	if !auth.LoggedIn(t.TempDir(), map[string]string{}) {
 		t.Error("an unverifiable authenticator should not block")
 	}

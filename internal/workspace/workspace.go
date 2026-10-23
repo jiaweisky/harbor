@@ -12,34 +12,27 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/jiaweisky/harbor/internal/core"
 )
 
-// Isolation selects how per-context working directories are provisioned.
-type Isolation string
+// Isolation is an alias for the runtime isolation kind.
+type Isolation = core.Isolation
 
 const (
-	IsolationShared   Isolation = "shared"
-	IsolationWorktree Isolation = "worktree"
-	IsolationCopy     Isolation = "copy"
+	IsolationShared   = core.IsolationShared
+	IsolationWorktree = core.IsolationWorktree
+	IsolationCopy     = core.IsolationCopy
 )
 
-// CopyStrategy selects how copy isolation provisions a context directory.
-type CopyStrategy string
+// CopyStrategy is an alias for the runtime copy strategy kind.
+type CopyStrategy = core.CopyStrategy
 
 const (
-	// CopyFull copies the tree with Go's file APIs and works on every platform.
-	// Ownership, ACLs, xattrs, and mtimes are not preserved; symlinks need
-	// privileges on Windows.
-	CopyFull CopyStrategy = "full"
-	// CopyReflink clones extents where the OS and filesystem support it:
-	// FICLONE on btrfs/XFS, clonefile on APFS, ReFS block cloning on Windows.
-	CopyReflink CopyStrategy = "reflink"
-	// CopyOverlay mounts a host-side overlay or snapshot; overlayfs exists only
-	// on Linux.
-	CopyOverlay CopyStrategy = "overlay"
-	// CopyHardlink links files from the source. It requires one filesystem and
-	// is not an isolation boundary: in-place writes reach the source.
-	CopyHardlink CopyStrategy = "hardlink"
+	CopyFull     = core.CopyFull
+	CopyReflink  = core.CopyReflink
+	CopyOverlay  = core.CopyOverlay
+	CopyHardlink = core.CopyHardlink
 )
 
 // isolationStrategy describes how one isolation mode provisions a context
@@ -65,10 +58,7 @@ var copyStrategies = map[CopyStrategy]isolationStrategy{
 }
 
 // CopyStrategyKnown reports whether s is a recognized copy strategy.
-func CopyStrategyKnown(s CopyStrategy) bool {
-	_, ok := copyStrategies[s]
-	return ok
-}
+func CopyStrategyKnown(s CopyStrategy) bool { return s.Known() }
 
 // CopyStrategyImplemented reports whether this build has an implementation. It
 // does not promise the strategy is usable on the current platform or filesystem;
@@ -76,6 +66,20 @@ func CopyStrategyKnown(s CopyStrategy) bool {
 func CopyStrategyImplemented(s CopyStrategy) bool {
 	st, ok := copyStrategies[s]
 	return ok && st.provision != nil
+}
+
+// CheckCopyStrategy rejects a recognized but unimplemented copy strategy.
+func CheckCopyStrategy(isolation Isolation, strategy CopyStrategy) error {
+	if isolation != IsolationCopy {
+		return nil
+	}
+	if strategy == "" {
+		strategy = CopyFull
+	}
+	if !CopyStrategyImplemented(strategy) {
+		return fmt.Errorf("sandbox.copy_strategy %q is not implemented", strategy)
+	}
+	return nil
 }
 
 // selectStrategy resolves a configured mode to its implementation. ok is false

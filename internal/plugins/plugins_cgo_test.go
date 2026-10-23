@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jiaweisky/harbor/internal/integration"
+	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/plugins"
 )
 
@@ -23,7 +23,7 @@ func TestLoadRegistersAdapter(t *testing.T) {
 	if err := plugins.Load([]string{so}); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if _, ok := integration.LookupAdapter("plugin-cli"); !ok {
+	if _, ok := cli.LookupDescriptor("plugin-cli"); !ok {
 		t.Fatal("plugin did not register its adapter")
 	}
 }

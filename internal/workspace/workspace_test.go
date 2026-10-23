@@ -220,3 +220,18 @@ func TestUnimplementedCopyStrategyFailsResolve(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckCopyStrategy(t *testing.T) {
+	if err := workspace.CheckCopyStrategy(workspace.IsolationShared, workspace.CopyReflink); err != nil {
+		t.Errorf("non-copy isolation: %v", err)
+	}
+	if err := workspace.CheckCopyStrategy(workspace.IsolationCopy, workspace.CopyFull); err != nil {
+		t.Errorf("full copy: %v", err)
+	}
+	if err := workspace.CheckCopyStrategy(workspace.IsolationCopy, ""); err != nil {
+		t.Errorf("empty strategy defaults to full: %v", err)
+	}
+	if err := workspace.CheckCopyStrategy(workspace.IsolationCopy, workspace.CopyReflink); err == nil {
+		t.Error("unimplemented strategy must be rejected")
+	}
+}

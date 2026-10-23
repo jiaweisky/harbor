@@ -6,6 +6,7 @@ import (
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 )
 
 // stubLauncher is a Launcher that only exposes capabilities, for testing the
@@ -29,7 +30,7 @@ func TestApplyInteractionMode(t *testing.T) {
 	}
 
 	// auto (and unset) keep the integration default.
-	for _, mode := range []config.Interaction{"", config.InteractionAuto} {
+	for _, mode := range []core.Interaction{"", core.InteractionAuto} {
 		got, err := applyInteractionMode(stubLauncher{interactive}, mode)
 		if err != nil {
 			t.Fatalf("applyInteractionMode(%q): %v", mode, err)
@@ -70,7 +71,7 @@ func TestApplyInteractionMode(t *testing.T) {
 func TestNewAppliesInteractionMode(t *testing.T) {
 	ac := config.AgentConfig{
 		ID: "cb", Binary: "codebuddy",
-		Integration: config.IntegrationStreamJSON,
+		Integration: core.IntegrationStreamJSON,
 		Interaction: "non-interactive",
 	}
 	ln, err := New(ac, Options{InheritEnv: true})

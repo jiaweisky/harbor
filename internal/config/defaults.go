@@ -3,9 +3,7 @@ package config
 import (
 	"path/filepath"
 
-	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/core"
-	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
 // Core maps the configured limits to their runtime form.
@@ -55,50 +53,32 @@ func (c *Config) applyTelemetryDefaults() {
 }
 
 func (c *Config) applySandboxDefaults() {
+	c.Sandbox.IsolationRoot = absolutePath(c.Sandbox.IsolationRoot)
+	c.Sandbox.CLIHome = absolutePath(c.Sandbox.CLIHome)
 	if c.Sandbox.Isolation == "" {
-		c.Sandbox.Isolation = workspace.IsolationShared
+		c.Sandbox.Isolation = core.IsolationShared
 	}
-	if c.Sandbox.Isolation == workspace.IsolationCopy && c.Sandbox.CopyStrategy == "" {
-		c.Sandbox.CopyStrategy = workspace.CopyFull
+	if c.Sandbox.Isolation == core.IsolationCopy && c.Sandbox.CopyStrategy == "" {
+		c.Sandbox.CopyStrategy = core.CopyFull
 	}
 }
 
 func applyAgentDefaults(a *AgentConfig) {
-	// Normalize to an absolute path: container bind mounts cannot use relative
-	// paths, and change capture needs a stable directory.
-	if a.Workdir != "" {
-		if abs, err := filepath.Abs(a.Workdir); err == nil {
-			a.Workdir = abs
-		}
-	}
+	a.Workdir = absolutePath(a.Workdir)
 	if a.Interaction == "" {
-		a.Interaction = InteractionAuto
+		a.Interaction = core.InteractionAuto
 	}
-	p, ok := cli.Lookup(a.Binary)
-	if !ok {
-		return
-	}
-	if a.Integration == "" {
-		a.Integration = p.Integration
-	}
-	if a.Parser == "" {
-		a.Parser = p.Parser
-	}
-	if a.Integration == IntegrationACP && len(a.Args) == 0 {
-		a.Args = append([]string(nil), p.ACPArgs...)
-	}
-	if a.Session.ForkFlag == "" {
-		a.Session.ForkFlag = p.ForkFlag
-	}
-	defaultStrings(&a.OutputSchemaArgs, p.OutputSchemaArgs)
-	defaultStrings(&a.FileArgs, p.FileArgs)
-	defaultStrings(&a.ImageArgs, p.ImageArgs)
-	defaultStrings(&a.InputImage, p.InputImage)
 }
 
-// defaultStrings replaces an empty dst with a copy of src.
-func defaultStrings(dst *[]string, src []string) {
-	if len(*dst) == 0 {
-		*dst = append([]string(nil), src...)
+// absolutePath normalizes a non-empty path for container bind mounts, which
+// require host paths to be absolute.
+func absolutePath(path string) string {
+	if path == "" {
+		return ""
 	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
 }

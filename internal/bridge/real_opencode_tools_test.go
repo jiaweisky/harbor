@@ -14,6 +14,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
@@ -34,7 +35,7 @@ func expectText(t *testing.T, task *a2a.Task, want string) {
 
 func opencodeExecConfig() config.AgentConfig {
 	return config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationExec,
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationExec,
 		Args:    []string{"run", "{{.Prompt}}"},
 		Session: config.SessionConfig{IDFlag: "--session", ContinueFlag: "--continue"},
 	}
@@ -76,7 +77,7 @@ func TestRealOpencodeACPTool(t *testing.T) {
 	t.Cleanup(cancel)
 	dir := t.TempDir()
 	h := opencodeWorkspaceHandler(t, ctx, dir, config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationACP, Args: []string{"acp"},
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationACP, Args: []string{"acp"},
 	})
 	prompt := "Use your Bash tool to run the command `echo $((6 * 7))`, then reply with only the command's output."
 	task, _ := sendTask(t, h, message(prompt))
@@ -89,7 +90,7 @@ func TestRealOpencodeACPToolFile(t *testing.T) {
 	t.Cleanup(cancel)
 	dir := t.TempDir()
 	h := opencodeWorkspaceHandler(t, ctx, dir, config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationACP, Args: []string{"acp"},
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationACP, Args: []string{"acp"},
 	})
 	prompt := "Use your file tools to create the file acp.txt in the current working " +
 		"directory whose exact contents are ACP42. Then reply with the single word: written"
@@ -132,7 +133,7 @@ func TestRealOpencodeServerTool(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	h := opencodeHandler(t, ctx, config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationServer,
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationServer,
 	})
 	prompt := "Use your Bash tool to run the command `echo $((6 * 7))`, then reply with only the command's output."
 	task, _ := sendTask(t, h, message(prompt))
@@ -146,7 +147,7 @@ func TestRealOpencodeServerCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	h := opencodeHandler(t, ctx, config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationServer,
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationServer,
 	})
 	cancelRunningTask(t, h, "Use your Bash tool to run the command `sleep 90`, then reply done.")
 }

@@ -39,13 +39,13 @@ func scriptPath(t *testing.T, name string) string {
 }
 
 func newLauncher(
-	t *testing.T, script string, integ config.Integration, args []string, env map[string]string,
+	t *testing.T, script string, integ core.Integration, args []string, env map[string]string,
 ) agent.Launcher {
 	return newLauncherParser(t, script, integ, "", args, env)
 }
 
 func newLauncherParser(
-	t *testing.T, script string, integ config.Integration, parserName config.ParserKind,
+	t *testing.T, script string, integ core.Integration, parserName core.ParserKind,
 	args []string, env map[string]string,
 ) agent.Launcher {
 	t.Helper()
@@ -520,7 +520,7 @@ func TestNonInteractivePermissionFails(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "stdin.log")
 	ln, err := integration.New(config.AgentConfig{
 		ID: "plan", Binary: scriptPath(t, "fake-plan.sh"),
-		Integration: config.IntegrationStreamJSON, Args: []string{"-p"},
+		Integration: core.IntegrationStreamJSON, Args: []string{"-p"},
 		Interaction: "non-interactive",
 		Env:         map[string]string{"HARBOR_STDIN_LOG": logPath},
 	}, integration.Options{InheritEnv: true})
@@ -547,10 +547,10 @@ func TestNonInteractivePermissionFails(t *testing.T) {
 }
 
 // launcherWithInteraction builds a stream-json launcher with an interaction mode.
-func launcherWithInteraction(t *testing.T, script string, mode config.Interaction) agent.Launcher {
+func launcherWithInteraction(t *testing.T, script string, mode core.Interaction) agent.Launcher {
 	t.Helper()
 	ln, err := integration.New(config.AgentConfig{
-		ID: "cb", Binary: script, Integration: config.IntegrationStreamJSON, Interaction: mode,
+		ID: "cb", Binary: script, Integration: core.IntegrationStreamJSON, Interaction: mode,
 	}, integration.Options{InheritEnv: true})
 	if err != nil {
 		t.Fatalf("integration.New: %v", err)
@@ -602,7 +602,7 @@ func stdinLoggerHandler(t *testing.T, logPath string) a2asrv.RequestHandler {
 		`echo "$line" >> "$HARBOR_STDIN_LOG"` + "\n" +
 		`echo '{"type":"result","result":"ok","is_error":false}'` + "\n"
 	ln, err := integration.New(config.AgentConfig{
-		ID: "cb", Binary: fakeBin(t, "codebuddy", script), Integration: config.IntegrationStreamJSON,
+		ID: "cb", Binary: fakeBin(t, "codebuddy", script), Integration: core.IntegrationStreamJSON,
 		Args: []string{"-p"}, Env: map[string]string{"HARBOR_STDIN_LOG": logPath},
 	}, integration.Options{InheritEnv: true})
 	if err != nil {
@@ -878,7 +878,7 @@ func TestServerModeEndToEnd(t *testing.T) {
 
 	ln, err := integration.New(config.AgentConfig{
 		ID: "oc", Binary: fakeBin(t, "opencode", "#!/bin/sh\n"),
-		Integration: config.IntegrationServer, ServerURL: srv.URL,
+		Integration: core.IntegrationServer, ServerURL: srv.URL,
 	}, integration.Options{Ctx: context.Background()})
 	if err != nil {
 		t.Fatalf("integration.New: %v", err)
@@ -1310,7 +1310,7 @@ func TestSendMessage_codex(t *testing.T) {
 func TestExecImageAttachment(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "args.log")
 	ln, err := integration.New(config.AgentConfig{
-		ID: "codex", Binary: scriptPath(t, "fake-codex.sh"), Integration: config.IntegrationExec,
+		ID: "codex", Binary: scriptPath(t, "fake-codex.sh"), Integration: core.IntegrationExec,
 		Parser: "codex", Args: []string{"exec", "{{.Prompt}}"},
 		ImageArgs:  []string{"-i", "{{.Image}}"},
 		InputImage: []string{"image/png"},

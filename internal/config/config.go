@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/core"
-	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
 // Config is the root configuration.
@@ -90,13 +89,13 @@ type AuthConfig struct {
 
 // SandboxConfig configures workspace and env constraints.
 type SandboxConfig struct {
-	Isolation     workspace.Isolation    `yaml:"isolation"`      // shared | worktree | copy
-	IsolationRoot string                 `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
-	CopyStrategy  workspace.CopyStrategy `yaml:"copy_strategy"`  // copy only: full (default) is implemented
-	InheritEnv    *bool                  `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
-	CLIHome       string                 `yaml:"cli_home"`       // optional root for the CLI's config/home
-	StateDir      string                 `yaml:"state_dir"`      // required; CLI process records for orphan cleanup
-	Container     *ContainerConfig       `yaml:"container"`      // optional strong isolation: run each CLI in a container
+	Isolation     core.Isolation    `yaml:"isolation"`      // shared | worktree | copy
+	IsolationRoot string            `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
+	CopyStrategy  core.CopyStrategy `yaml:"copy_strategy"`  // copy only: full (default) is implemented
+	InheritEnv    *bool             `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
+	CLIHome       string            `yaml:"cli_home"`       // optional root for the CLI's config/home
+	StateDir      string            `yaml:"state_dir"`      // required; CLI process records for orphan cleanup
+	Container     *ContainerConfig  `yaml:"container"`      // optional strong isolation: run each CLI in a container
 	// RequireContainerForDangerous refuses to start when an agent has
 	// allow_dangerous while no container sandbox is configured (optional hardening).
 	RequireContainerForDangerous bool `yaml:"require_container_for_dangerous"`
@@ -120,15 +119,6 @@ type SandboxConfig struct {
 	RawStreamCompress bool `yaml:"raw_stream_compress"`
 }
 
-// ContainerRuntime is an alias for the runtime container kind.
-type ContainerRuntime = core.ContainerRuntime
-
-const (
-	ContainerRuntimeDocker  = core.ContainerRuntimeDocker
-	ContainerRuntimePodman  = core.ContainerRuntimePodman
-	ContainerRuntimeNerdctl = core.ContainerRuntimeNerdctl
-)
-
 // ContainerConfig runs each CLI inside a container for filesystem isolation.
 // The task working directory (and the CLI home, when set) are bind-mounted at
 // their host paths, so paths inside the container match the host and the CLI
@@ -138,9 +128,9 @@ const (
 // through and does not constrain what they allow. Isolation bounds a
 // prompt-injected agent under those choices, not the deployer who wrote them.
 type ContainerConfig struct {
-	Image     string           `yaml:"image"`
-	Runtime   ContainerRuntime `yaml:"runtime"`    // required; docker | podman | nerdctl
-	ExtraArgs []string         `yaml:"extra_args"` // passed verbatim to <runtime> run
+	Image     string                `yaml:"image"`
+	Runtime   core.ContainerRuntime `yaml:"runtime"`    // required; docker | podman | nerdctl
+	ExtraArgs []string              `yaml:"extra_args"` // passed verbatim to <runtime> run
 }
 
 // InheritEnvEnabled reports whether child processes inherit the parent
@@ -150,51 +140,20 @@ func (s SandboxConfig) InheritEnvEnabled() bool {
 	return s.InheritEnv == nil || *s.InheritEnv
 }
 
-// Integration is an alias for the runtime integration kind.
-type Integration = core.Integration
-
-const (
-	IntegrationStreamJSON = core.IntegrationStreamJSON
-	IntegrationExec       = core.IntegrationExec
-	IntegrationServer     = core.IntegrationServer
-	IntegrationACP        = core.IntegrationACP
-)
-
-// ParserKind is an alias for the exec parser kind.
-type ParserKind = core.ParserKind
-
-// ServerProtocol is an alias for the runtime server protocol.
-type ServerProtocol = core.ServerProtocol
-
-const (
-	ServerProtocolHTTP              = core.ServerProtocolHTTP
-	ServerProtocolACP               = core.ServerProtocolACP
-	ServerProtocolACPStreamableHTTP = core.ServerProtocolACPStreamableHTTP
-)
-
-// Interaction is an alias for the runtime interaction mode.
-type Interaction = core.Interaction
-
-const (
-	InteractionAuto           = core.InteractionAuto
-	InteractionInteractive    = core.InteractionInteractive
-	InteractionNonInteractive = core.InteractionNonInteractive
-)
-
 // AgentConfig configures one exposed coding-agent CLI.
 type AgentConfig struct {
-	ID             string            `yaml:"id"`
-	DisplayName    string            `yaml:"display_name"`
-	Binary         string            `yaml:"binary"`
-	Integration    Integration       `yaml:"integration"`
-	Parser         ParserKind        `yaml:"parser"`          // exec framing: text | codex | regex; default text
-	Regex          *RegexConfig      `yaml:"regex"`           // parser: regex
-	ServerURL      string            `yaml:"server_url"`      // integration: server; connect instead of spawning
-	ServerProtocol ServerProtocol    `yaml:"server_protocol"` // "http" (default) | "acp" | "acp-streamable-http"
-	Workdir        string            `yaml:"workdir"`         // required; "." means Harbor's cwd (stored absolute)
-	Args           []string          `yaml:"args"`
-	Env            map[string]string `yaml:"env"`
-	AllowDangerous bool              `yaml:"allow_dangerous"`
+	ID             string              `yaml:"id"`
+	DisplayName    string              `yaml:"display_name"`
+	Binary         string              `yaml:"binary"`
+	Integration    core.Integration    `yaml:"integration"`
+	Parser         core.ParserKind     `yaml:"parser"`          // exec framing: text | codex | regex; default text
+	Regex          *RegexConfig        `yaml:"regex"`           // parser: regex
+	ServerURL      string              `yaml:"server_url"`      // integration: server; connect instead of spawning
+	ServerProtocol core.ServerProtocol `yaml:"server_protocol"` // "http" (default) | "acp" | "acp-streamable-http"
+	Workdir        string              `yaml:"workdir"`         // required; "." means Harbor's cwd (stored absolute)
+	Args           []string            `yaml:"args"`
+	Env            map[string]string   `yaml:"env"`
+	AllowDangerous bool                `yaml:"allow_dangerous"`
 	// SDKCaps declares stream-json SDK capabilities (currently askUserQuestion)
 	// before the first prompt, so the CLI routes AskUserQuestion through
 	// can_use_tool and Harbor can surface it as an input-required question.
@@ -226,9 +185,9 @@ type AgentConfig struct {
 	// Interaction controls whether the CLI's permission/plan/question prompts are
 	// surfaced as A2A input-required. auto (default) derives it from the
 	// integration; interactive forces it on; non-interactive turns it off.
-	Interaction Interaction   `yaml:"interaction"`
-	Session     SessionConfig `yaml:"session"`
-	Limits      LimitsConfig  `yaml:"limits"`
+	Interaction core.Interaction `yaml:"interaction"`
+	Session     SessionConfig    `yaml:"session"`
+	Limits      LimitsConfig     `yaml:"limits"`
 }
 
 // RegexConfig configures the regex parser.

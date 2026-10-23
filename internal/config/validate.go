@@ -9,22 +9,8 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 
-	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/core"
-	"github.com/jiaweisky/harbor/internal/workspace"
 )
-
-// integrationList renders the known values for error messages.
-func integrationList() string { return integrationNames(core.Integrations()) }
-
-// integrationNames renders a set of integrations for error messages.
-func integrationNames(vals []Integration) string {
-	names := make([]string, 0, len(vals))
-	for _, v := range vals {
-		names = append(names, string(v))
-	}
-	return strings.Join(names, ", ")
-}
 
 // hasParentSegment reports whether p contains a ".." path segment.
 func hasParentSegment(p string) bool {
@@ -117,8 +103,8 @@ func (c *Config) validateSandbox() error {
 		}
 	}
 	switch c.Sandbox.Isolation {
-	case workspace.IsolationShared:
-	case workspace.IsolationWorktree, workspace.IsolationCopy:
+	case core.IsolationShared:
+	case core.IsolationWorktree, core.IsolationCopy:
 		if c.Sandbox.IsolationRoot == "" {
 			return fmt.Errorf("sandbox.isolation_root is required for isolation %q", c.Sandbox.Isolation)
 		}
@@ -127,18 +113,15 @@ func (c *Config) validateSandbox() error {
 	}
 	// copy isolation is self-contained, so a container mounts only the isolation
 	// root; keep the source workdir outside it or it stays visible to the agent.
-	if c.Sandbox.CopyStrategy != "" && c.Sandbox.Isolation != workspace.IsolationCopy {
+	if c.Sandbox.CopyStrategy != "" && c.Sandbox.Isolation != core.IsolationCopy {
 		return fmt.Errorf("sandbox.copy_strategy is only valid with isolation copy")
 	}
-	if c.Sandbox.Isolation == workspace.IsolationCopy {
-		if !workspace.CopyStrategyKnown(c.Sandbox.CopyStrategy) {
+	if c.Sandbox.Isolation == core.IsolationCopy {
+		if !c.Sandbox.CopyStrategy.Known() {
 			return fmt.Errorf(
 				"sandbox.copy_strategy must be one of full, reflink, overlay, hardlink; got %q",
 				c.Sandbox.CopyStrategy,
 			)
-		}
-		if !workspace.CopyStrategyImplemented(c.Sandbox.CopyStrategy) {
-			return fmt.Errorf("sandbox.copy_strategy %q is not implemented", c.Sandbox.CopyStrategy)
 		}
 		for i := range c.Agents {
 			workdir := c.Agents[i].Workdir
@@ -167,7 +150,7 @@ func (c *Config) validateSandbox() error {
 		// Value check only: platform support and daemon reachability are
 		// environment properties and are probed at startup.
 		switch ct.Runtime {
-		case ContainerRuntimeDocker, ContainerRuntimePodman, ContainerRuntimeNerdctl:
+		case core.ContainerRuntimeDocker, core.ContainerRuntimePodman, core.ContainerRuntimeNerdctl:
 		default:
 			return fmt.Errorf(
 				"sandbox.container.runtime must be one of docker, podman, nerdctl; got %q",
@@ -208,57 +191,12 @@ func validateAgent(i int, a *AgentConfig) error {
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("agent %q: workdir %q is not a directory", a.ID, a.Workdir)
 	}
-	if p, ok := cli.Lookup(a.Binary); ok {
-		if !p.Supports(a.Integration) {
-			return fmt.Errorf(
-				"agent %q: binary %q does not support integration %q (supported: %s)",
-				a.ID, filepath.Base(a.Binary), a.Integration, integrationNames(p.Supported),
-			)
-		}
-	} else if a.Integration == "" {
-		return fmt.Errorf(
-			"agent %q: unknown binary %q; set \"integration\" explicitly (known values: %s)",
-			a.ID, a.Binary, integrationList(),
-		)
-	}
-	if !a.Integration.Known() {
-		return fmt.Errorf("agent %q: unknown integration %q (known values: %s)", a.ID, a.Integration, integrationList())
-	}
-	if a.Integration == IntegrationExec && !hasPromptTemplate(a.Args) {
-		return fmt.Errorf(
-			"agent %q: integration %q passes the prompt through args but none contains {{.Prompt}}; "+
-				"add {{.Prompt}} to args, or use %q if the CLI has a structured stream",
-			a.ID, IntegrationExec, IntegrationStreamJSON,
-		)
-	}
-	if a.Integration == IntegrationACP && len(a.Args) == 0 {
-		return fmt.Errorf(
-			"agent %q: integration %q requires args selecting the CLI's ACP mode "+
-				"(for example [\"acp\"]); without them the CLI would start its interactive UI",
-			a.ID, IntegrationACP,
-		)
-	}
 	switch a.ServerProtocol {
-	case "", ServerProtocolHTTP, ServerProtocolACP, ServerProtocolACPStreamableHTTP:
+	case "", core.ServerProtocolHTTP, core.ServerProtocolACP, core.ServerProtocolACPStreamableHTTP:
 	default:
 		return fmt.Errorf(
 			"agent %q: server_protocol must be one of %q, %q, %q; got %q",
-			a.ID, ServerProtocolHTTP, ServerProtocolACP, ServerProtocolACPStreamableHTTP, a.ServerProtocol,
-		)
-	}
-	switch a.Interaction {
-	case InteractionAuto, InteractionInteractive, InteractionNonInteractive:
-	default:
-		return fmt.Errorf(
-			"agent %q: interaction must be one of auto, interactive, non-interactive; got %q",
-			a.ID, a.Interaction,
-		)
-	}
-	if a.Interaction == InteractionInteractive &&
-		a.Integration != IntegrationStreamJSON && a.Integration != IntegrationACP {
-		return fmt.Errorf(
-			"agent %q: interaction \"interactive\" requires a pausable integration (%q or %q); got %q",
-			a.ID, IntegrationStreamJSON, IntegrationACP, a.Integration,
+			a.ID, core.ServerProtocolHTTP, core.ServerProtocolACP, core.ServerProtocolACPStreamableHTTP, a.ServerProtocol,
 		)
 	}
 	for j, s := range a.Skills {
@@ -267,22 +205,6 @@ func validateAgent(i int, a *AgentConfig) error {
 		}
 	}
 	return nil
-}
-
-// IntegrationList renders every known integration value, for error messages.
-func IntegrationList() string { return integrationList() }
-
-// IntegrationNames renders a set of integrations, for error messages.
-func IntegrationNames(vals []Integration) string { return integrationNames(vals) }
-
-// hasPromptTemplate reports whether any argument carries the prompt placeholder.
-func hasPromptTemplate(args []string) bool {
-	for _, a := range args {
-		if strings.Contains(a, "{{.Prompt}}") {
-			return true
-		}
-	}
-	return false
 }
 
 // isLoopback reports whether listen addresses only the loopback interface.

@@ -9,7 +9,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Load reads and validates a config file, applying defaults.
+// Load reads and validates a config file, applying schema-level defaults.
+// CLI profile defaults and CLI-specific validation are applied separately by
+// cli.Prepare.
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {

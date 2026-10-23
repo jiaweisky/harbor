@@ -1,4 +1,4 @@
-package adapters
+package cli
 
 // codebuddy keeps its login state in the OS Keychain and has no headless login
 // command, so only environment credentials can be verified and isolated.

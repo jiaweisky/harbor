@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/integration"
 )
 
@@ -20,7 +21,7 @@ func TestBuildOpencodeDoesNotLogin(t *testing.T) {
 		t.Skip("opencode not installed")
 	}
 	ac := config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationExec,
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationExec,
 		Args: []string{"run", "{{.Prompt}}"},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

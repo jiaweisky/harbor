@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/integration"
@@ -26,12 +27,12 @@ func (stubLauncher) Start(context.Context, *agent.Request) (agent.Session, error
 // used by New instead of the built-in construction.
 func TestRegisteredAdapterIsUsed(t *testing.T) {
 	const bin = "harbor-test-weird-cli"
-	integration.RegisterAdapter(bin, func(ac core.AgentSpec, _ integration.AdapterOptions) (agent.Launcher, error) {
+	cli.Register(cli.Descriptor{Binary: bin, Build: func(ac core.AgentSpec, _ cli.Options) (agent.Launcher, error) {
 		return stubLauncher{name: ac.ID}, nil
-	})
+	}})
 
 	ln, err := integration.New(config.AgentConfig{
-		ID: "weird", Binary: bin, Integration: config.IntegrationExec,
+		ID: "weird", Binary: bin, Integration: core.IntegrationExec,
 		Args: []string{"{{.Prompt}}"},
 	}, integration.Options{})
 	if err != nil {
@@ -46,12 +47,12 @@ func TestRegisteredAdapterIsUsed(t *testing.T) {
 // (ErrUnhandled) so the built-in construction still runs.
 func TestAdapterErrUnhandledFallsThrough(t *testing.T) {
 	const bin = "harbor-test-fallthrough"
-	integration.RegisterAdapter(bin, func(core.AgentSpec, integration.AdapterOptions) (agent.Launcher, error) {
-		return nil, integration.ErrUnhandled
-	})
+	cli.Register(cli.Descriptor{Binary: bin, Build: func(core.AgentSpec, cli.Options) (agent.Launcher, error) {
+		return nil, cli.ErrUnhandled
+	}})
 
 	ln, err := integration.New(config.AgentConfig{
-		ID: "ft", Binary: bin, Integration: config.IntegrationExec,
+		ID: "ft", Binary: bin, Integration: core.IntegrationExec,
 		Args: []string{"{{.Prompt}}"},
 	}, integration.Options{})
 	if err != nil {
@@ -66,8 +67,9 @@ func TestAdapterErrUnhandledFallsThrough(t *testing.T) {
 // self-register.
 func TestBuiltinAdaptersRegistered(t *testing.T) {
 	for _, name := range []string{"opencode", "codebuddy", "codex"} {
-		if _, ok := integration.LookupAdapter(name); !ok {
-			t.Errorf("built-in adapter %q is not registered", name)
+		d, ok := cli.LookupDescriptor(name)
+		if !ok || d.Build == nil {
+			t.Errorf("built-in adapter %q has no registered builder", name)
 		}
 	}
 }

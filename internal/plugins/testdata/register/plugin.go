@@ -6,8 +6,8 @@ import (
 	"context"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/core"
-	"github.com/jiaweisky/harbor/internal/integration"
 )
 
 type stub struct{}
@@ -23,9 +23,9 @@ func (stub) Start(context.Context, *agent.Request) (agent.Session, error) {
 
 // Register is called by plugins.Load after the plugin is opened.
 func Register() {
-	integration.RegisterAdapter("plugin-cli", func(core.AgentSpec, integration.AdapterOptions) (agent.Launcher, error) {
+	cli.Register(cli.Descriptor{Binary: "plugin-cli", Build: func(core.AgentSpec, cli.Options) (agent.Launcher, error) {
 		return stub{}, nil
-	})
+	}})
 }
 
 func main() {}

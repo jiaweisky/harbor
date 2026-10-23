@@ -14,6 +14,12 @@ import (
 	"github.com/jiaweisky/harbor/internal/core"
 )
 
+// loadConfig loads a config file and applies the CLI preparation step.
+func loadConfig(t *testing.T, path string) (*config.Config, error) {
+	t.Helper()
+	return cli.Load(path)
+}
+
 // writeRawConfig writes body as-is.
 func writeRawConfig(t *testing.T, body string) string {
 	t.Helper()
@@ -72,7 +78,7 @@ agents:
       BRACED_DIGIT: "${1}"
       NESTED: "${HARBOR_TEST_NESTED}"
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -111,7 +117,7 @@ agents:
     env:
       TOKEN: "${HARBOR_TEST_UNSET_9F3C"
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "config: closing brace") {
 		t.Fatalf("expected a config expansion error, got %v", err)
 	}
@@ -129,7 +135,7 @@ agents:
     env:
       TOKEN: "${HARBOR_TEST_UNSET_9F3C}"
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "not set") {
 		t.Fatalf("expected an unset-variable error, got %v", err)
 	}
@@ -159,7 +165,7 @@ agents:
     binary: codebuddy
     integration: stream-json
 `)
-			cfg, err := config.Load(path)
+			cfg, err := loadConfig(t, path)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -181,13 +187,13 @@ agents:
     binary: codebuddy
     integration: stream-json
 `)
-	if _, err := config.Load(path); err == nil {
+	if _, err := loadConfig(t, path); err == nil {
 		t.Fatal("expected a YAML error for an unquoted value containing \"a: b\"")
 	}
 }
 
 func TestExampleConfigLoads(t *testing.T) {
-	if _, err := config.Load("../../examples/agents.yaml"); err != nil {
+	if _, err := loadConfig(t, "../../examples/agents.yaml"); err != nil {
 		t.Fatalf("examples/agents.yaml: %v", err)
 	}
 }
@@ -205,7 +211,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "listen") {
 		t.Fatalf("expected a listen error, got %v", err)
 	}
@@ -224,7 +230,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "state_dir") {
 		t.Fatalf("expected a state_dir error, got %v", err)
 	}
@@ -239,7 +245,7 @@ agents:
     integration: stream-json
     description: "Test agent."
 `)
-	_, err := config.Load(displayName)
+	_, err := loadConfig(t, displayName)
 	if err == nil || !strings.Contains(err.Error(), "display_name is required") {
 		t.Fatalf("expected a display_name error, got %v", err)
 	}
@@ -252,7 +258,7 @@ agents:
     integration: stream-json
     display_name: "CodeBuddy"
 `)
-	_, err = config.Load(description)
+	_, err = loadConfig(t, description)
 	if err == nil || !strings.Contains(err.Error(), "description is required") {
 		t.Fatalf("expected a description error, got %v", err)
 	}
@@ -269,7 +275,7 @@ agents:
     integration: exec
     args: ["-p", "--output-format", "stream-json"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "{{.Prompt}}") {
 		t.Fatalf("expected a prompt-template error, got %v", err)
 	}
@@ -286,7 +292,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	if _, err := config.Load(path); err != nil {
+	if _, err := loadConfig(t, path); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -302,7 +308,7 @@ agents:
     integration: exec
     args: ["exec", "--json", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -323,7 +329,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -344,7 +350,7 @@ agents:
     integration: server
     server_protocol: acp
 `)
-	if _, err := config.Load(valid); err != nil {
+	if _, err := loadConfig(t, valid); err != nil {
 		t.Fatalf("unexpected error for acp protocol: %v", err)
 	}
 
@@ -358,7 +364,7 @@ agents:
     integration: server
     server_protocol: acp-streamable-http
 `)
-	if _, err := config.Load(streamable); err != nil {
+	if _, err := loadConfig(t, streamable); err != nil {
 		t.Fatalf("unexpected error for acp-streamable-http protocol: %v", err)
 	}
 
@@ -372,14 +378,14 @@ agents:
     integration: server
     server_protocol: grpc
 `)
-	if _, err := config.Load(bad); err == nil || !strings.Contains(err.Error(), "server_protocol") {
+	if _, err := loadConfig(t, bad); err == nil || !strings.Contains(err.Error(), "server_protocol") {
 		t.Fatalf("expected a server_protocol error, got %v", err)
 	}
 }
 
 func TestInteractionValidation(t *testing.T) {
-	for _, mode := range []config.Interaction{
-		config.InteractionAuto, config.InteractionInteractive, config.InteractionNonInteractive,
+	for _, mode := range []core.Interaction{
+		core.InteractionAuto, core.InteractionInteractive, core.InteractionNonInteractive,
 	} {
 		path := writeConfig(t, `
 version: 1
@@ -391,7 +397,7 @@ agents:
     integration: stream-json
     interaction: `+string(mode)+`
 `)
-		cfg, err := config.Load(path)
+		cfg, err := loadConfig(t, path)
 		if err != nil {
 			t.Fatalf("interaction %q: unexpected error: %v", mode, err)
 		}
@@ -409,11 +415,11 @@ agents:
     binary: codebuddy
     integration: stream-json
 `)
-	cfg, err := config.Load(def)
+	cfg, err := loadConfig(t, def)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.Agents[0].Interaction != config.InteractionAuto {
+	if cfg.Agents[0].Interaction != core.InteractionAuto {
 		t.Fatalf("default interaction = %q, want auto", cfg.Agents[0].Interaction)
 	}
 
@@ -427,7 +433,7 @@ agents:
     integration: stream-json
     interaction: sometimes
 `)
-	if _, err := config.Load(bad); err == nil || !strings.Contains(err.Error(), "interaction") {
+	if _, err := loadConfig(t, bad); err == nil || !strings.Contains(err.Error(), "interaction") {
 		t.Fatalf("expected an interaction error, got %v", err)
 	}
 
@@ -443,7 +449,7 @@ agents:
     interaction: interactive
     args: ["run", "{{.Prompt}}"]
 `)
-	if _, err := config.Load(badCombo); err == nil || !strings.Contains(err.Error(), "pausable") {
+	if _, err := loadConfig(t, badCombo); err == nil || !strings.Contains(err.Error(), "pausable") {
 		t.Fatalf("expected a pausable-integration error, got %v", err)
 	}
 }
@@ -458,7 +464,7 @@ agents:
     binary: opencode
     integration: acp
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -477,7 +483,7 @@ agents:
     binary: codebuddy
     integration: acp
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "ACP mode") {
 		t.Fatalf("expected an ACP-args error, got %v", err)
 	}
@@ -493,7 +499,7 @@ agents:
     binary: b
     integration: bogus
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "unknown integration") {
 		t.Fatalf("expected unknown-integration error, got %v", err)
 	}
@@ -501,7 +507,7 @@ agents:
 
 func TestAtLeastOneAgentRequired(t *testing.T) {
 	path := writeConfig(t, "version: 1\nagents: []\n")
-	if _, err := config.Load(path); err == nil {
+	if _, err := loadConfig(t, path); err == nil {
 		t.Fatal("expected an error for an empty agent list")
 	}
 }
@@ -516,12 +522,12 @@ agents:
     binary: /usr/local/bin/codebuddy
     args: ["-p"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := cfg.Agents[0].Integration; got != config.IntegrationStreamJSON {
-		t.Fatalf("integration = %q, want %q", got, config.IntegrationStreamJSON)
+	if got := cfg.Agents[0].Integration; got != core.IntegrationStreamJSON {
+		t.Fatalf("integration = %q, want %q", got, core.IntegrationStreamJSON)
 	}
 }
 
@@ -536,7 +542,7 @@ agents:
     integration: exec
     args: ["{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "does not support integration") {
 		t.Fatalf("expected a profile-mismatch error, got %v", err)
 	}
@@ -551,7 +557,7 @@ agents:
     description: "Test agent for the x CLI."
     binary: my-bot
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "unknown binary") {
 		t.Fatalf("expected an unknown-binary error, got %v", err)
 	}
@@ -572,7 +578,7 @@ agents:
       timeout: 30m
       idle_timeout: 5m
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -596,7 +602,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "isolation_root") {
 		t.Fatalf("expected an isolation_root error, got %v", err)
 	}
@@ -623,7 +629,7 @@ agents:
     args: ["run", "{{.Prompt}}"]
     workdir: ` + strconv.Quote(work) + `
 `
-	_, err := config.Load(writeConfig(t, body))
+	_, err := loadConfig(t, writeConfig(t, body))
 	if err == nil || !strings.Contains(err.Error(), "must not contain") {
 		t.Fatalf("expected an isolation_root containment error, got %v", err)
 	}
@@ -633,7 +639,7 @@ agents:
 		t.Fatal(err)
 	}
 	body = strings.Replace(body, strconv.Quote(work), strconv.Quote(sibling), 1)
-	if _, err := config.Load(writeConfig(t, body)); err != nil {
+	if _, err := loadConfig(t, writeConfig(t, body)); err != nil {
 		t.Fatalf("sibling workdir: unexpected error: %v", err)
 	}
 }
@@ -669,13 +675,13 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-			cfg, err := config.Load(path)
+			cfg, err := loadConfig(t, path)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				if cfg.Sandbox.CopyStrategy != "full" {
-					t.Errorf("copy_strategy = %q, want full", cfg.Sandbox.CopyStrategy)
+				if string(cfg.Sandbox.CopyStrategy) != tc.strategy {
+					t.Errorf("copy_strategy = %q, want %q", cfg.Sandbox.CopyStrategy, tc.strategy)
 				}
 				return
 			}
@@ -720,7 +726,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-			_, err := config.Load(path)
+			_, err := loadConfig(t, path)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Load(%q,%q,%v) err=%v, wantErr=%v", tc.listen, tc.mode, tc.allowInsecure, err, tc.wantErr)
 			}
@@ -743,7 +749,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "workdir is required") {
 		t.Fatalf("expected a workdir error, got %v", err)
 	}
@@ -761,7 +767,7 @@ agents:
     args: ["run", "{{.Prompt}}"]
     workdir: "."
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -771,6 +777,43 @@ agents:
 	}
 	if got := cfg.Agents[0].Workdir; got != want {
 		t.Errorf("workdir = %q, want %q", got, want)
+	}
+}
+
+func TestSandboxPathsStoredAbsolute(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  state_dir: `+strconv.Quote(t.TempDir())+`
+  isolation_root: "relative/iso"
+  cli_home: "relative/home"
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	cfg, err := loadConfig(t, path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		got  string
+		raw  string
+	}{
+		{"isolation_root", cfg.Sandbox.IsolationRoot, "relative/iso"},
+		{"cli_home", cfg.Sandbox.CLIHome, "relative/home"},
+	} {
+		want, err := filepath.Abs(tc.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.got != want {
+			t.Errorf("%s = %q, want %q", tc.name, tc.got, want)
+		}
 	}
 }
 
@@ -788,7 +831,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "artifact_inline_max_bytes") {
 		t.Fatalf("expected an artifact_inline_max_bytes error, got %v", err)
 	}
@@ -810,7 +853,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -839,7 +882,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "diff_inline_max_bytes") {
 		t.Fatalf("expected a diff_inline_max_bytes error, got %v", err)
 	}
@@ -859,7 +902,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -883,7 +926,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-		if _, err := config.Load(path); err == nil || !strings.Contains(err.Error(), "non_git_change_globs") {
+		if _, err := loadConfig(t, path); err == nil || !strings.Contains(err.Error(), "non_git_change_globs") {
 			t.Fatalf("glob %q: expected a validation error, got %v", glob, err)
 		}
 	}
@@ -903,7 +946,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "store") {
 		t.Fatalf("expected a store error, got %v", err)
 	}
@@ -923,7 +966,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "store_path") {
 		t.Fatalf("expected a path error, got %v", err)
 	}
@@ -943,7 +986,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -964,7 +1007,7 @@ agents:
     args: ["run", "{{.Prompt}}"]
     workdir: /no/such/harbor-dir-xyz
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "workdir") {
 		t.Fatalf("expected a workdir error, got %v", err)
 	}
@@ -981,7 +1024,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1004,7 +1047,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1028,7 +1071,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "sandbox.container.runtime is required") {
 		t.Fatalf("expected a runtime error, got %v", err)
 	}
@@ -1060,7 +1103,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-		cfg, err := config.Load(path)
+		cfg, err := loadConfig(t, path)
 		if (err != nil) != tc.wantErr {
 			t.Errorf("runtime %q: err = %v, wantErr %v", tc.runtime, err, tc.wantErr)
 			continue
@@ -1088,12 +1131,12 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	ct := cfg.Sandbox.Container
-	if ct.Runtime != config.ContainerRuntimePodman {
+	if ct.Runtime != core.ContainerRuntimePodman {
 		t.Errorf("runtime = %q, want podman", ct.Runtime)
 	}
 	want := []string{"--network=none", "--read-only", "--pids-limit=512"}
@@ -1117,7 +1160,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "sandbox.container.image is required") {
 		t.Fatalf("expected a container image error, got %v", err)
 	}
@@ -1134,7 +1177,7 @@ agents:
     integration: exec
     args: ["exec", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1168,7 +1211,7 @@ agents:
     integration: stream-json
     allow_dangerous: true
 `)
-	if _, err := config.Load(bad); err == nil || !strings.Contains(err.Error(), "require_container_for_dangerous") {
+	if _, err := loadConfig(t, bad); err == nil || !strings.Contains(err.Error(), "require_container_for_dangerous") {
 		t.Fatalf("expected a container-required error, got %v", err)
 	}
 
@@ -1186,7 +1229,7 @@ agents:
     integration: stream-json
     allow_dangerous: true
 `)
-	if _, err := config.Load(good); err != nil {
+	if _, err := loadConfig(t, good); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -1202,7 +1245,7 @@ agents:
     integration: stream-json
     args: ["-p"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1228,7 +1271,7 @@ agents:
         tags: ["review", "quality"]
         examples: ["review this diff"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1254,7 +1297,7 @@ agents:
     skills:
       - id: only-id
 `)
-	_, err := config.Load(path)
+	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "requires id, name, and description") {
 		t.Fatalf("expected a skills validation error, got %v", err)
 	}
@@ -1274,7 +1317,7 @@ agents:
     integration: exec
     args: ["run", "{{.Prompt}}"]
 `)
-	cfg, err := config.Load(path)
+	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1289,13 +1332,13 @@ agents:
 func TestAgentSpecMapping(t *testing.T) {
 	ac := config.AgentConfig{
 		ID: "a", DisplayName: "A", Description: "d", Binary: "b",
-		Integration: config.IntegrationExec, Parser: "codex",
+		Integration: core.IntegrationExec, Parser: "codex",
 		Regex:     &config.RegexConfig{Text: "^x$"},
-		ServerURL: "http://x", ServerProtocol: config.ServerProtocolACP,
+		ServerURL: "http://x", ServerProtocol: core.ServerProtocolACP,
 		Args: []string{"a"}, Env: map[string]string{"K": "V"},
 		AllowDangerous: true, SDKCaps: true,
 		OutputSchemaArgs: []string{"o"}, FileArgs: []string{"f"}, ImageArgs: []string{"i"},
-		InputImage: []string{"image/png"}, Interaction: config.InteractionInteractive,
+		InputImage: []string{"image/png"}, Interaction: core.InteractionInteractive,
 		Session: config.SessionConfig{IDFlag: "--id", ResumeFlag: "--r", ContinueFlag: "--c", ForkFlag: "--f"},
 		Limits: config.LimitsConfig{
 			MaxConcurrent: 2, Timeout: time.Minute, IdleTimeout: time.Second, MaxTurns: 3,

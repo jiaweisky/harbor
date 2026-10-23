@@ -3,7 +3,10 @@
 // configuration loader and the execution layers can use it.
 package core
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Limits bounds the execution of one agent's tasks.
 type Limits struct {
@@ -56,6 +59,18 @@ func (i Integration) Known() bool {
 func Integrations() []Integration {
 	return []Integration{IntegrationStreamJSON, IntegrationExec, IntegrationServer, IntegrationACP}
 }
+
+// IntegrationNames renders a set of integrations for error messages.
+func IntegrationNames(vals []Integration) string {
+	names := make([]string, 0, len(vals))
+	for _, v := range vals {
+		names = append(names, string(v))
+	}
+	return strings.Join(names, ", ")
+}
+
+// IntegrationList renders every known integration value, for error messages.
+func IntegrationList() string { return IntegrationNames(Integrations()) }
 
 // ContainerRuntime is a container runtime with a Docker-compatible CLI.
 type ContainerRuntime string
@@ -127,4 +142,35 @@ type AgentSpec struct {
 	Limits                               Limits
 	Skills                               []Skill
 	Version                              string
+}
+
+// Spec returns the receiver.
+func (a AgentSpec) Spec() AgentSpec { return a }
+
+// Isolation selects how per-context working directories are provisioned.
+type Isolation string
+
+const (
+	IsolationShared   Isolation = "shared"
+	IsolationWorktree Isolation = "worktree"
+	IsolationCopy     Isolation = "copy"
+)
+
+// CopyStrategy selects how copy isolation provisions a context directory.
+type CopyStrategy string
+
+const (
+	CopyFull     CopyStrategy = "full"
+	CopyReflink  CopyStrategy = "reflink"
+	CopyOverlay  CopyStrategy = "overlay"
+	CopyHardlink CopyStrategy = "hardlink"
+)
+
+// Known reports whether the copy strategy is a recognized value.
+func (s CopyStrategy) Known() bool {
+	switch s {
+	case CopyFull, CopyReflink, CopyOverlay, CopyHardlink:
+		return true
+	}
+	return false
 }

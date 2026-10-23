@@ -1,4 +1,4 @@
-package adapters
+package cli
 
 // opencode resolves providers from its own configuration (opencode.json) and
 // the environment, so it is usable without a stored ticket and readiness must

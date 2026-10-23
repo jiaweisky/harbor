@@ -6,6 +6,7 @@ import (
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/integration"
 )
 
@@ -14,7 +15,7 @@ func newAdapter(ac config.AgentConfig) (agent.Launcher, error) {
 }
 
 func TestServerModeRejectsOtherBinary(t *testing.T) {
-	_, err := newAdapter(config.AgentConfig{ID: "x", Binary: "sh", Integration: config.IntegrationServer})
+	_, err := newAdapter(config.AgentConfig{ID: "x", Binary: "sh", Integration: core.IntegrationServer})
 	if err == nil || !strings.Contains(err.Error(), `got "sh"`) {
 		t.Fatalf("expected an unsupported-binary error, got %v", err)
 	}
@@ -22,7 +23,7 @@ func TestServerModeRejectsOtherBinary(t *testing.T) {
 
 func TestNewServerCodebuddy(t *testing.T) {
 	ln, err := newAdapter(config.AgentConfig{
-		ID: "cb", Binary: "codebuddy", Integration: config.IntegrationServer,
+		ID: "cb", Binary: "codebuddy", Integration: core.IntegrationServer,
 		ServerURL: "http://127.0.0.1:1",
 	})
 	if err != nil {
@@ -35,7 +36,7 @@ func TestNewServerCodebuddy(t *testing.T) {
 
 func TestNewServerCodex(t *testing.T) {
 	ln, err := newAdapter(config.AgentConfig{
-		ID: "cx", Binary: "codex", Integration: config.IntegrationServer,
+		ID: "cx", Binary: "codex", Integration: core.IntegrationServer,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -47,7 +48,7 @@ func TestNewServerCodex(t *testing.T) {
 
 func TestNewServerOpencode(t *testing.T) {
 	ln, err := newAdapter(config.AgentConfig{
-		ID: "oc", Binary: "opencode", Integration: config.IntegrationServer,
+		ID: "oc", Binary: "opencode", Integration: core.IntegrationServer,
 		ServerURL: "http://127.0.0.1:1",
 	})
 	if err != nil {
@@ -60,7 +61,7 @@ func TestNewServerOpencode(t *testing.T) {
 
 func TestNewACP(t *testing.T) {
 	ln, err := newAdapter(config.AgentConfig{
-		ID: "oc", Binary: "sh", Integration: config.IntegrationACP, Args: []string{"acp"},
+		ID: "oc", Binary: "sh", Integration: core.IntegrationACP, Args: []string{"acp"},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -79,7 +80,7 @@ func TestNewUnknownIntegration(t *testing.T) {
 }
 
 func TestNewRejectsIntegrationUnsupportedByBinary(t *testing.T) {
-	ac := config.AgentConfig{ID: "c", Binary: "claude", Integration: config.IntegrationExec}
+	ac := config.AgentConfig{ID: "c", Binary: "claude", Integration: core.IntegrationExec}
 	if _, err := newAdapter(ac); err == nil || !strings.Contains(err.Error(), "does not support integration") {
 		t.Fatalf("expected profile mismatch error, got %v", err)
 	}

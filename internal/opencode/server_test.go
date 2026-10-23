@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiaweisky/harbor/internal/adapters"
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/opencode"
 )
 
@@ -54,7 +54,7 @@ func TestServerLauncherTurn(t *testing.T) {
 	defer srv.Close()
 
 	ln := opencode.NewServerLauncher(context.Background(), opencode.Config{
-		Name: "oc", Binary: "opencode", BaseURL: srv.URL, Auth: adapters.Unverified(),
+		Name: "oc", Binary: "opencode", BaseURL: srv.URL, Auth: cli.Unverified(),
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -119,7 +119,7 @@ func TestServerLauncherStreamsDeltas(t *testing.T) {
 	defer srv.Close()
 
 	ln := opencode.NewServerLauncher(context.Background(), opencode.Config{
-		Name: "oc", Binary: "opencode", BaseURL: srv.URL, Auth: adapters.Unverified(),
+		Name: "oc", Binary: "opencode", BaseURL: srv.URL, Auth: cli.Unverified(),
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -144,7 +144,7 @@ func TestServerLauncherError(t *testing.T) {
 	defer srv.Close()
 
 	ln := opencode.NewServerLauncher(context.Background(), opencode.Config{
-		Name: "oc", Binary: "opencode", BaseURL: srv.URL, Auth: adapters.Unverified(),
+		Name: "oc", Binary: "opencode", BaseURL: srv.URL, Auth: cli.Unverified(),
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

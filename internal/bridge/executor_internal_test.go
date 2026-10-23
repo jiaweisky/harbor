@@ -26,7 +26,7 @@ func TestResumeFreshInjectsAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	ln, err := integration.New(config.AgentConfig{
-		ID: "rec", Binary: script, Integration: config.IntegrationStreamJSON,
+		ID: "rec", Binary: script, Integration: core.IntegrationStreamJSON,
 		Args:    []string{"-p"},
 		Session: config.SessionConfig{ResumeFlag: "--resume"},
 	}, integration.Options{InheritEnv: true})

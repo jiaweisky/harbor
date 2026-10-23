@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiaweisky/harbor/internal/adapters"
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/codex"
 )
 
@@ -43,7 +43,7 @@ func TestAppServerTurn(t *testing.T) {
 	defer cancel()
 
 	ln := codex.NewServerLauncher(ctx, codex.Config{
-		Name: "cx", Binary: writeFake(t), Auth: adapters.Unverified(),
+		Name: "cx", Binary: writeFake(t), Auth: cli.Unverified(),
 	})
 	sess, err := ln.Start(ctx, &agent.Request{Prompt: "hi"})
 	if err != nil {
