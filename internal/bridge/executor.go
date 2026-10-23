@@ -2,19 +2,12 @@ package bridge
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"iter"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -26,7 +19,6 @@ import (
 	"github.com/jiaweisky/harbor/internal/changes"
 	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/telemetry"
-	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
 // error codes written to TaskStatus.Message.Metadata["harbor.errorCode"].
@@ -60,12 +52,24 @@ type SessionStore interface {
 	Bind(contextID, sessionID string)
 }
 
+// Workspace resolves the working directory for a task and serializes access to
+// it. The workspace package implements it; tests may pass nil for the default.
+type Workspace interface {
+	Resolve(contextID string) (string, error)
+	Lock(dir string) func()
+}
+
+type nopWorkspace struct{}
+
+func (nopWorkspace) Resolve(string) (string, error) { return "", nil }
+func (nopWorkspace) Lock(string) func()             { return func() {} }
+
 // CLIExecutor turns a coding-agent CLI session into A2A task events.
 type CLIExecutor struct {
 	launcher               agent.Launcher
 	sessions               SessionStore
 	live                   *agent.LiveSessions
-	workspace              *workspace.Resolver
+	workspace              Workspace
 	timeout                time.Duration // total task timeout; 0 disables
 	idleTimeout            time.Duration // fail a task with no output for this long; 0 disables
 	keepalive              time.Duration // emit a keepalive when quiet for this long; 0 disables
@@ -81,169 +85,15 @@ type CLIExecutor struct {
 	metrics                *agentMetrics
 }
 
-// idemCache is a bounded messageId -> taskID map used to make repeated sends
-// idempotent (the same message must not start a second execution).
-type idemCache struct {
-	mu    sync.Mutex
-	m     map[string]a2a.TaskID
-	order []string
-	max   int
-}
-
-func newIdemCache(max int) *idemCache {
-	return &idemCache{m: map[string]a2a.TaskID{}, max: max}
-}
-
-// getOrPut returns the existing task id for key, or records id and reports that
-// it was absent. It is atomic, so two concurrent duplicates cannot both start a
-// new execution.
-func (c *idemCache) getOrPut(key string, id a2a.TaskID) (a2a.TaskID, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if v, ok := c.m[key]; ok {
-		return v, true
-	}
-	c.storeLocked(key, id)
-	return id, false
-}
-
-// set re-points a key to a new task id.
-func (c *idemCache) set(key string, id a2a.TaskID) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.storeLocked(key, id)
-}
-
-// storeLocked records id for key, evicting the oldest entry when at capacity. It
-// must be called with the lock held.
-func (c *idemCache) storeLocked(key string, id a2a.TaskID) {
-	if _, ok := c.m[key]; !ok {
-		if len(c.order) >= c.max {
-			delete(c.m, c.order[0])
-			c.order = c.order[1:]
-		}
-		c.order = append(c.order, key)
-	}
-	c.m[key] = id
-}
-
-// structuredState tracks a task whose request asked for structured output, so
-// the executor can fall back to parsing the final text when the CLI has no
-// explicit structured-output event (exec CLIs). It is touched only by the task's
-// own goroutine.
-type structuredState struct{ emitted bool }
-
-// taskState is the transient state of one task execution. A single entry in
-// CLIExecutor.tasks owns everything a task holds while it runs: its process
-// lifetime (ctx/cancel), the workdir lock, the change baseline, the turn count,
-// the structured-output flag, and any pending interaction or paused-task reaper.
-// forget releases the entry and everything in it together.
-type taskState struct {
-	// ctx is detached from the RPC context so a task paused on input-required
-	// keeps its process alive after the request returns; it is canceled on a
-	// terminal state, Cancel, or the configured task timeout.
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started time.Time
-
-	turns atomic.Int64
-
-	// mu guards the fields below, which are touched from more than one
-	// goroutine (the task's own goroutine, Cancel, and the paused-task reaper).
-	mu          sync.Mutex
-	lock        func()
-	baseline    *changes.Baseline
-	structured  *structuredState
-	interaction *agent.Interaction
-	reap        context.CancelFunc
-}
-
-func (s *taskState) setStructured(st *structuredState) {
-	s.mu.Lock()
-	s.structured = st
-	s.mu.Unlock()
-}
-
-func (s *taskState) structuredState() *structuredState {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.structured
-}
-
-func (s *taskState) setBaseline(b changes.Baseline) {
-	s.mu.Lock()
-	s.baseline = &b
-	s.mu.Unlock()
-}
-
-// takeBaseline returns the change baseline once, then clears it so a second
-// call does not re-emit the same changes.
-func (s *taskState) takeBaseline() (changes.Baseline, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.baseline == nil {
-		return changes.Baseline{}, false
-	}
-	b := *s.baseline
-	s.baseline = nil
-	return b, true
-}
-
-func (s *taskState) setLock(release func()) {
-	if release == nil {
-		return
-	}
-	s.mu.Lock()
-	s.lock = release
-	s.mu.Unlock()
-}
-
-func (s *taskState) takeLock() func() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	f := s.lock
-	s.lock = nil
-	return f
-}
-
-func (s *taskState) setInteraction(it *agent.Interaction) {
-	s.mu.Lock()
-	s.interaction = it
-	s.mu.Unlock()
-}
-
-func (s *taskState) takeInteraction() {
-	s.mu.Lock()
-	s.interaction = nil
-	s.mu.Unlock()
-}
-
-func (s *taskState) pendingInteraction() *agent.Interaction {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.interaction
-}
-
-func (s *taskState) setReap(cancel context.CancelFunc) {
-	s.mu.Lock()
-	s.reap = cancel
-	s.mu.Unlock()
-}
-
-func (s *taskState) takeReap() context.CancelFunc {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c := s.reap
-	s.reap = nil
-	return c
-}
-
 // NewCLIExecutor creates an executor over the given launcher. limits bounds the
 // task duration and the failure circuit breaker.
 func NewCLIExecutor(
 	ln agent.Launcher, sessions SessionStore, live *agent.LiveSessions,
-	ws *workspace.Resolver, limits core.Limits,
+	ws Workspace, limits core.Limits,
 ) *CLIExecutor {
+	if ws == nil {
+		ws = nopWorkspace{}
+	}
 	return &CLIExecutor{
 		launcher:    ln,
 		sessions:    sessions,
@@ -478,204 +328,6 @@ func (e *CLIExecutor) loadState(taskID string) *taskState {
 		return v.(*taskState)
 	}
 	return nil
-}
-
-// resume answers a task paused on input-required by writing to its live session.
-func (e *CLIExecutor) resume(
-	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string,
-	yield func(a2a.Event, error) bool,
-) {
-	st := e.loadState(taskID)
-	if st != nil {
-		e.disarmPauseReaper(st)
-		if e.takeTurn(st) {
-			e.stopPausedTask(taskID)
-			yield(failedStatus(ec, codeMaxTurns, "max turns exceeded"), nil)
-			return
-		}
-		if err := st.ctx.Err(); err != nil {
-			// The process already ended (typically the task timed out while paused).
-			e.cleanup(taskID, true)
-			yield(failedStatus(ec, codeForRunError(err), err.Error()), nil)
-			return
-		}
-	}
-	sess, ok := e.live.Get(taskID)
-	if st == nil || !ok {
-		// No live process (for example after a restart): drop any stale state
-		// and resume the CLI's recorded session instead.
-		e.forget(taskID)
-		e.resumeFresh(ctx, ec, taskID, yield)
-		return
-	}
-	in, err := e.answerFromMessage(ec, taskID, ec.Message)
-	if err != nil {
-		// A bad client reply is not an agent failure; tear the process down
-		// without penalizing the breaker.
-		e.teardown(taskID, sess)
-		yield(failedStatus(ec, codeInternal, err.Error()), nil)
-		return
-	}
-	st.takeInteraction()
-	if err := sess.Send(st.ctx, in); err != nil {
-		e.cleanup(taskID, true)
-		yield(failedStatus(ec, codeInternal, err.Error()), nil)
-		return
-	}
-	if !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
-		e.teardown(taskID, sess)
-		return
-	}
-	e.watchExecution(ctx, taskID)
-	e.pump(st, ec, taskID, sess, yield)
-}
-
-// stopPausedTask tears down a paused task's live process, or releases its state
-// when no live process remains.
-func (e *CLIExecutor) stopPausedTask(taskID string) {
-	if sess, ok := e.live.Get(taskID); ok {
-		e.teardown(taskID, sess)
-		return
-	}
-	e.cleanup(taskID, false)
-}
-
-// resumeFresh recovers a task paused on input-required whose live process is gone
-// (for example after a Harbor restart): it resumes the CLI's recorded session and
-// injects the client's answer as the next prompt. The injection is best-effort
-// (the CLI restarts and may replay context) and requires a recorded session id
-// and a resume-capable CLI.
-func (e *CLIExecutor) resumeFresh(
-	ctx context.Context, ec *a2asrv.ExecutorContext, taskID string, yield func(a2a.Event, error) bool,
-) {
-	sid := e.sessionFromTask(ec)
-	if sid == "" || !e.launcher.Capabilities().SessionResume {
-		e.forget(taskID)
-		yield(failedStatus(ec, codeInternal, "session lost"), nil)
-		return
-	}
-	in, err := e.answerFromMessage(ec, taskID, ec.Message)
-	if err != nil || strings.TrimSpace(in.Answer) == "" {
-		e.forget(taskID)
-		yield(failedStatus(ec, codeInternal, "session lost"), nil)
-		return
-	}
-	dir, err := e.workspace.Resolve(contextKey(ec))
-	if err != nil {
-		e.forget(taskID)
-		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
-		return
-	}
-	st := e.startTask(ctx, taskID)
-	e.launchAndPump(ctx, st, ec, taskID,
-		&agent.Request{Prompt: in.Answer, SessionID: sid, WorkDir: dir}, true, yield)
-}
-
-// sessionFromTask returns the CLI session id recorded with a paused task.
-func (e *CLIExecutor) sessionFromTask(ec *a2asrv.ExecutorContext) string {
-	if ec.StoredTask == nil || ec.StoredTask.Status.Message == nil {
-		return ""
-	}
-	return metaString(ec.StoredTask.Status.Message.Metadata, metaKeySessionID)
-}
-
-// teardown stops a task's process and releases its per-task state after the
-// consumer goes away.
-func (e *CLIExecutor) teardown(taskID string, sess agent.Session) {
-	_ = sess.Cancel()
-	e.cleanup(taskID, false)
-}
-
-// watchExecution stops the task's CLI when the server aborts the execution with
-// the agent inactivity timeout. A normal return (the request completed, e.g. a
-// pause, which also cancels the context) must not stop the CLI, so the client
-// can still resume it; a client cancel is handled by Cancel.
-func (e *CLIExecutor) watchExecution(parent context.Context, taskID string) {
-	if parent.Done() == nil {
-		return
-	}
-	go func() {
-		<-parent.Done()
-		if !errors.Is(context.Cause(parent), a2asrv.ErrAgentInactivityTimeout) {
-			return
-		}
-		if sess, ok := e.live.Get(taskID); ok {
-			e.teardown(taskID, sess)
-		}
-	}()
-}
-
-// forget releases a task's state: its process lifetime, workdir lock, change
-// baseline, pending interaction, paused-task reaper, and live session. It is the
-// single release path and is idempotent; it does not touch the failure breaker.
-func (e *CLIExecutor) forget(taskID string) {
-	v, ok := e.tasks.LoadAndDelete(taskID)
-	if !ok {
-		return
-	}
-	st := v.(*taskState)
-	st.cancel()
-	if c := st.takeReap(); c != nil {
-		c()
-	}
-	if f := st.takeLock(); f != nil {
-		f()
-	}
-	e.live.Del(taskID)
-	e.metrics.active.Add(-1)
-	telemetry.TaskActive(-1)
-}
-
-// armPauseReaper reaps a task paused on input-required if it is not answered
-// before idleTimeout elapses or its run deadline passes. Without it a paused
-// task holds its CLI process and workdir lock until the client answers.
-func (e *CLIExecutor) armPauseReaper(st *taskState, taskID string, sess agent.Session) {
-	ctx, cancel := context.WithCancel(context.Background())
-	st.setReap(cancel)
-	go func() {
-		defer cancel()
-		var timeoutC <-chan time.Time
-		if e.idleTimeout > 0 {
-			t := time.NewTimer(e.idleTimeout)
-			defer t.Stop()
-			timeoutC = t.C
-		}
-		select {
-		case <-st.ctx.Done():
-		case <-timeoutC:
-		case <-ctx.Done():
-			return
-		}
-		e.teardown(taskID, sess)
-	}()
-}
-
-// disarmPauseReaper stops a paused task's reaper, called when it resumes. It is
-// idempotent.
-func (e *CLIExecutor) disarmPauseReaper(st *taskState) {
-	if c := st.takeReap(); c != nil {
-		c()
-	}
-}
-
-// takeTurn counts a turn for the task (a start or a resume) and reports
-// whether it exceeds the configured cap. A cap of 0 disables the check.
-func (e *CLIExecutor) takeTurn(st *taskState) bool {
-	if e.maxTurns <= 0 {
-		return false
-	}
-	return int(st.turns.Add(1)) > e.maxTurns
-}
-
-// cleanup releases a task's state. When fail is true the failure breaker is
-// penalized; otherwise it is resolved.
-func (e *CLIExecutor) cleanup(taskID string, fail bool) {
-	e.forget(taskID)
-	if fail {
-		e.breaker.Failure()
-	} else {
-		e.breaker.Resolve()
-	}
 }
 
 func codeForRunError(err error) string {
@@ -934,6 +586,33 @@ func usageMeta(u *agent.Usage) map[string]any {
 	}
 }
 
+// failedStatus builds a failed status event carrying a machine-readable code.
+func failedStatus(ec *a2asrv.ExecutorContext, code, msg string) *a2a.TaskStatusUpdateEvent {
+	return codedStatus(ec, a2a.TaskStateFailed, code, msg)
+}
+
+// rejectedStatus builds a rejected status event (the agent did not run).
+func rejectedStatus(ec *a2asrv.ExecutorContext, msg string) *a2a.TaskStatusUpdateEvent {
+	return codedStatus(ec, a2a.TaskStateRejected, codeAgentUnavailable, msg)
+}
+
+// codedStatus builds a terminal status event carrying a machine-readable code.
+func codedStatus(ec *a2asrv.ExecutorContext, state a2a.TaskState, code, msg string) *a2a.TaskStatusUpdateEvent {
+	m := a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(msg))
+	if m.Metadata == nil {
+		m.Metadata = map[string]any{}
+	}
+	m.Metadata[metaKeyErrorCode] = code
+	return a2a.NewStatusUpdateEvent(ec, state, m)
+}
+
+func eventErrorText(ev agent.Event) string {
+	if ev.Err != nil {
+		return ev.Err.Error()
+	}
+	return "cli error"
+}
+
 // finish flushes pending text and emits the terminal state after the event
 // channel closes (the CLI process has exited). A context deadline is reported
 // as a timeout failure.
@@ -991,226 +670,6 @@ func (e *CLIExecutor) fail(
 	e.forget(taskID)
 }
 
-// emitChanges captures the task's working-tree changes and emits the file,
-// image, and diff artifacts they produce. It is a no-op when there is no
-// baseline or the workspace cannot be resolved.
-func (e *CLIExecutor) emitChanges(ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool) {
-	st := e.loadState(taskID)
-	if st == nil {
-		return
-	}
-	base, ok := st.takeBaseline()
-	if !ok {
-		return
-	}
-	dir, err := e.workspace.Resolve(contextKey(ec))
-	if err != nil || dir == "" {
-		return
-	}
-	res := changes.Capture(dir, base, e.diffInlineLimit())
-	if !e.emitChangedFiles(ec, dir, res.Files, emit) {
-		return
-	}
-	if res.Diff == "" {
-		return
-	}
-	e.emitDiff(ec, res, emit)
-}
-
-// emitDiff delivers the change diff inline as text.
-func (e *CLIExecutor) emitDiff(ec *a2asrv.ExecutorContext, res changes.Result, emit func(a2a.Event) bool) {
-	data := []byte(res.Diff)
-	part := a2a.NewTextPart(res.Diff)
-	format := "summary"
-	if res.Unified {
-		part.MediaType = "text/x-diff"
-		format = "unified"
-	} else {
-		part.MediaType = "text/plain"
-	}
-	part.Metadata = digestMeta(data)
-	emit(artifactEvent(ec, "changes", part, map[string]any{
-		"files": toAnySlice(res.Files), "truncated": res.Truncated, "format": format,
-	}))
-}
-
-// defaultArtifactReadLimit is the default bound on how much of a single changed
-// file is read into memory before it is inlined.
-const defaultArtifactReadLimit = 256 << 20
-
-// artifactInlineLimit is the effective inline bound for one changed file.
-func (e *CLIExecutor) artifactInlineLimit() int64 {
-	if e.artifactInlineMaxBytes > 0 {
-		return e.artifactInlineMaxBytes
-	}
-	return defaultArtifactReadLimit
-}
-
-// defaultDiffInlineMaxBytes bounds the captured diff before it is truncated.
-const defaultDiffInlineMaxBytes = 32 << 20
-
-// diffInlineLimit is the effective diff bound.
-func (e *CLIExecutor) diffInlineLimit() int64 {
-	if e.diffInlineMaxBytes > 0 {
-		return e.diffInlineMaxBytes
-	}
-	return defaultDiffInlineMaxBytes
-}
-
-// imageMediaTypes maps a lower-case file extension to its image MIME type. It
-// covers the formats the supported CLIs produce.
-var imageMediaTypes = map[string]string{
-	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-	".gif": "image/gif", ".webp": "image/webp",
-}
-
-// textMediaTypes maps a lower-case file extension to a text media type; unknown
-// extensions fall back to application/octet-stream.
-var textMediaTypes = map[string]string{
-	".txt": "text/plain", ".md": "text/markdown", ".json": "application/json",
-	".yaml": "application/yaml", ".yml": "application/yaml", ".xml": "application/xml",
-	".csv": "text/csv", ".diff": "text/x-diff", ".patch": "text/x-diff",
-	".go": "text/plain", ".py": "text/plain", ".js": "text/plain", ".ts": "text/plain",
-	".sh": "text/plain", ".html": "text/html", ".css": "text/css",
-}
-
-// emitChangedFiles emits artifacts for changed images and, when enabled, for
-// changed non-image files. It returns false when the consumer has gone away.
-func (e *CLIExecutor) emitChangedFiles(
-	ec *a2asrv.ExecutorContext, dir string, files []string, emit func(a2a.Event) bool,
-) bool {
-	for _, rel := range files {
-		name, media, ok := artifactForFile(rel, e.nonImageArtifacts)
-		if !ok {
-			continue
-		}
-		if !e.emitChangedFile(ec, dir, rel, name, media, emit) {
-			return false
-		}
-	}
-	return true
-}
-
-// artifactForFile classifies one changed path as an image artifact, an optional
-// non-image file artifact, or neither.
-func artifactForFile(rel string, includeNonImage bool) (name, media string, ok bool) {
-	ext := strings.ToLower(filepath.Ext(rel))
-	if media, ok := imageMediaTypes[ext]; ok {
-		return "image", media, true
-	}
-	if !includeNonImage {
-		return "", "", false
-	}
-	media, ok = textMediaTypes[ext]
-	if !ok {
-		media = "application/octet-stream"
-	}
-	return "file", media, true
-}
-
-// emitChangedFile inlines one changed file as a raw artifact, or emits an
-// omitted notice when it cannot be read or exceeds the inline limit. It returns
-// false only when the consumer has gone away.
-func (e *CLIExecutor) emitChangedFile(
-	ec *a2asrv.ExecutorContext, dir, rel, artifactName, media string,
-	emit func(a2a.Event) bool,
-) bool {
-	data, ok := readChangedFile(dir, rel, e.artifactInlineLimit())
-	if !ok {
-		path, err := safePath(dir, rel)
-		if err != nil {
-			return true
-		}
-		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() {
-			return true // deleted or otherwise not a file
-		}
-		return emit(e.omittedFileArtifact(ec, rel, artifactName, info.Size()))
-	}
-	return emit(e.fileArtifact(ec, rel, artifactName, media, data))
-}
-
-// omittedFileArtifact reports a changed file that could not be inlined, so the
-// client learns which file was dropped and why.
-func (e *CLIExecutor) omittedFileArtifact(
-	ec *a2asrv.ExecutorContext, rel, artifactName string, size int64,
-) *a2a.TaskArtifactUpdateEvent {
-	reason := "unreadable"
-	if size > e.artifactInlineLimit() {
-		reason = fmt.Sprintf("size %d exceeds the %d-byte inline limit", size, e.artifactInlineLimit())
-	}
-	part := a2a.NewTextPart(fmt.Sprintf("[file: %s] not delivered: %s", filepath.Base(rel), reason))
-	return artifactEvent(ec, artifactName, part, map[string]any{
-		"path": rel, "omitted": true, "size": size,
-	})
-}
-
-// fileArtifact builds the inline artifact for a changed file.
-func (e *CLIExecutor) fileArtifact(
-	ec *a2asrv.ExecutorContext, rel, artifactName, media string, data []byte,
-) *a2a.TaskArtifactUpdateEvent {
-	part := a2a.NewRawPart(data)
-	part.MediaType = media
-	part.Filename = filepath.Base(rel)
-	part.Metadata = digestMeta(data)
-	return artifactEvent(ec, artifactName, part, map[string]any{"path": rel})
-}
-
-// artifactEvent builds an artifact update event with its name and metadata.
-func artifactEvent(
-	ec *a2asrv.ExecutorContext, name string, part *a2a.Part, meta map[string]any,
-) *a2a.TaskArtifactUpdateEvent {
-	evt := a2a.NewArtifactEvent(ec, part)
-	evt.Artifact.Name = name
-	evt.Artifact.Metadata = meta
-	return evt
-}
-
-// digestMeta is the integrity metadata carried on a file part.
-func digestMeta(data []byte) map[string]any {
-	return map[string]any{"sha256": sha256Hex(data), "size": len(data)}
-}
-
-// sha256Hex is the lowercase hex SHA-256 of data.
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-// safePath joins dir and rel, rejecting absolute paths and traversal.
-func safePath(dir, rel string) (string, error) {
-	if filepath.IsAbs(rel) || strings.HasPrefix(filepath.Clean(rel), "..") {
-		return "", fmt.Errorf("unsafe path %q", rel)
-	}
-	return filepath.Join(dir, rel), nil
-}
-
-// readChangedFile reads a changed file inside dir when rel is a safe relative
-// path to a regular file within maxBytes.
-func readChangedFile(dir, rel string, maxBytes int64) ([]byte, bool) {
-	path, err := safePath(dir, rel)
-	if err != nil {
-		return nil, false
-	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxBytes {
-		return nil, false
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, false
-	}
-	return data, true
-}
-
-func toAnySlice(values []string) []any {
-	out := make([]any, len(values))
-	for i, v := range values {
-		out[i] = v
-	}
-	return out
-}
-
 // Cancel implements a2asrv.AgentExecutor.
 func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
@@ -1232,400 +691,4 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 		emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCanceled, nil), nil)
 		e.forget(taskID)
 	}
-}
-
-// toRequest maps the A2A request onto an agent.Request, merging message-level
-// and request-level metadata (request-level wins).
-func (e *CLIExecutor) toRequest(ctx context.Context, ec *a2asrv.ExecutorContext) (*agent.Request, error) {
-	meta := mergeMetadata(ec)
-	dir, err := e.workspace.Resolve(contextKey(ec))
-	if err != nil {
-		return nil, err
-	}
-	attach := filepath.Join(dir, ".a2a", "attachments", turnDir(ec))
-	in, err := e.promptFromParts(ec.Message, attach)
-	if err != nil {
-		return nil, err
-	}
-	blocks, images, files := in.Blocks, in.Images, in.Files
-	if len(blocks) == 0 && len(images) == 0 && len(files) == 0 && len(in.ImageFiles) == 0 {
-		return nil, errNoText
-	}
-	sid, _ := e.sessions.Get(contextKey(ec))
-	return &agent.Request{
-		Prompt:       strings.Join(blocks, "\n"),
-		Blocks:       blocks,
-		SystemExtra:  metaString(meta, "harbor.systemPrompt"),
-		Model:        metaString(meta, "harbor.model"),
-		Agent:        metaString(meta, "harbor.agent"),
-		WorkDir:      dir,
-		SessionID:    sid,
-		Continue:     sid == "" && metaBool(meta, "harbor.continue"),
-		Fork:         metaBool(meta, "harbor.fork"),
-		MaxTurns:     metaInt(meta, "harbor.maxTurns"),
-		OutputSchema: metaMap(meta, "harbor.outputSchema"),
-		Images:       images,
-		Files:        files,
-		ImageFiles:   in.ImageFiles,
-		Meta:         meta,
-	}, nil
-}
-
-// contextKey scopes a context id to its owner, so one caller cannot resume
-// another caller's CLI session or working tree by reusing a contextId. A NUL
-// separator keeps the user and context parts unambiguous.
-func contextKey(ec *a2asrv.ExecutorContext) string {
-	if ec.User == nil || ec.User.Name == "" {
-		return ec.ContextID
-	}
-	return ec.User.Name + "\x00" + ec.ContextID
-}
-
-// turnDir is the per-turn subdirectory inbound attachments are materialized
-// into, derived from the task id so turns do not overwrite each other in the
-// shared workspace.
-func turnDir(ec *a2asrv.ExecutorContext) string {
-	id := filepath.Base(string(ec.TaskID))
-	if id == "" || id == "." || id == ".." || id == string(filepath.Separator) {
-		return "turn"
-	}
-	return id
-}
-
-func isWaitingForInput(ec *a2asrv.ExecutorContext) bool {
-	return ec.StoredTask != nil && ec.StoredTask.Status.State == a2a.TaskStateInputRequired
-}
-
-// answerWithoutRunning reports whether a request is answered from existing
-// state instead of starting a CLI run: a repeated message returns the earlier
-// task, and a message to a finished task returns it unchanged.
-func (e *CLIExecutor) answerWithoutRunning(
-	ctx context.Context, ec *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool,
-) bool {
-	if orig, ok := e.duplicateTask(ctx, ec); ok {
-		e.replayDuplicate(ec, orig, yield)
-		return true
-	}
-	if ec.StoredTask != nil && isTerminalState(ec.StoredTask.Status.State) {
-		yield(ec.StoredTask, nil)
-		return true
-	}
-	return false
-}
-
-// isTerminalState reports whether a task state is final (no further execution).
-func isTerminalState(s a2a.TaskState) bool {
-	switch s {
-	case a2a.TaskStateCompleted, a2a.TaskStateFailed, a2a.TaskStateCanceled, a2a.TaskStateRejected:
-		return true
-	}
-	return false
-}
-
-// duplicateTask returns the earlier task for a repeated messageId, so a
-// duplicate send is not executed twice. The first occurrence records the mapping.
-// The mapping is scoped by caller so one caller cannot replay another's task by
-// reusing a message id; a context id is not part of the scope because the server
-// may assign a fresh one per request.
-func (e *CLIExecutor) duplicateTask(ctx context.Context, ec *a2asrv.ExecutorContext) (*a2a.Task, bool) {
-	if e.taskLookup == nil || ec.StoredTask != nil || ec.Message == nil || ec.Message.ID == "" {
-		return nil, false
-	}
-	key := callerScope(ec) + "\x00" + ec.Message.ID
-	prev, existed := e.idem.getOrPut(key, ec.TaskID)
-	if !existed || prev == ec.TaskID {
-		return nil, false
-	}
-	task, ok := e.taskLookup(ctx, prev)
-	if !ok || task == nil || task.Status.State == a2a.TaskStateRejected {
-		// The earlier attempt was rejected (e.g. the breaker was open); do not
-		// pin that transient result, let this attempt proceed.
-		e.idem.set(key, ec.TaskID)
-		return nil, false
-	}
-	return task, true
-}
-
-// callerScope returns the authenticated caller's identity for idempotency
-// scoping, or empty when unauthenticated (a message id is only unique per
-// caller).
-func callerScope(ec *a2asrv.ExecutorContext) string {
-	if ec.User == nil {
-		return ""
-	}
-	return ec.User.Name
-}
-
-// replayDuplicate answers a duplicate send by replaying the earlier task's
-// artifacts and state under the new task, so the CLI is not run twice. The new
-// task records the original as harbor.duplicateOf.
-func (e *CLIExecutor) replayDuplicate(
-	ec *a2asrv.ExecutorContext, orig *a2a.Task, yield func(a2a.Event, error) bool,
-) {
-	tk := a2a.NewSubmittedTask(ec, ec.Message)
-	if tk.Metadata == nil {
-		tk.Metadata = map[string]any{}
-	}
-	tk.Metadata["harbor.duplicateOf"] = string(orig.ID)
-	if !yield(tk, nil) {
-		return
-	}
-	for _, a := range orig.Artifacts {
-		evt := a2a.NewArtifactEvent(ec, a.Parts...)
-		evt.Artifact.Name = a.Name
-		evt.Artifact.Metadata = a.Metadata
-		if !yield(evt, nil) {
-			return
-		}
-	}
-	state := orig.Status.State
-	if state == "" || state == a2a.TaskStateSubmitted {
-		state = a2a.TaskStateCompleted
-	}
-	yield(a2a.NewStatusUpdateEvent(ec, state, orig.Status.Message), nil)
-}
-
-func codeForRequestError(err error) string {
-	switch {
-	case errors.Is(err, errNoText), errors.Is(err, errUnsupportedContent):
-		return codeUnsupportedContent
-	default:
-		return codeInternal
-	}
-}
-
-func codeForStartError(err error) string {
-	switch {
-	case errors.Is(err, agent.ErrCLINotFound):
-		return codeCLINotFound
-	default:
-		return codeInternal
-	}
-}
-
-func mergeMetadata(ec *a2asrv.ExecutorContext) map[string]any {
-	meta := map[string]any{}
-	if ec.Message != nil {
-		for k, v := range ec.Message.Metadata {
-			meta[k] = v
-		}
-	}
-	for k, v := range ec.Metadata {
-		meta[k] = v
-	}
-	return meta
-}
-
-// failedStatus builds a failed status event carrying a machine-readable code.
-func failedStatus(ec *a2asrv.ExecutorContext, code, msg string) *a2a.TaskStatusUpdateEvent {
-	return codedStatus(ec, a2a.TaskStateFailed, code, msg)
-}
-
-// rejectedStatus builds a rejected status event (the agent did not run).
-func rejectedStatus(ec *a2asrv.ExecutorContext, msg string) *a2a.TaskStatusUpdateEvent {
-	return codedStatus(ec, a2a.TaskStateRejected, codeAgentUnavailable, msg)
-}
-
-// codedStatus builds a terminal status event carrying a machine-readable code.
-func codedStatus(ec *a2asrv.ExecutorContext, state a2a.TaskState, code, msg string) *a2a.TaskStatusUpdateEvent {
-	m := a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(msg))
-	if m.Metadata == nil {
-		m.Metadata = map[string]any{}
-	}
-	m.Metadata[metaKeyErrorCode] = code
-	return a2a.NewStatusUpdateEvent(ec, state, m)
-}
-
-func eventErrorText(ev agent.Event) string {
-	if ev.Err != nil {
-		return ev.Err.Error()
-	}
-	return "cli error"
-}
-
-func firstTextPart(m *a2a.Message) string {
-	if m == nil {
-		return ""
-	}
-	for _, p := range m.Parts {
-		if p != nil {
-			if t := p.Text(); t != "" {
-				return t
-			}
-		}
-	}
-	return ""
-}
-
-// interactionFromEvent builds the canonical descriptor for a permission event.
-// It uses the adapter's structured interaction when present and fills the gaps
-// from the event's tool fields, assigning a fresh id for cross-talk checks.
-func interactionFromEvent(ev agent.Event) *agent.Interaction {
-	itx := &agent.Interaction{Kind: agent.InteractionPermission, Resume: true}
-	if ev.Interaction != nil {
-		c := *ev.Interaction
-		itx = &c
-	}
-	if itx.Kind == "" {
-		itx.Kind = agent.InteractionPermission
-	}
-	if itx.ID == "" {
-		itx.ID = newInteractionID()
-	}
-	if itx.Action == "" {
-		itx.Action = ev.Tool
-	}
-	return itx
-}
-
-// interactionMessage builds the input-required message: a human-readable text
-// part plus a DataPart carrying the structured interaction for rich clients.
-func interactionMessage(prompt string, itx *agent.Interaction, sessionID string) *a2a.Message {
-	m := a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(prompt))
-	m.Parts = append(m.Parts, a2a.NewDataPart(interactionPayload(itx)))
-	m.Metadata = map[string]any{
-		metaKeyKind:          string(itx.Kind),
-		metaKeyInteractionID: itx.ID,
-	}
-	// Record the CLI session so a paused task can be resumed after a restart.
-	if sessionID != "" {
-		m.Metadata[metaKeySessionID] = sessionID
-	}
-	return m
-}
-
-// interactionPayload renders an interaction as JSON-native values (string,
-// bool, []any). The DataPart must not hold the Go struct: the task store
-// serializes tasks with gob, which requires every type carried in an interface
-// to be registered. Marshaling through JSON keeps the wire form and the stored
-// form identical and derived from the struct's own tags.
-func interactionPayload(itx *agent.Interaction) map[string]any {
-	m := map[string]any{}
-	if b, err := json.Marshal(itx); err == nil {
-		_ = json.Unmarshal(b, &m)
-	}
-	return m
-}
-
-// answerFromMessage maps a client's reply onto an agent.Input. The interaction
-// id may arrive in a structured DataPart or in the message metadata; either way
-// it is checked against the pending interaction. A reply with no id is accepted
-// as a text fallback for clients that do not use the extension.
-func (e *CLIExecutor) answerFromMessage(
-	ec *a2asrv.ExecutorContext, taskID string, m *a2a.Message,
-) (agent.Input, error) {
-	id, answer, content := parseAnswer(m)
-	kind, action, target := "answer", "", ""
-	if cur, ok := e.answerableInteraction(ec, taskID); ok {
-		if id != "" && id != cur.ID {
-			return agent.Input{}, fmt.Errorf("interaction id mismatch: got %q, want %q", id, cur.ID)
-		}
-		// Use the interaction's own id, kind, action, and target so the session
-		// can build the right response even when the client answered with text.
-		id, kind, action, target = cur.ID, string(cur.Kind), cur.Action, cur.Target
-	}
-	return agent.Input{
-		Kind: kind, ID: id, Action: action, Target: target, Answer: answer, Content: content,
-	}, nil
-}
-
-// parseAnswer extracts the interaction id, answer text, and form content from a
-// client reply. It prefers a structured DataPart and falls back to the message
-// metadata (key "harbor.interactionId") plus the first text part.
-func parseAnswer(m *a2a.Message) (id, answer string, content map[string]any) {
-	if m == nil {
-		return "", "", nil
-	}
-	for _, p := range m.Parts {
-		if p == nil || p.Data() == nil {
-			continue
-		}
-		b, err := json.Marshal(p.Data())
-		if err != nil {
-			continue
-		}
-		var a agent.Answer
-		if err := json.Unmarshal(b, &a); err != nil {
-			continue
-		}
-		if a.ID != "" || a.Answer != "" || a.Content != nil {
-			return a.ID, a.Answer, a.Content
-		}
-	}
-	return metaString(m.Metadata, metaKeyInteractionID), firstTextPart(m), nil
-}
-
-// answerableInteraction returns the input request a paused task is waiting on.
-// It falls back to the interaction recorded in the persisted input-required
-// status message, so a paused task remains answerable across a restart (when a
-// durable task store is configured).
-func (e *CLIExecutor) answerableInteraction(ec *a2asrv.ExecutorContext, taskID string) (*agent.Interaction, bool) {
-	if st := e.loadState(taskID); st != nil {
-		if it := st.pendingInteraction(); it != nil {
-			return it, true
-		}
-	}
-	if ec.StoredTask != nil {
-		if itx, ok := interactionFromStatusMessage(ec.StoredTask.Status.Message); ok {
-			return itx, true
-		}
-	}
-	return nil, false
-}
-
-// interactionFromStatusMessage reconstructs the interaction carried by an
-// input-required status message.
-func interactionFromStatusMessage(m *a2a.Message) (*agent.Interaction, bool) {
-	if m == nil {
-		return nil, false
-	}
-	for _, p := range m.Parts {
-		if p == nil || p.Data() == nil {
-			continue
-		}
-		b, err := json.Marshal(p.Data())
-		if err != nil {
-			continue
-		}
-		var itx agent.Interaction
-		if err := json.Unmarshal(b, &itx); err == nil && itx.ID != "" {
-			return &itx, true
-		}
-	}
-	return nil, false
-}
-
-// newInteractionID returns a short random interaction identifier.
-func newInteractionID() string {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "itx_unknown"
-	}
-	return "itx_" + hex.EncodeToString(b[:])
-}
-
-func metaString(m map[string]any, key string) string {
-	v, _ := m[key].(string)
-	return v
-}
-
-func metaBool(m map[string]any, key string) bool {
-	v, _ := m[key].(bool)
-	return v
-}
-
-func metaInt(m map[string]any, key string) int {
-	switch v := m[key].(type) {
-	case int:
-		return v
-	case float64:
-		return int(v)
-	}
-	return 0
-}
-
-// metaMap returns a nested JSON object under key, or nil when absent.
-func metaMap(m map[string]any, key string) map[string]any {
-	v, _ := m[key].(map[string]any)
-	return v
 }

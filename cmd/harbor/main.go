@@ -3,8 +3,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,8 +15,7 @@ import (
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/agent"
-	"github.com/jiaweisky/harbor/internal/config"
-	"github.com/jiaweisky/harbor/internal/plugins"
+	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/sandbox"
 	"github.com/jiaweisky/harbor/internal/server"
 	"github.com/jiaweisky/harbor/internal/telemetry"
@@ -41,7 +38,10 @@ func run() error {
 	cfgPath := flag.String("config", "examples/agents.yaml", "path to agents.yaml")
 	flag.Parse()
 
-	cfg := config.MustLoad(*cfgPath)
+	cfg, err := cli.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -71,11 +71,6 @@ func run() error {
 		}
 	}()
 
-	// Load any runtime adapter plugins before building agents.
-	if err := plugins.Load(cfg.Plugins); err != nil {
-		return fmt.Errorf("plugins: %w", err)
-	}
-
 	// Clean up orphaned CLIs from a previous crash, then build the runtime that
 	// tracks this process's children and logs their raw streams.
 	agent.SweepOrphans(cfg.Sandbox.StateDir)
@@ -90,16 +85,12 @@ func run() error {
 			slog.Warn("store close", "err", err)
 		}
 	}()
-	tlsConfig, err := httpTLSConfig(cfg.Server.TLS)
-	if err != nil {
-		return fmt.Errorf("server tls: %w", err)
-	}
 	srv := &http.Server{
 		Addr:    cfg.Server.Listen,
 		Handler: servers.HTTP,
 		// Requests derive from the root context, so shutdown cancels in-flight tasks.
 		BaseContext: func(net.Listener) context.Context { return ctx },
-		TLSConfig:   tlsConfig,
+		TLSConfig:   servers.TLSConfig,
 	}
 
 	serveErr := make(chan error, 1)
@@ -125,32 +116,4 @@ func run() error {
 		}
 		return err
 	}
-}
-
-// httpTLSConfig builds the server's TLS configuration, or nil when no
-// certificate is configured (plaintext).
-func httpTLSConfig(cfg config.TLSConfig) (*tls.Config, error) {
-	if cfg.CertFile == "" {
-		return nil, nil
-	}
-	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-	if err != nil {
-		return nil, err
-	}
-	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
-	if cfg.CAFile != "" {
-		pem, err := os.ReadFile(cfg.CAFile)
-		if err != nil {
-			return nil, err
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("no certificates in %s", cfg.CAFile)
-		}
-		tlsCfg.ClientCAs = pool
-	}
-	if cfg.ClientAuth {
-		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
-	}
-	return tlsCfg, nil
 }
