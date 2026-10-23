@@ -1,4 +1,4 @@
-package agent
+package integration
 
 import (
 	"context"
@@ -6,7 +6,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/core"
 )
 
 // ErrUnhandled signals that an AdapterBuilder does not handle the agent's
@@ -15,11 +16,13 @@ var ErrUnhandled = errors.New("adapter does not handle this agent")
 
 // AdapterOptions carries the deployment environment a launcher is built in. It
 // mirrors the runner-affecting settings, not the agent's own configuration
-// (which is passed separately as the AgentConfig).
+// (which is passed separately as the AgentSpec).
 type AdapterOptions struct {
 	InheritEnv bool
 	CLIHome    string
-	Container  *ContainerSpec
+	Container  *agent.ContainerSpec
+	// Runtime supplies orphan tracking and raw stream logging (may be nil).
+	Runtime *agent.Runtime
 	// Lifecycle bounds a spawned long-running server process (integration
 	// "server"); it is nil for per-task launchers.
 	Lifecycle context.Context
@@ -30,7 +33,7 @@ type AdapterOptions struct {
 // handling (a handshake, a bespoke transport, multi-turn stdin): register it
 // with RegisterAdapter from the adapter's init, so adding a CLI needs no change
 // to a central switch. Return ErrUnhandled for integrations it does not handle.
-type AdapterBuilder func(ac config.AgentConfig, opts AdapterOptions) (Launcher, error)
+type AdapterBuilder func(ac core.AgentSpec, opts AdapterOptions) (agent.Launcher, error)
 
 var (
 	adapterMu       sync.RWMutex

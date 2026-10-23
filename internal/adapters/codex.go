@@ -3,11 +3,7 @@ package adapters
 import (
 	"path/filepath"
 	"strings"
-
-	"github.com/jiaweisky/harbor/internal/agent"
 )
-
-func init() { Register("codex", func(_ string) agent.Authenticator { return codex{} }) }
 
 // codex stores its login state in CODEX_HOME/auth.json and also accepts API key
 // and access token environment variables. CODEX_HOME redirects the login state

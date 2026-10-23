@@ -41,6 +41,8 @@ type LauncherConfig struct {
 	CLIHome string
 	// Container, when set, runs the CLI inside a container.
 	Container *ContainerSpec
+	// Runtime supplies orphan tracking and raw stream logging (may be nil).
+	Runtime *Runtime
 	// VersionArgs is the flag(s) used to read the CLI version; nil skips probing.
 	VersionArgs []string
 	// VersionOverride, when set, is used verbatim instead of probing.
@@ -73,7 +75,7 @@ func NewHeadlessLauncher(cfg LauncherConfig) *HeadlessLauncher {
 		invoke:          cfg.Invoke,
 		env:             cfg.Env,
 		auth:            cfg.Auth,
-		runner:          NewRunner(cfg.MaxConcurrent, cfg.InheritEnv, cfg.CLIHome, cfg.Container),
+		runner:          NewRunner(cfg.MaxConcurrent, cfg.InheritEnv, cfg.CLIHome, cfg.Container, cfg.Runtime),
 		versionArgs:     cfg.VersionArgs,
 		versionOverride: cfg.VersionOverride,
 	}

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 )
 
 func TestBreakerDisabled(t *testing.T) {
@@ -20,7 +20,7 @@ func TestBreakerDisabled(t *testing.T) {
 // TestBreakerTripsOnFailureRatio verifies the breaker trips once the window is
 // full and the failure ratio is reached, even when failures are not consecutive.
 func TestBreakerTripsOnFailureRatio(t *testing.T) {
-	b := newBreaker(&config.BreakerConfig{Threshold: 4, FailureRatio: 0.5, Cooldown: time.Hour, MaxCooldown: time.Hour})
+	b := newBreaker(&core.Breaker{Threshold: 4, FailureRatio: 0.5, Cooldown: time.Hour, MaxCooldown: time.Hour})
 	b.Success()
 	b.Failure()
 	b.Success()
@@ -36,7 +36,7 @@ func TestBreakerTripsOnFailureRatio(t *testing.T) {
 // TestBreakerStaleSuccessIgnoredWhileOpen verifies a call that began before the
 // trip cannot close the breaker when it later succeeds.
 func TestBreakerStaleSuccessIgnoredWhileOpen(t *testing.T) {
-	b := newBreaker(&config.BreakerConfig{Threshold: 1, Cooldown: time.Hour, MaxCooldown: time.Hour})
+	b := newBreaker(&core.Breaker{Threshold: 1, Cooldown: time.Hour, MaxCooldown: time.Hour})
 	b.Failure() // opens
 	b.Success()
 	if b.State() != stateNameOpen {
@@ -51,7 +51,7 @@ func TestBreakerStaleSuccessIgnoredWhileOpen(t *testing.T) {
 // cooldown has elapsed: only an admitted probe, not a stale success, changes
 // state.
 func TestBreakerStaleSuccessAfterCooldownIgnored(t *testing.T) {
-	b := newBreaker(&config.BreakerConfig{Threshold: 1, Cooldown: 40 * time.Millisecond, MaxCooldown: time.Second})
+	b := newBreaker(&core.Breaker{Threshold: 1, Cooldown: 40 * time.Millisecond, MaxCooldown: time.Second})
 	b.Failure() // opens
 	time.Sleep(60 * time.Millisecond)
 	b.Success() // a call admitted before the trip, completing after the cooldown
@@ -63,7 +63,7 @@ func TestBreakerStaleSuccessAfterCooldownIgnored(t *testing.T) {
 // TestBreakerResolveReleasesProbe verifies Resolve frees a half-open probe slot
 // without closing the breaker.
 func TestBreakerResolveReleasesProbe(t *testing.T) {
-	b := newBreaker(&config.BreakerConfig{Threshold: 1, Cooldown: 100 * time.Millisecond, MaxCooldown: time.Second})
+	b := newBreaker(&core.Breaker{Threshold: 1, Cooldown: 100 * time.Millisecond, MaxCooldown: time.Second})
 	b.Failure() // opens
 	time.Sleep(150 * time.Millisecond)
 	if !b.Allow() {
@@ -81,7 +81,7 @@ func TestBreakerResolveReleasesProbe(t *testing.T) {
 // TestBreakerHalfOpenIgnoresOutcomeWithoutProbe verifies an outcome reported
 // while no probe is outstanding (for example after Resolve) is ignored.
 func TestBreakerHalfOpenIgnoresOutcomeWithoutProbe(t *testing.T) {
-	b := newBreaker(&config.BreakerConfig{Threshold: 1, Cooldown: 100 * time.Millisecond, MaxCooldown: time.Second})
+	b := newBreaker(&core.Breaker{Threshold: 1, Cooldown: 100 * time.Millisecond, MaxCooldown: time.Second})
 	b.Failure() // opens
 	time.Sleep(150 * time.Millisecond)
 	if !b.Allow() {
@@ -97,7 +97,7 @@ func TestBreakerHalfOpenIgnoresOutcomeWithoutProbe(t *testing.T) {
 // TestBreakerHalfOpenNeedsConsecutiveSuccesses verifies more than one probe must
 // succeed before the breaker closes.
 func TestBreakerHalfOpenNeedsConsecutiveSuccesses(t *testing.T) {
-	b := newBreaker(&config.BreakerConfig{
+	b := newBreaker(&core.Breaker{
 		Threshold: 1, HalfOpenSuccesses: 2, Cooldown: 100 * time.Millisecond, MaxCooldown: time.Second,
 	})
 	b.Failure() // opens
@@ -121,7 +121,7 @@ func TestBreakerHalfOpenNeedsConsecutiveSuccesses(t *testing.T) {
 // TestBreakerHalfOpenDoesNotWedge verifies an unanswered half-open probe cannot
 // keep the breaker half-open forever.
 func TestBreakerHalfOpenDoesNotWedge(t *testing.T) {
-	b := newBreaker(&config.BreakerConfig{Threshold: 1, Cooldown: 40 * time.Millisecond, MaxCooldown: time.Second})
+	b := newBreaker(&core.Breaker{Threshold: 1, Cooldown: 40 * time.Millisecond, MaxCooldown: time.Second})
 	b.Failure() // opens
 	time.Sleep(60 * time.Millisecond)
 	if !b.Allow() {
@@ -148,7 +148,7 @@ func TestBreakerState(t *testing.T) {
 		t.Fatalf("disabled breaker state = %q, want closed", got)
 	}
 
-	b := newBreaker(&config.BreakerConfig{Threshold: 1, Cooldown: time.Hour, MaxCooldown: time.Hour})
+	b := newBreaker(&core.Breaker{Threshold: 1, Cooldown: time.Hour, MaxCooldown: time.Hour})
 	if got := b.State(); got != stateNameClosed {
 		t.Fatalf("state = %q, want closed", got)
 	}
@@ -159,7 +159,7 @@ func TestBreakerState(t *testing.T) {
 }
 
 func TestBreakerStateHalfOpen(t *testing.T) {
-	b := newBreaker(&config.BreakerConfig{Threshold: 1, Cooldown: 100 * time.Millisecond, MaxCooldown: time.Second})
+	b := newBreaker(&core.Breaker{Threshold: 1, Cooldown: 100 * time.Millisecond, MaxCooldown: time.Second})
 	b.Failure()
 	if got := b.State(); got != stateNameOpen {
 		t.Fatalf("state = %q, want open", got)

@@ -23,6 +23,7 @@ import (
 	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/integration"
+	"github.com/jiaweisky/harbor/internal/sandbox"
 	"github.com/jiaweisky/harbor/internal/session"
 	"github.com/jiaweisky/harbor/internal/store"
 	"github.com/jiaweisky/harbor/internal/workspace"
@@ -46,33 +47,27 @@ func sessionStore(sc config.ServerConfig, agentID string) (bridge.SessionStore, 
 }
 
 // containerSpec builds the runner's container sandbox from the configuration, or
-// nil when no container is configured. The agent's workdir, the isolation root,
-// and the CLI home are bind-mounted at their host paths so paths inside the
-// container match the host.
-func containerSpec(s config.SandboxConfig, workdir string) *agent.ContainerSpec {
+// nil when no container is configured. The sandbox package owns the mount
+// policy; shared/worktree isolation needs the source workdir, copy does not.
+func containerSpec(s config.SandboxConfig, workdir string, needsSource bool) *agent.ContainerSpec {
 	if s.Container == nil {
 		return nil
 	}
-	var mounts []string
-	for _, m := range []string{workdir, s.IsolationRoot, s.CLIHome} {
-		if m != "" {
-			mounts = append(mounts, m)
-		}
-	}
-	return &agent.ContainerSpec{
-		Runtime: s.Container.Runtime,
-		Image:   s.Container.Image,
-		Network: string(s.Container.Network),
-		Mounts:  mounts,
+	return &sandbox.Container{
+		Runtime:   string(s.Container.Runtime),
+		Image:     s.Container.Image,
+		Mounts:    sandbox.Mounts(workdir, needsSource, s.IsolationRoot, s.CLIHome),
+		ExtraArgs: append([]string(nil), s.Container.ExtraArgs...),
 	}
 }
 
 // NewHandler builds the HTTP handler that exposes every configured agent:
 // a public agent card per agent, a JSON-RPC endpoint per agent, the standard
 // first-agent card, and the aggregate discovery endpoint. The auth middleware,
-// when enabled, protects only the JSON-RPC endpoints.
-func NewHandler(ctx context.Context, cfg *config.Config) (http.Handler, error) {
-	servers, err := New(ctx, cfg)
+// when enabled, protects only the JSON-RPC endpoints. rt supplies orphan
+// tracking and raw stream logging and may be nil for tests or embedding.
+func NewHandler(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (http.Handler, error) {
+	servers, err := New(ctx, cfg, rt)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +85,7 @@ type Servers struct {
 func (s *Servers) Close() error { return closeAll(s.closers) }
 
 // New builds the HTTP handler for the configured agents.
-func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
+func New(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Servers, error) {
 	auth, err := authMiddleware(cfg.Server.Auth)
 	if err != nil {
 		return nil, err
@@ -113,9 +108,10 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 
 	b := &agentBuilder{
 		cfg:            cfg,
+		runtime:        rt,
 		auth:           auth,
-		bearer:         cfg.Server.Auth.Mode == "bearer",
-		rl:             newRateLimiter(cfg.Server.RateLimit, cfg.Server.Auth.Mode == "bearer"),
+		bearer:         cfg.Server.Auth.Mode == config.AuthModeBearer,
+		rl:             newRateLimiter(cfg.Server.RateLimit, cfg.Server.Auth.Mode == config.AuthModeBearer),
 		taskLookup:     taskLookupFunc(taskStore),
 		mux:            http.NewServeMux(),
 		authReady:      make(map[string]bool, len(cfg.Agents)),
@@ -133,12 +129,12 @@ func New(ctx context.Context, cfg *config.Config) (*Servers, error) {
 
 	mux := b.mux
 	mux.Handle("/.well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(b.cards[0]))
-	mux.Handle(DiscoveryPath, bridge.NewCardsHandler(b.cards))
+	mux.Handle(DiscoveryPath, NewCardsHandler(b.cards))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/readyz", readinessHandler(b.execs, b.authReady))
 	mux.HandleFunc("/metrics", metricsHandler(b.execs))
 
-	httpHandler := traceMiddleware(bridge.CORSMiddleware(cfg.Server.CORSAllowedOrigins, mux))
+	httpHandler := traceMiddleware(CORSMiddleware(cfg.Server.CORSAllowedOrigins, mux))
 	return &Servers{HTTP: httpHandler, closers: b.closers}, nil
 }
 
@@ -215,6 +211,7 @@ type agentBuilder struct {
 	cards     []*a2a.AgentCard
 	execs     []*bridge.CLIExecutor
 	authReady map[string]bool
+	runtime   *agent.Runtime
 	closers   []io.Closer
 }
 
@@ -222,10 +219,13 @@ type agentBuilder struct {
 // routes. A build error or missing binary disables the agent with a warning
 // rather than failing startup.
 func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
+	resolver := workspace.NewResolverWithIsolation(ac.Workdir,
+		b.cfg.Sandbox.Isolation, b.cfg.Sandbox.IsolationRoot, b.cfg.Sandbox.CopyStrategy)
 	ln, info, err := integration.Build(ctx, ac, integration.Options{
 		InheritEnv: b.cfg.Sandbox.InheritEnvEnabled(),
 		CLIHome:    b.cfg.Sandbox.CLIHome,
-		Container:  containerSpec(b.cfg.Sandbox, ac.Workdir),
+		Container:  containerSpec(b.cfg.Sandbox, ac.Workdir, resolver.NeedsSourceMount()),
+		Runtime:    b.runtime,
 	})
 	if err != nil {
 		slog.Warn("agent disabled", "id", ac.ID, "err", err)
@@ -243,9 +243,7 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	if c, ok := sessions.(io.Closer); ok {
 		b.closers = append(b.closers, c)
 	}
-	resolver := workspace.NewResolverWithIsolation(ac.Workdir,
-		b.cfg.Sandbox.Isolation, b.cfg.Sandbox.IsolationRoot)
-	exec := bridge.NewCLIExecutor(ln, sessions, agent.NewLiveSessions(), resolver, ac.Limits)
+	exec := bridge.NewCLIExecutor(ln, sessions, agent.NewLiveSessions(), resolver, ac.Limits.Core())
 	exec.SetNonImageFileArtifacts(b.cfg.Sandbox.NonImageFileArtifacts)
 	exec.SetArtifactInlineMaxBytes(b.cfg.Sandbox.ArtifactInlineMaxBytes)
 	exec.SetDiffInlineMaxBytes(b.cfg.Sandbox.DiffInlineMaxBytes)
@@ -343,10 +341,10 @@ func metricsHandler(execs []*bridge.CLIExecutor) http.HandlerFunc {
 // silently serving without auth.
 func authMiddleware(cfg config.AuthConfig) (func(http.Handler) http.Handler, error) {
 	switch cfg.Mode {
-	case "", "none":
+	case "", config.AuthModeNone:
 		return func(h http.Handler) http.Handler { return h }, nil
-	case "bearer":
-		return func(h http.Handler) http.Handler { return bridge.BearerMiddleware(cfg.Tokens, h) }, nil
+	case config.AuthModeBearer:
+		return func(h http.Handler) http.Handler { return BearerMiddleware(cfg.Tokens, h) }, nil
 	default:
 		return nil, fmt.Errorf("unsupported auth mode %q", cfg.Mode)
 	}

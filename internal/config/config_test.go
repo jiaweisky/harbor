@@ -3,20 +3,48 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 )
 
-func writeConfig(t *testing.T, body string) string {
+// writeRawConfig writes body as-is.
+func writeRawConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "agents.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// writeConfig writes body with the required listen, state_dir, and workdir
+// filled in unless the fixture sets its own server, sandbox, or workdir.
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	if !strings.Contains(body, "listen:") {
+		body = "server:\n  listen: \"127.0.0.1:8080\"\n" + body
+	}
+	if !strings.Contains(body, "state_dir:") {
+		body = "sandbox:\n  state_dir: " + strconv.Quote(t.TempDir()) + "\n" + body
+	}
+	if !strings.Contains(body, "workdir:") {
+		var lines []string
+		for _, line := range strings.Split(body, "\n") {
+			lines = append(lines, line)
+			if strings.HasPrefix(line, "  - id:") {
+				lines = append(lines, "    workdir: \".\"")
+			}
+		}
+		body = strings.Join(lines, "\n")
+	}
+	return writeRawConfig(t, body)
 }
 
 func TestLoadExpandsEnvironment(t *testing.T) {
@@ -161,6 +189,44 @@ agents:
 func TestExampleConfigLoads(t *testing.T) {
 	if _, err := config.Load("../../examples/agents.yaml"); err != nil {
 		t.Fatalf("examples/agents.yaml: %v", err)
+	}
+}
+
+func TestListenRequired(t *testing.T) {
+	path := writeRawConfig(t, `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("expected a listen error, got %v", err)
+	}
+}
+
+func TestStateDirRequired(t *testing.T) {
+	path := writeRawConfig(t, `
+version: 1
+server:
+  listen: "127.0.0.1:8080"
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "state_dir") {
+		t.Fatalf("expected a state_dir error, got %v", err)
 	}
 }
 
@@ -520,6 +586,7 @@ func TestIsolationWorktreeRequiresRoot(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   isolation: worktree
 agents:
   - id: oc
@@ -535,10 +602,183 @@ agents:
 	}
 }
 
+func TestCopyIsolationRootMustNotContainWorkdir(t *testing.T) {
+	root := t.TempDir()
+	work := filepath.Join(root, "project")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+  isolation: copy
+  isolation_root: ` + strconv.Quote(root) + `
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+    workdir: ` + strconv.Quote(work) + `
+`
+	_, err := config.Load(writeConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "must not contain") {
+		t.Fatalf("expected an isolation_root containment error, got %v", err)
+	}
+
+	sibling := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body = strings.Replace(body, strconv.Quote(work), strconv.Quote(sibling), 1)
+	if _, err := config.Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("sibling workdir: unexpected error: %v", err)
+	}
+}
+
+func TestCopyStrategy(t *testing.T) {
+	cases := []struct {
+		name      string
+		isolation string
+		strategy  string
+		wantErr   string
+	}{
+		{"full implemented", "copy", "full", ""},
+		{"reflink unimplemented", "copy", "reflink", "not implemented"},
+		{"overlay unimplemented", "copy", "overlay", "not implemented"},
+		{"hardlink unimplemented", "copy", "hardlink", "not implemented"},
+		{"unknown", "copy", "magic", "must be one of"},
+		{"without copy", "shared", "full", "only valid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+  isolation: `+tc.isolation+`
+  isolation_root: "/tmp/harbor-test-iso"
+  copy_strategy: `+tc.strategy+`
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+			cfg, err := config.Load(path)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if cfg.Sandbox.CopyStrategy != "full" {
+					t.Errorf("copy_strategy = %q, want full", cfg.Sandbox.CopyStrategy)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected an error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestRequireAuthOnExposedBind(t *testing.T) {
+	cases := []struct {
+		name          string
+		listen, mode  string
+		allowInsecure bool
+		wantErr       bool
+	}{
+		{"loopback no auth", "127.0.0.1:8080", "none", false, false},
+		{"loopback range no auth", "127.0.0.2:8080", "none", false, false},
+		{"localhost no auth", "localhost:8080", "none", false, false},
+		{"ipv6 loopback no auth", "[::1]:8080", "none", false, false},
+		{"exposed no auth", "0.0.0.0:8080", "none", false, true},
+		{"ipv6 exposed no auth", "[::]:8080", "none", false, true},
+		{"empty host no auth", ":8080", "none", false, true},
+		{"exposed with bearer", "0.0.0.0:8080", "bearer", false, false},
+		{"exposed but allow_insecure", "0.0.0.0:8080", "none", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, `
+version: 1
+server:
+  listen: `+strconv.Quote(tc.listen)+`
+  allow_insecure: `+strconv.FormatBool(tc.allowInsecure)+`
+  auth:
+    mode: `+tc.mode+`
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+			_, err := config.Load(path)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Load(%q,%q,%v) err=%v, wantErr=%v", tc.listen, tc.mode, tc.allowInsecure, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestWorkdirRequired(t *testing.T) {
+	path := writeRawConfig(t, `
+version: 1
+server:
+  listen: "127.0.0.1:8080"
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "workdir is required") {
+		t.Fatalf("expected a workdir error, got %v", err)
+	}
+}
+
+func TestWorkdirStoredAbsolute(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+    workdir: "."
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Agents[0].Workdir; got != want {
+		t.Errorf("workdir = %q, want %q", got, want)
+	}
+}
+
 func TestArtifactInlineMaxBytesMustNotBeNegative(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   artifact_inline_max_bytes: -1
 agents:
   - id: oc
@@ -558,6 +798,7 @@ func TestSandboxArtifactSettings(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   non_image_file_artifacts: true
   artifact_inline_max_bytes: 1234
   diff_inline_max_bytes: 5678
@@ -588,6 +829,7 @@ func TestDiffInlineMaxBytesMustNotBeNegative(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   diff_inline_max_bytes: -1
 agents:
   - id: oc
@@ -607,6 +849,7 @@ func TestNonGitChangeGlobs(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   non_git_change_globs: ["src/**", "*.md"]
 agents:
   - id: oc
@@ -630,6 +873,7 @@ func TestNonGitChangeGlobsRejectsInvalidPatterns(t *testing.T) {
 		path := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   non_git_change_globs: ["`+glob+`"]
 agents:
   - id: oc
@@ -649,6 +893,7 @@ func TestStoreMustBeKnown(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 server:
+  listen: "127.0.0.1:8080"
   store: bogus
 agents:
   - id: oc
@@ -668,6 +913,7 @@ func TestSQLiteStoreRequiresAPath(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 server:
+  listen: "127.0.0.1:8080"
   store: sqlite
 agents:
   - id: oc
@@ -687,6 +933,7 @@ func TestAgentInactivityTimeout(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 server:
+  listen: "127.0.0.1:8080"
   agent_inactivity_timeout: 30s
 agents:
   - id: oc
@@ -747,6 +994,7 @@ func TestInheritEnvCanBeDisabled(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   inherit_env: false
 agents:
   - id: oc
@@ -765,12 +1013,73 @@ agents:
 	}
 }
 
-func TestContainerDefaults(t *testing.T) {
+func TestContainerRuntimeRequired(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   container:
     image: harbor/claude:latest
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "sandbox.container.runtime is required") {
+		t.Fatalf("expected a runtime error, got %v", err)
+	}
+}
+
+func TestContainerRuntime(t *testing.T) {
+	cases := []struct {
+		runtime string
+		wantErr bool
+	}{
+		{"docker", false},
+		{"podman", false},
+		{"nerdctl", false},
+		{"lxc", true},
+	}
+	for _, tc := range cases {
+		path := writeConfig(t, `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+  container:
+    image: harbor/claude:latest
+    runtime: `+tc.runtime+`
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`)
+		cfg, err := config.Load(path)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("runtime %q: err = %v, wantErr %v", tc.runtime, err, tc.wantErr)
+			continue
+		}
+		if err == nil && string(cfg.Sandbox.Container.Runtime) != tc.runtime {
+			t.Errorf("runtime = %q, want %q", cfg.Sandbox.Container.Runtime, tc.runtime)
+		}
+	}
+}
+
+func TestContainerExtraArgs(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+  container:
+    image: harbor/claude:latest
+    runtime: podman
+    extra_args: ["--network=none", "--read-only", "--pids-limit=512"]
 agents:
   - id: oc
     display_name: "oc"
@@ -784,14 +1093,12 @@ agents:
 		t.Fatalf("unexpected error: %v", err)
 	}
 	ct := cfg.Sandbox.Container
-	if ct == nil {
-		t.Fatal("container config was dropped")
+	if ct.Runtime != config.ContainerRuntimePodman {
+		t.Errorf("runtime = %q, want podman", ct.Runtime)
 	}
-	if ct.Network != config.NetworkNone {
-		t.Errorf("network = %q, want none", ct.Network)
-	}
-	if ct.Runtime != "docker" {
-		t.Errorf("runtime = %q, want docker", ct.Runtime)
+	want := []string{"--network=none", "--read-only", "--pids-limit=512"}
+	if !reflect.DeepEqual(ct.ExtraArgs, want) {
+		t.Errorf("extra_args = %q, want %q", ct.ExtraArgs, want)
 	}
 }
 
@@ -799,8 +1106,9 @@ func TestContainerRequiresImage(t *testing.T) {
 	path := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   container:
-    network: none
+    runtime: docker
 agents:
   - id: oc
     display_name: "oc"
@@ -812,27 +1120,6 @@ agents:
 	_, err := config.Load(path)
 	if err == nil || !strings.Contains(err.Error(), "sandbox.container.image is required") {
 		t.Fatalf("expected a container image error, got %v", err)
-	}
-}
-
-func TestContainerRejectsUnknownNetwork(t *testing.T) {
-	path := writeConfig(t, `
-version: 1
-sandbox:
-  container:
-    image: harbor/claude:latest
-    network: host
-agents:
-  - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
-    binary: opencode
-    integration: exec
-    args: ["run", "{{.Prompt}}"]
-`)
-	_, err := config.Load(path)
-	if err == nil || !strings.Contains(err.Error(), "sandbox.container.network") {
-		t.Fatalf("expected a container network error, got %v", err)
 	}
 }
 
@@ -861,7 +1148,7 @@ agents:
 }
 
 func TestCodebuddyProfileOutputImage(t *testing.T) {
-	p, ok := config.LookupProfile("codebuddy")
+	p, ok := cli.Lookup("codebuddy")
 	if !ok || len(p.OutputImage) == 0 {
 		t.Fatalf("codebuddy profile OutputImage = %v, want image types", p.OutputImage)
 	}
@@ -871,6 +1158,7 @@ func TestRequireContainerForDangerous(t *testing.T) {
 	bad := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   require_container_for_dangerous: true
 agents:
   - id: cb
@@ -887,8 +1175,9 @@ agents:
 	good := writeConfig(t, `
 version: 1
 sandbox:
+  state_dir: "/tmp/harbor-test-state"
   require_container_for_dangerous: true
-  container: { image: "harbor/cb:latest" }
+  container: { image: "harbor/cb:latest", runtime: docker }
 agents:
   - id: cb
     display_name: "cb"
@@ -994,5 +1283,59 @@ agents:
 	}
 	if cfg.Telemetry.ServiceName != "harbor" {
 		t.Errorf("service_name = %q, want default harbor", cfg.Telemetry.ServiceName)
+	}
+}
+
+func TestAgentSpecMapping(t *testing.T) {
+	ac := config.AgentConfig{
+		ID: "a", DisplayName: "A", Description: "d", Binary: "b",
+		Integration: config.IntegrationExec, Parser: "codex",
+		Regex:     &config.RegexConfig{Text: "^x$"},
+		ServerURL: "http://x", ServerProtocol: config.ServerProtocolACP,
+		Args: []string{"a"}, Env: map[string]string{"K": "V"},
+		AllowDangerous: true, SDKCaps: true,
+		OutputSchemaArgs: []string{"o"}, FileArgs: []string{"f"}, ImageArgs: []string{"i"},
+		InputImage: []string{"image/png"}, Interaction: config.InteractionInteractive,
+		Session: config.SessionConfig{IDFlag: "--id", ResumeFlag: "--r", ContinueFlag: "--c", ForkFlag: "--f"},
+		Limits: config.LimitsConfig{
+			MaxConcurrent: 2, Timeout: time.Minute, IdleTimeout: time.Second, MaxTurns: 3,
+			Breaker: &config.BreakerConfig{
+				Threshold: 4, FailureRatio: 0.5, HalfOpenSuccesses: 2,
+				Cooldown: time.Second, MaxCooldown: time.Minute,
+			},
+		},
+		Skills: []config.SkillConfig{{
+			ID: "s", Name: "n", Description: "d",
+			Tags: []string{"t"}, Examples: []string{"e"},
+			InputModes: []string{"in"}, OutputModes: []string{"out"},
+		}},
+		Version: "1",
+	}
+	want := core.AgentSpec{
+		ID: "a", DisplayName: "A", Description: "d", Binary: "b",
+		Integration: core.IntegrationExec, Parser: core.ParserCodex,
+		Regex:     &core.Regex{Text: "^x$"},
+		ServerURL: "http://x", ServerProtocol: core.ServerProtocolACP,
+		Args: []string{"a"}, Env: map[string]string{"K": "V"},
+		AllowDangerous: true, SDKCaps: true,
+		OutputSchemaArgs: []string{"o"}, FileArgs: []string{"f"}, ImageArgs: []string{"i"},
+		InputImage: []string{"image/png"}, Interaction: core.InteractionInteractive,
+		Session: core.Session{IDFlag: "--id", ResumeFlag: "--r", ContinueFlag: "--c", ForkFlag: "--f"},
+		Limits: core.Limits{
+			MaxConcurrent: 2, Timeout: time.Minute, IdleTimeout: time.Second, MaxTurns: 3,
+			Breaker: &core.Breaker{
+				Threshold: 4, FailureRatio: 0.5, HalfOpenSuccesses: 2,
+				Cooldown: time.Second, MaxCooldown: time.Minute,
+			},
+		},
+		Skills: []core.Skill{{
+			ID: "s", Name: "n", Description: "d",
+			Tags: []string{"t"}, Examples: []string{"e"},
+			InputModes: []string{"in"}, OutputModes: []string{"out"},
+		}},
+		Version: "1",
+	}
+	if got := ac.Spec(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Spec() = %+v, want %+v", got, want)
 	}
 }

@@ -53,10 +53,10 @@ Sandboxing, authentication, dangerous switches, etc. are all **configurable poli
 | Configurable item | Config key | Default | Meaning of enabling |
 |---|---|---|---|
 | Authentication | `server.auth.mode` | `none` (local) / `bearer` (external) | Integrate with external systems |
-| Workdir | `agents[].workdir` | Harbor's working directory | Pin a CLI to a project directory |
+| Workdir | `agents[].workdir` | required (`.` means Harbor's working directory) | Pin a CLI to a project directory |
 | Environment variables | `sandbox.inherit_env` | `true` (inherit the launching user's environment) | When set to `false`, only a whitelist is injected |
 | Dangerous switches | `agents[].allow_dangerous` | `false` | Enable `--dangerously-skip-permissions`/`-y`/`bypassPermissions` |
-| Container sandbox | `sandbox.container` | off | Strong isolation (network/filesystem) |
+| Container sandbox | `sandbox.container` | off | Filesystem isolation; network and extra flags are deployer-defined |
 | Concurrency/timeout | `agents[].limits.*` | conservative values | Increase throughput |
 
 > Conclusion: Harbor guarantees "boundaries can be enforced", but does not decide policies on behalf of the deployer; dangerous capabilities are always opt-in and are highlighted with warnings in the startup log.
@@ -677,8 +677,8 @@ mux.Handle("/agents/codebuddy/", a2asrv.NewJSONRPCHandler(handler))
 
 A coding agent only makes sense inside a **real codebase**, and a CLI treats its **cwd as the project root** (loading `opencode.json`/`.opencode`/`.codebuddy`/`.claude`/`.codex`, skills and sub-agents from there). So which directory a CLI runs in is a **deployment property of the agent**, not a per-request parameter:
 
-- **Source**: `agents[].workdir` — the directory the CLI is started in (its project root). When unset, the CLI inherits **Harbor's working directory**. To serve several projects, register several agents (one card each) — this matches how a CLI is normally used (`cd project && cli`).
-- **Validation**: `agents[].workdir`, when set, must exist and be a directory (checked at startup; the agent is otherwise refused).
+- **Source**: `agents[].workdir` — the directory the CLI is started in (its project root). It is required; `"."` resolves to **Harbor's working directory** and is stored as an absolute path. To serve several projects, register several agents (one card each) — this matches how a CLI is normally used (`cd project && cli`).
+- **Validation**: `agents[].workdir` must exist and be a directory (checked at startup; the agent is otherwise refused).
 - **No per-request override**: A2A has no notion of a working directory, and requiring a custom `harbor.*` metadata key would not interoperate with standard clients. Harbor does not expose the server's filesystem layout to callers.
 - **Binding to `contextId`**: the resolved directory is bound to the A2A `contextId` so that subsequent tasks of the same context (including `--resume`) **reuse the same working tree**.
 - **Isolation strategy** (`sandbox.isolation`, configuration; determines concurrency safety):
@@ -935,12 +935,12 @@ func init() {
 
 ### Level 3: Full Adapter (complex CLI) — **already implemented (compile-time registration)**
 
-Implement and register an **AdapterBuilder** for CLIs requiring a handshake, multiple stdin round-trips, or a dedicated transport. Registration is by **CLI binary base name**: `integration.New` preferentially calls it when there is a registration for that name; a builder returning `agent.ErrUnhandled` means that integration is not its concern, falling back to the built-in generic assembly (`stream-json`/`exec`). Adding a complex CLI = **creating one package + registering in `init()`**, without touching a central switch.
+Implement and register an **AdapterBuilder** for CLIs requiring a handshake, multiple stdin round-trips, or a dedicated transport. Registration is by **CLI binary base name**: `integration.New` preferentially calls it when there is a registration for that name; a builder returning `integration.ErrUnhandled` means that integration is not its concern, falling back to the built-in generic assembly (`stream-json`/`exec`). Adding a complex CLI = **creating one package + registering in `init()`**, without touching a central switch.
 
 ```go
 func init() {
-    agent.RegisterAdapter("weird-cli", func(ac config.AgentConfig, opts agent.AdapterOptions) (agent.Launcher, error) {
-        if ac.Integration != config.IntegrationServer { return nil, agent.ErrUnhandled }
+    integration.RegisterAdapter("weird-cli", func(ac core.AgentSpec, opts integration.AdapterOptions) (agent.Launcher, error) {
+        if ac.Integration != core.IntegrationServer { return nil, integration.ErrUnhandled }
         return newWeirdLauncher(ac, opts), nil
     })
 }
@@ -948,8 +948,8 @@ func init() {
 
 **Loading methods**:
 
-- **Compile-time registration** (adopted): `agent.RegisterAdapter` (`internal/agent/adapter.go`) maintains a `binary name → AdapterBuilder` registry. First-party adapters (the `acp`/`server` of `opencode`/`codebuddy`/`codex`) are registered in the `init()` of `internal/integration/adapters.go`; external/new CLIs register in their own package's `init()` (triggered by a compile-time import).
-- **Go plugin (the `plugin` package)**: `.so` files can be loaded at runtime (**already implemented**, experimental): `plugins: ["/path/x.so"]` opens each plugin at startup and calls its exported `Register()` (which internally uses `agent.RegisterAdapter` to register adapters). Subject to CGO/platform restrictions — available only under `cgo` on linux/darwin/freebsd (`internal/plugins` provides the implementation and degradation via build tags).
+- **Compile-time registration** (adopted): `integration.RegisterAdapter` (`internal/integration/adapter_registry.go`) maintains a `binary name → AdapterBuilder` registry. First-party adapters (the `acp`/`server` of `opencode`/`codebuddy`/`codex`) are registered in the `init()` of `internal/integration/adapters.go`; external/new CLIs register in their own package's `init()` (triggered by a compile-time import).
+- **Go plugin (the `plugin` package)**: `.so` files can be loaded at runtime (**already implemented**, experimental): `plugins: ["/path/x.so"]` opens each plugin at startup and calls its exported `Register()` (which internally uses `integration.RegisterAdapter` to register adapters). Subject to CGO/platform restrictions — available only under `cgo` on linux/darwin/freebsd (`internal/plugins` provides the implementation and degradation via build tags).
 - Everything is exposed uniformly through the registry; the HTTP layer and A2A layer are completely unaware of the specific CLI. config still validates the **configuration shape** (integration value, profile version, argument templates); adapter construction only happens in `integration.New`.
 
 ---
@@ -965,10 +965,10 @@ func init() {
    - **Scope**: the Bearer middleware **wraps only the JSON-RPC endpoints**; cards and discovery endpoints (`/.well-known/agent-card.json`, `/.well-known/agents.json`, `/agents/{id}/.well-known/agent-card.json`) are **public** — a client needs the card first to learn the auth scheme, and codebuddy does not carry a token when fetching cards.
    **Not planned to support** OAuth2 / mTLS / token introspection / fine-grained authorization (YAGNI). Per-caller credentials (model B in §10.2) are not implemented; if per-user quota/billing is needed, start multiple Harbor instances each with a different OS user.
 2. **Upstream credentials and login**: see **§10** (the CLI's own provider login/credential isolation, a separate matter from this item's service authentication).
-3. **Workdir**: each agent runs in its configured `agents[].workdir` (its project root), which must exist; when unset it inherits Harbor's working directory (see §6.7 for details).
+3. **Workdir**: each agent runs in its configured `agents[].workdir` (its project root), which is required and must exist; `"."` means Harbor's working directory (see §6.7 for details).
 4. **Environment variables**: **by default the launching user's environment is inherited** (many CLIs depend on it); when `sandbox.inherit_env: false`, only a whitelist (`PATH`/`HOME`/`LANG`/`LC_ALL`/`TERM`/`TMPDIR`) + `agents[].env` are injected, to reduce credential exposure.
 5. **Dangerous switches made explicit**: `--dangerously-skip-permissions`/`-y`/`bypassPermissions` can only be enabled by the deployer in the configuration (`agents[].allow_dangerous`, default `false`), with **no environment-variable bypass**, and are highlighted with warnings in the startup log. Hardening (already implemented, optional): when `sandbox.require_container_for_dangerous: true`, any `allow_dangerous` agent may only start if `sandbox.container` is configured; otherwise `config.Load` errors out and refuses to start.
-6. **Optional container sandbox (already implemented)**: when `sandbox.container: {image, network, runtime}` is enabled, each CLI process starts with `<runtime> run --rm -i --network <network>` (the `Runner`, covering exec/stream-json/acp and the long-running process of server). The agent's **workdir**, the `isolation_root`, and `cli_home` are bind-mounted at their **host original paths** (`-v <path>:<path>`), and the workdir is specified via `-w`, so `PWD` and each CLI's configuration root remain valid inside the container; the environment is forwarded entry by entry via `--env` (including the results of `inherit_env`/`cli_home`). `network` defaults to `none`, `runtime` to `docker` (can be set to `podman`). The image must ship the corresponding CLI. Trade-off: in-container paths match the host, so `inv.Bin` is not rewritten; image selection and credential injection are the deployer's responsibility.
+6. **Optional container sandbox (already implemented)**: when `sandbox.container: {image, runtime, extra_args}` is enabled, each CLI process starts with `<runtime> run --rm -i` (the `Runner`, covering exec/stream-json/acp and the long-running process of server). The agent's **workdir** (for `shared`/`worktree` isolation), the `isolation_root`, and `cli_home` are bind-mounted at their **host original paths** (`-v <path>:<path>`), and the workdir is specified via `-w`, so `PWD` and each CLI's configuration root remain valid inside the container; `copy` isolation is self-contained, so the original workdir stays unmounted (`copy_strategy` selects the implementation; only the portable `full` copy is implemented, while reflink/overlay/hardlink await platform-specific implementations and are rejected). The environment is forwarded entry by entry via `--env` (including the results of `inherit_env`/`cli_home`). `runtime` is required (fixed set: `docker`, `podman`, `nerdctl`; nerdctl is Linux-only, while docker and podman are VM-backed on macOS/Windows); `extra_args` are passed through verbatim before the image and are deployer-owned (they can weaken isolation, and they set the network mode; the runtime default applies otherwise). The image must ship the corresponding CLI. Trade-off: in-container paths match the host, so `inv.Bin` is not rewritten; image selection, runtime flags, and credential injection are the deployer's responsibility. At startup Harbor probes `<runtime> info` and refuses to start when the binary or its daemon is unavailable.
 7. **Resource limits**: concurrency cap, CPU/memory (`ulimit`/cgroup), per-task timeout and maximum turns, to prevent runaway loops.
 8. **Audit log**: record `user → agent → prompt summary → taskId → result status`, with sensitive content redactable.
 9. **Network**: CORS allows trusted domains only; the AgentCard may be public but the invocation interface requires authentication.
@@ -1103,7 +1103,7 @@ The authentication logic is abstracted into the `agent.Authenticator` interface 
 | CLI hangs with no output | Idle timeout (`limits.idle_timeout`, triggered when there are no events) | Failed `timeout`; cancel the run → kill the process group |
 | **Process exits after user cancellation** | — | **The post-cancel `EventError` must be suppressed** (canceled flag), otherwise it would override `Canceled` |
 | Repeated crashes | Consecutive failure count | The agent is marked unhealthy / circuit-broken; `/readyz` fails and it stops accepting requests |
-| Harbor crashes leaving orphans | Startup scan (already implemented) | The `Runner` records each process's **process group** in `<state_dir>/procs` (`sandbox.state_dir`, default temporary directory); the record is removed when the process exits. At startup `SweepOrphans` reads the records and kills **only when that group's command still matches the recorded binary** (to prevent PID reuse), then clears the records. Windows does not verify and therefore does not clean up. |
+| Harbor crashes leaving orphans | Startup scan (already implemented) | The `Runner` records each process's **process group** in `<state_dir>/procs` (`sandbox.state_dir`, required); the record is removed when the process exits. At startup `SweepOrphans` reads the records and kills **only when that group's command still matches the recorded binary** (to prevent PID reuse), then clears the records. Windows does not verify and therefore does not clean up. |
 
 Key points:
 
@@ -1232,8 +1232,9 @@ sandbox:
   # isolation_root: "/srv/iso"       # required for worktree/copy
   inherit_env: true
   cli_home: "/srv/harbor-cli-home"   # optional: redirect the CLI config/home here
-  state_dir: "/var/lib/harbor"       # runtime state (orphan records); defaults to the temp dir
-  # container: { image: "harbor/claude:latest", network: none }  # optional strong isolation
+  state_dir: "/var/lib/harbor"       # required: runtime state (orphan records)
+  # container: { image: "harbor/claude:latest", runtime: docker,
+  #              extra_args: ["--network=none"] }  # optional strong isolation
 
 agents:
   - id: claude
@@ -1570,6 +1571,7 @@ type AuthConfig struct {
 type SandboxConfig struct {
     Isolation      string           `yaml:"isolation"`       // shared | worktree | copy
     IsolationRoot  string           `yaml:"isolation_root"`  // for worktree/copy
+    CopyStrategy   string           `yaml:"copy_strategy"`   // copy only: full (implemented)
     InheritEnv     *bool            `yaml:"inherit_env"`     // default true
     CLIHome        string           `yaml:"cli_home"`        // redirect the CLI config/home
     StateDir       string           `yaml:"state_dir"`       // orphan process records
@@ -1584,9 +1586,9 @@ type SandboxConfig struct {
 }
 
 type ContainerConfig struct {
-    Image   string `yaml:"image"`
-    Network string `yaml:"network"` // none (default) | bridge
-    Runtime string `yaml:"runtime"` // container runtime binary; default docker
+    Image     string           `yaml:"image"`
+    Runtime   ContainerRuntime `yaml:"runtime"`    // required; docker | podman | nerdctl
+    ExtraArgs []string         `yaml:"extra_args"` // passed verbatim to <runtime> run
 }
 
 type AgentConfig struct {

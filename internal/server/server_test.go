@@ -67,7 +67,7 @@ func testConfig(t *testing.T) *config.Config {
 
 func newTestServer(t *testing.T, cfg *config.Config) *httptest.Server {
 	t.Helper()
-	h, err := server.NewHandler(context.Background(), cfg)
+	h, err := server.NewHandler(context.Background(), cfg, nil)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -278,14 +278,14 @@ func TestAggregateDiscoveryIsArray(t *testing.T) {
 func TestUnsupportedAuthModeFailsClosed(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Server.Auth.Mode = "oauth2"
-	if _, err := server.NewHandler(context.Background(), cfg); err == nil {
+	if _, err := server.NewHandler(context.Background(), cfg, nil); err == nil {
 		t.Fatal("expected NewHandler to reject an unsupported auth mode")
 	}
 }
 
 func TestNoAgentsFailsClosed(t *testing.T) {
 	cfg := &config.Config{Version: 1, Server: config.ServerConfig{Listen: "127.0.0.1:0"}}
-	if _, err := server.NewHandler(context.Background(), cfg); err == nil {
+	if _, err := server.NewHandler(context.Background(), cfg, nil); err == nil {
 		t.Fatal("expected NewHandler to fail when no agents are configured")
 	}
 }
@@ -293,7 +293,7 @@ func TestNoAgentsFailsClosed(t *testing.T) {
 func TestAllBinariesMissingFailsClosed(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Agents[0].Binary = "/nonexistent/harbor-no-such-binary"
-	if _, err := server.NewHandler(context.Background(), cfg); err == nil {
+	if _, err := server.NewHandler(context.Background(), cfg, nil); err == nil {
 		t.Fatal("expected NewHandler to fail when no agent binary is usable")
 	}
 }

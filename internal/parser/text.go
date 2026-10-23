@@ -16,7 +16,3 @@ func (p *Text) Parse(rec []byte, out func(agent.Event)) error {
 
 // Flush implements agent.Parser.
 func (p *Text) Flush(func(agent.Event)) error { return nil }
-
-func init() {
-	RegisterParser("text", func(string) (agent.Parser, error) { return NewText(), nil })
-}

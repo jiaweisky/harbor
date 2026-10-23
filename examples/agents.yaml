@@ -37,13 +37,18 @@ server:
 # plugins: ["/opt/harbor/plugins/my-cli.so"]
 
 sandbox:
+  # Required: writable directory for the CLI process records used to clean up
+  # orphans after a crash. Use a private per-user directory when several
+  # instances or users share a host.
+  state_dir: "/var/lib/harbor"
   inherit_env: true                  # false restricts the CLI env to an allowlist
   # Optional per-context isolation for concurrent tasks on the same project.
   # isolation: shared                # shared | worktree | copy
   # isolation_root: "/srv/iso"       # required for worktree/copy
+  # copy_strategy: full              # copy only; reflink/overlay/hardlink are not implemented
   # cli_home: "/srv/harbor-cli-home" # redirect the CLI config/home here
-  # state_dir: "/var/lib/harbor"     # runtime state (orphan records); default is under the temp dir
-  # container: { image: "harbor/claude:latest", network: none, runtime: docker }
+  # container: { image: "harbor/claude:latest", runtime: docker,
+  #              extra_args: ["--network=none"] }   # flags are deployer-owned
   # require_container_for_dangerous: true   # refuse allow_dangerous without a container
   # non_image_file_artifacts: true          # emit a FilePart per changed non-image file
   # artifact_inline_max_bytes: 268435456       # max bytes inlined into one artifact
@@ -65,8 +70,8 @@ agents:
     #                                                     # surface as A2A input-required (default: auto);
     #                                                     # keep the CLI from prompting (e.g. dontAsk below)
     #                                                     # when non-interactive
-    # workdir: "/srv/projects/my-project"   # project dir the CLI starts in (its project
-    #                                       # root); defaults to Harbor's working directory
+    workdir: "."   # required; "." is Harbor's working directory (stored absolute)
+    # workdir: "/srv/projects/my-project"
     args:
       - "-p"
       - "--input-format"
@@ -94,6 +99,7 @@ agents:
     display_name: "OpenCode"
     binary: opencode
     integration: exec
+    workdir: "."
     args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]   # exec passes the prompt via {{.Prompt}}
     session: { id_flag: "--session", continue_flag: "--continue" }
     limits: { max_concurrent: 2 }

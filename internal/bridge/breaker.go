@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 )
 
 // breakerStates.
@@ -52,7 +52,7 @@ type breaker struct {
 }
 
 // newBreaker builds a breaker, applying sensible defaults for zero fields.
-func newBreaker(cfg *config.BreakerConfig) *breaker {
+func newBreaker(cfg *core.Breaker) *breaker {
 	if cfg == nil || cfg.Threshold <= 0 {
 		return nil
 	}

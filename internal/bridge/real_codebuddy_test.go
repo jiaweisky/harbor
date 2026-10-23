@@ -24,6 +24,7 @@ import (
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/integration"
 	"github.com/jiaweisky/harbor/internal/session"
 )
@@ -36,7 +37,7 @@ func codebuddyHandler(t *testing.T, ac config.AgentConfig) a2asrv.RequestHandler
 		t.Fatalf("integration.New: %v", err)
 	}
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 150 * time.Second})
+		core.Limits{Timeout: 150 * time.Second})
 	return a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 }
 
@@ -156,7 +157,7 @@ func TestRealCodebuddyServerACPTool(t *testing.T) {
 		InheritEnv: true, Lifecycle: t.Context(),
 	})
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 150 * time.Second})
+		core.Limits{Timeout: 150 * time.Second})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	prompt := "Use your Bash tool to run the command `echo $((6 * 7))`, then reply with only the command's output."

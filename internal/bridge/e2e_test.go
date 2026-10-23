@@ -22,7 +22,9 @@ import (
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/integration"
+	"github.com/jiaweisky/harbor/internal/server"
 	"github.com/jiaweisky/harbor/internal/session"
 	"github.com/jiaweisky/harbor/internal/workspace"
 )
@@ -43,7 +45,7 @@ func newLauncher(
 }
 
 func newLauncherParser(
-	t *testing.T, script string, integ config.Integration, parserName string,
+	t *testing.T, script string, integ config.Integration, parserName config.ParserKind,
 	args []string, env map[string]string,
 ) agent.Launcher {
 	t.Helper()
@@ -65,7 +67,7 @@ func newLauncherParser(
 
 func newHandler(t *testing.T, ln agent.Launcher) a2asrv.RequestHandler {
 	t.Helper()
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, core.Limits{})
 	return a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 }
 
@@ -75,7 +77,7 @@ func newPwdHandler(t *testing.T, root string) a2asrv.RequestHandler {
 	t.Helper()
 	ln := newLauncher(t, scriptPath(t, "fake-pwd.sh"), "exec", nil, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(root), config.LimitsConfig{})
+		workspace.NewResolver(root), core.Limits{})
 	return a2asrv.NewHandler(exec)
 }
 
@@ -266,7 +268,7 @@ func newPausedACPTask(t *testing.T) (a2asrv.RequestHandler, context.Context, con
 	t.Helper()
 	ln := newLauncher(t, scriptPath(t, "fake-acp.sh"), "acp", nil, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 10 * time.Second})
+		core.Limits{Timeout: 10 * time.Second})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -303,7 +305,7 @@ func newStreamJSONHandler(t *testing.T, script string) (a2asrv.RequestHandler, c
 	t.Helper()
 	ln := newLauncher(t, scriptPath(t, script), "stream-json", []string{"-p"}, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 10 * time.Second})
+		core.Limits{Timeout: 10 * time.Second})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	return h, ctx, cancel
@@ -452,7 +454,7 @@ func TestStreamJSONElicitationForm(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-form.sh"), "stream-json", []string{"-p"},
 		map[string]string{"HARBOR_STDIN_LOG": logPath})
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 10 * time.Second})
+		core.Limits{Timeout: 10 * time.Second})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -487,7 +489,7 @@ func TestStreamJSONPlanApproval(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-plan.sh"), "stream-json", []string{"-p"},
 		map[string]string{"HARBOR_STDIN_LOG": logPath})
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 10 * time.Second})
+		core.Limits{Timeout: 10 * time.Second})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -526,7 +528,7 @@ func TestNonInteractivePermissionFails(t *testing.T) {
 		t.Fatalf("integration.New: %v", err)
 	}
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 10 * time.Second})
+		core.Limits{Timeout: 10 * time.Second})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -607,7 +609,7 @@ func stdinLoggerHandler(t *testing.T, logPath string) a2asrv.RequestHandler {
 		t.Fatalf("integration.New: %v", err)
 	}
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 30 * time.Second})
+		core.Limits{Timeout: 30 * time.Second})
 	return a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 }
 
@@ -926,7 +928,7 @@ func TestSendMessage_opencode(t *testing.T) {
 func TestIdleTimeout(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-slow.sh"), "stream-json", nil, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{IdleTimeout: 200 * time.Millisecond, Timeout: 20 * time.Second})
+		core.Limits{IdleTimeout: 200 * time.Millisecond, Timeout: 20 * time.Second})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -948,7 +950,7 @@ func TestIdleTimeout(t *testing.T) {
 func TestCancel(t *testing.T) {
 	exec := bridge.NewCLIExecutor(
 		newLauncher(t, scriptPath(t, "fake-slow.sh"), "stream-json", nil, nil),
-		session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
+		session.New(), agent.NewLiveSessions(), nil, core.Limits{})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1015,7 +1017,7 @@ func runMetricsTask(t *testing.T, script string) *bridge.CLIExecutor {
 	t.Helper()
 	exec := bridge.NewCLIExecutor(
 		newLauncher(t, scriptPath(t, script), "stream-json", nil, nil),
-		session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
+		session.New(), agent.NewLiveSessions(), nil, core.Limits{})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1070,7 +1072,7 @@ func TestPromptFromParts(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "exec",
 		[]string{"-p", "{{.Prompt}}"}, map[string]string{"HARBOR_ARG_LOG": logPath})
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(root), config.LimitsConfig{})
+		workspace.NewResolver(root), core.Limits{})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1118,7 +1120,7 @@ func TestRejectsUnsupportedImage(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "exec",
 		[]string{"-p", "{{.Prompt}}"}, map[string]string{"HARBOR_ARG_LOG": logPath})
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(root), config.LimitsConfig{})
+		workspace.NewResolver(root), core.Limits{})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1317,7 +1319,7 @@ func TestExecImageAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("integration.New: %v", err)
 	}
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, core.Limits{})
 	h := a2asrv.NewHandler(exec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1377,14 +1379,14 @@ func TestSendMessage_genericRegex(t *testing.T) {
 // newHandlerTimeout returns a handler with a total task timeout.
 func newHandlerTimeout(t *testing.T, ln agent.Launcher, d time.Duration) a2asrv.RequestHandler {
 	t.Helper()
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{Timeout: d})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, core.Limits{Timeout: d})
 	return a2asrv.NewHandler(exec)
 }
 
 func TestBreakerRejectsAfterFailures(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-fail.sh"), "stream-json", nil, nil)
-	limits := config.LimitsConfig{
-		Breaker: &config.BreakerConfig{Threshold: 2, Cooldown: time.Hour, MaxCooldown: time.Hour},
+	limits := core.Limits{
+		Breaker: &core.Breaker{Threshold: 2, Cooldown: time.Hour, MaxCooldown: time.Hour},
 	}
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, limits)
 	h := a2asrv.NewHandler(exec)
@@ -1459,7 +1461,7 @@ func TestChangesArtifact(t *testing.T) {
 	repo := gitRepo(t)
 	ln := newLauncher(t, scriptPath(t, "fake-mutate.sh"), "exec", nil, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(repo), config.LimitsConfig{})
+		workspace.NewResolver(repo), core.Limits{})
 	h := a2asrv.NewHandler(exec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1493,7 +1495,7 @@ func TestImageOutputArtifact(t *testing.T) {
 	root := t.TempDir()
 	ln := newLauncher(t, scriptPath(t, "fake-image.sh"), "exec", []string{"{{.Prompt}}"}, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(root), config.LimitsConfig{})
+		workspace.NewResolver(root), core.Limits{})
 	exec.SetNonGitChangeGlobs([]string{"*.png"})
 	h := a2asrv.NewHandler(exec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1533,7 +1535,7 @@ func TestImageOutputArtifact(t *testing.T) {
 func TestMaxTurnsExceeded(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-question.sh"), "stream-json", []string{"-p"}, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 10 * time.Second, MaxTurns: 1})
+		core.Limits{Timeout: 10 * time.Second, MaxTurns: 1})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -1555,7 +1557,7 @@ func TestNonImageFileArtifacts(t *testing.T) {
 	repo := gitRepo(t)
 	ln := newLauncher(t, scriptPath(t, "fake-mutate.sh"), "exec", nil, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(repo), config.LimitsConfig{})
+		workspace.NewResolver(repo), core.Limits{})
 	exec.SetNonImageFileArtifacts(true)
 	h := a2asrv.NewHandler(exec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1593,7 +1595,7 @@ func TestDuplicateMessageIdempotent(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil,
 		map[string]string{"HARBOR_ARG_LOG": logPath})
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 10 * time.Second})
+		core.Limits{Timeout: 10 * time.Second})
 	ts := taskstore.NewInMemory(nil)
 	exec.SetTaskLookup(func(ctx context.Context, id a2a.TaskID) (*a2a.Task, bool) {
 		st, err := ts.Get(ctx, id)
@@ -1664,7 +1666,7 @@ func TestTraceEvents(t *testing.T) {
 
 func TestPushNotification(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-slow.sh"), "stream-json", nil, nil)
-	limits := config.LimitsConfig{Timeout: 800 * time.Millisecond}
+	limits := core.Limits{Timeout: 800 * time.Millisecond}
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, limits)
 	h := a2asrv.NewHandler(exec,
 		a2asrv.WithPushNotifications(push.NewInMemoryStore(),
@@ -1775,38 +1777,12 @@ func TestCardUsesDisplayName(t *testing.T) {
 	}
 }
 
-func TestRequireAuthOnExposedBind(t *testing.T) {
-	cases := []struct {
-		name          string
-		listen, mode  string
-		allowInsecure bool
-		wantErr       bool
-	}{
-		{"loopback no auth", "127.0.0.1:8080", "none", false, false},
-		{"loopback range no auth", "127.0.0.2:8080", "none", false, false},
-		{"localhost no auth", "localhost:8080", "none", false, false},
-		{"ipv6 loopback no auth", "[::1]:8080", "none", false, false},
-		{"exposed no auth", "0.0.0.0:8080", "none", false, true},
-		{"ipv6 exposed no auth", "[::]:8080", "none", false, true},
-		{"empty host no auth", ":8080", "none", false, true}, // empty host binds all interfaces
-		{"exposed with bearer", "0.0.0.0:8080", "bearer", false, false},
-		{"exposed but allow_insecure", "0.0.0.0:8080", "none", true, false},
-	}
-	for _, c := range cases {
-		err := bridge.RequireAuthOnExposedBind(c.listen, c.mode, c.allowInsecure)
-		if (err != nil) != c.wantErr {
-			t.Errorf("%s: RequireAuthOnExposedBind(%q,%q,%v) err=%v, wantErr=%v",
-				c.name, c.listen, c.mode, c.allowInsecure, err, c.wantErr)
-		}
-	}
-}
-
 func TestDiscoveryAggregate(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
 	card := bridge.BuildCard(ln, ln.Probe(context.Background()), "http://example/agents/x/", false)
 
 	mux := http.NewServeMux()
-	mux.Handle("/.well-known/agents.json", bridge.NewCardsHandler([]*a2a.AgentCard{card}))
+	mux.Handle("/.well-known/agents.json", server.NewCardsHandler([]*a2a.AgentCard{card}))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -1831,11 +1807,11 @@ func TestAuthScope(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
 	card := bridge.BuildCard(ln, ln.Probe(context.Background()), "http://example/agents/x/", true)
 
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, config.LimitsConfig{})
+	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, core.Limits{})
 	h := a2asrv.NewHandler(exec)
 
 	mux := http.NewServeMux()
-	mux.Handle("/agents/x/", bridge.BearerMiddleware([]string{"secret"}, a2asrv.NewJSONRPCHandler(h)))
+	mux.Handle("/agents/x/", server.BearerMiddleware([]string{"secret"}, a2asrv.NewJSONRPCHandler(h)))
 	mux.Handle("/agents/x/.well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(card))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

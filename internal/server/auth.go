@@ -1,36 +1,10 @@
-package bridge
+package server
 
 import (
 	"crypto/subtle"
-	"fmt"
-	"net"
 	"net/http"
 	"strings"
 )
-
-// RequireAuthOnExposedBind refuses to bind a non-loopback address that has no
-// authentication configured, unless the operator explicitly opts out with
-// allowInsecure. Any non-"none" auth mode is accepted; the check is about
-// having *some* auth, not about a specific scheme.
-func RequireAuthOnExposedBind(listen, mode string, allowInsecure bool) error {
-	if isLoopback(listen) || allowInsecure || mode != "none" {
-		return nil
-	}
-	return fmt.Errorf("refusing to bind %q with auth.mode=none; set server.auth.mode or server.allow_insecure", listen)
-}
-
-func isLoopback(listen string) bool {
-	host, _, err := net.SplitHostPort(listen)
-	if err != nil {
-		host = listen
-	}
-	if host == "localhost" {
-		return true
-	}
-	// An empty host (":8080") binds all interfaces; ParseIP returns nil for it.
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
 
 // BearerMiddleware enforces "Authorization: Bearer <token>" against a token set.
 func BearerMiddleware(tokens []string, next http.Handler) http.Handler {

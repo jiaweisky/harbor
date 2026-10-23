@@ -29,7 +29,7 @@ func (echoParser) Flush(func(agent.Event)) error { return nil }
 // TestRunnerContextCancelKills verifies that canceling the context terminates
 // the process group (the regression for "exec.CommandContext only kills direct child").
 func TestRunnerContextCancelKills(t *testing.T) {
-	r := agent.NewRunner(1, true, "", nil)
+	r := agent.NewRunner(1, true, "", nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	ch, err := r.Start(ctx, "task-1", &agent.Invocation{Bin: "sleep", Args: []string{"30"}}, nopParser{})
 	if err != nil {
@@ -57,7 +57,7 @@ func TestRunnerContextCancelKills(t *testing.T) {
 // reading (channel fills, sends block) and the process is killed, the read
 // goroutine aborts and its concurrency slot is released.
 func TestRunnerAbandonedConsumerReleasesSlot(t *testing.T) {
-	r := agent.NewRunner(1, true, "", nil)
+	r := agent.NewRunner(1, true, "", nil, nil)
 	flood := &agent.Invocation{
 		Bin:  "sh",
 		Args: []string{"-c", "i=0; while [ $i -lt 100000 ]; do echo line; i=$((i+1)); done"},
@@ -85,7 +85,7 @@ func TestRunnerAbandonedConsumerReleasesSlot(t *testing.T) {
 // set to it, so a CLI that reads PWD runs in the right directory (regression:
 // opencode used the parent's PWD and wrote outside the workspace).
 func TestRunnerSetsPWDToDir(t *testing.T) {
-	r := agent.NewRunner(1, true, "", nil)
+	r := agent.NewRunner(1, true, "", nil, nil)
 	dir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -120,7 +120,10 @@ func TestRunnerContainerRunsCLI(t *testing.T) {
 
 	dir := t.TempDir()
 	r := agent.NewRunner(1, true, "",
-		&agent.ContainerSpec{Runtime: script, Image: "fakeimage", Network: "none", Mounts: []string{dir}})
+		&agent.ContainerSpec{
+			Runtime: script, Image: "fakeimage", Mounts: []string{dir},
+			ExtraArgs: []string{"--read-only"},
+		}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -143,7 +146,7 @@ func TestRunnerContainerRunsCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read docker log: %v", err)
 	}
-	for _, want := range []string{"run", "--rm", "-i", "--network", "none", dir + ":" + dir, "fakeimage", "echo OK"} {
+	for _, want := range []string{"run", "--rm", "-i", dir + ":" + dir, "--read-only", "fakeimage", "echo OK"} {
 		if !strings.Contains(string(rec), want) {
 			t.Errorf("container argv missing %q; log:\n%s", want, rec)
 		}
@@ -154,10 +157,7 @@ func TestRunnerContainerRunsCLI(t *testing.T) {
 // logging is enabled.
 func TestRunnerRawStream(t *testing.T) {
 	dir := t.TempDir()
-	agent.SetRawStream(dir, false)
-	defer agent.SetRawStream("", false)
-
-	r := agent.NewRunner(1, true, "", nil)
+	r := agent.NewRunner(1, true, "", nil, agent.NewRuntime("", dir, false))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -183,7 +183,7 @@ func TestRunnerRawStream(t *testing.T) {
 // consumer still receives every event produced during normal operation.
 func TestRunnerDeliversAllEventsToSlowConsumer(t *testing.T) {
 	const n = 300
-	r := agent.NewRunner(1, true, "", nil)
+	r := agent.NewRunner(1, true, "", nil, nil)
 	script := "i=0; while [ $i -lt " + strconv.Itoa(n) + " ]; do echo x; i=$((i+1)); done"
 
 	inv := &agent.Invocation{Bin: "sh", Args: []string{"-c", script}}
@@ -206,7 +206,7 @@ func TestRunnerDeliversAllEventsToSlowConsumer(t *testing.T) {
 // initial Stdin gets EOF on stdin, so a CLI that reads stdin does not block
 // (regression: `opencode run` / `codex exec` hung on an open pipe).
 func TestRunnerClosesStdinOneShot(t *testing.T) {
-	r := agent.NewRunner(1, true, "", nil)
+	r := agent.NewRunner(1, true, "", nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	inv := &agent.Invocation{Bin: "sh", Args: []string{"-c", "cat >/dev/null; echo done"}}

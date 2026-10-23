@@ -95,7 +95,3 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
-
-func init() {
-	RegisterParser("codex", func(string) (agent.Parser, error) { return NewCodex(), nil })
-}

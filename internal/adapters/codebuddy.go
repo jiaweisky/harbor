@@ -1,9 +1,5 @@
 package adapters
 
-import "github.com/jiaweisky/harbor/internal/agent"
-
-func init() { Register("codebuddy", func(_ string) agent.Authenticator { return codebuddy{} }) }
-
 // codebuddy keeps its login state in the OS Keychain and has no headless login
 // command, so only environment credentials can be verified and isolated.
 type codebuddy struct{}

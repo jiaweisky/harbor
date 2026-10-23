@@ -14,7 +14,9 @@ import (
 	"github.com/jiaweisky/harbor/internal/acp"
 	"github.com/jiaweisky/harbor/internal/adapters"
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/cli"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/parser"
 	versionutil "github.com/jiaweisky/harbor/internal/version"
 )
@@ -27,6 +29,8 @@ type Options struct {
 	CLIHome string
 	// Container, when set, runs each CLI inside a container for isolation.
 	Container *agent.ContainerSpec
+	// Runtime supplies orphan tracking and raw stream logging (may be nil).
+	Runtime *agent.Runtime
 	// Ctx bounds a long-running server process (integration "server"); nil uses
 	// a background context.
 	Ctx context.Context
@@ -41,7 +45,7 @@ func Build(ctx context.Context, ac config.AgentConfig, opts Options) (agent.Laun
 		return nil, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Enabled: false, Err: err}, nil
 	}
 
-	profile, known := config.LookupProfile(ac.Binary)
+	profile, known := cli.Lookup(ac.Binary)
 	ver := ac.Version // an explicit override is kept verbatim
 	if ver == "" && known {
 		ver = agent.DetectVersion(ctx, path, profile.VersionArgs)
@@ -66,9 +70,10 @@ func Build(ctx context.Context, ac config.AgentConfig, opts Options) (agent.Laun
 	}
 	// Harbor does not gate on its own credential guess: the CLI decides whether
 	// it can run, so a CLI that starts standalone is served as-is.
+	spec := ac.Spec()
 	return ln, agent.Info{
-		Name: ac.ID, DisplayName: ac.DisplayName, Description: ac.Description,
-		Skills: infoSkills(ac), Path: path, Enabled: true, Version: ver,
+		Name: spec.ID, DisplayName: spec.DisplayName, Description: spec.Description,
+		Skills: infoSkills(spec), Path: path, Enabled: true, Version: ver,
 	}, nil
 }
 
@@ -87,15 +92,15 @@ func (l interactionLauncher) Capabilities() agent.Capabilities { return l.caps }
 // forces prompts to be surfaced; non-interactive drops them so the card does not
 // advertise the interaction extension and the executor fails if the CLI still
 // prompts.
-func applyInteractionMode(ln agent.Launcher, mode config.Interaction) (agent.Launcher, error) {
+func applyInteractionMode(ln agent.Launcher, mode core.Interaction) (agent.Launcher, error) {
 	caps := ln.Capabilities()
 	switch mode {
-	case "", config.InteractionAuto:
+	case "", core.InteractionAuto:
 		return ln, nil
-	case config.InteractionInteractive:
+	case core.InteractionInteractive:
 		caps.Permission = agent.PermInteractive
 		caps.InputRequiredResume = true
-	case config.InteractionNonInteractive:
+	case core.InteractionNonInteractive:
 		caps.Permission = agent.PermFlagOnly
 		caps.InputRequiredResume = false
 		caps.PlanApproval = false
@@ -107,7 +112,7 @@ func applyInteractionMode(ln agent.Launcher, mode config.Interaction) (agent.Lau
 }
 
 // infoSkills maps the configured card skills onto the agent package type.
-func infoSkills(ac config.AgentConfig) []agent.Skill {
+func infoSkills(ac core.AgentSpec) []agent.Skill {
 	if len(ac.Skills) == 0 {
 		return nil
 	}
@@ -125,17 +130,18 @@ func infoSkills(ac config.AgentConfig) []agent.Skill {
 // configured interaction mode to its capabilities. When the integration is
 // empty it is resolved from the CLI's known profile.
 func New(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
-	ln, err := newLauncher(ac, opts)
+	spec := ac.Spec()
+	ln, err := buildLauncher(spec, opts)
 	if err != nil {
 		return nil, err
 	}
-	return applyInteractionMode(ln, ac.Interaction)
+	return applyInteractionMode(ln, spec.Interaction)
 }
 
-// newLauncher builds the integration-specific launcher without the interaction
-// override.
-func newLauncher(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
-	profile, known := config.LookupProfile(ac.Binary)
+// buildLauncher builds the integration-specific launcher without the
+// interaction override.
+func buildLauncher(ac core.AgentSpec, opts Options) (agent.Launcher, error) {
+	profile, known := cli.Lookup(ac.Binary)
 
 	integ := ac.Integration
 	if known {
@@ -163,34 +169,34 @@ func newLauncher(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 
 	// A dedicated adapter registered for this CLI (see adapters.go, or any
 	// package's init) takes precedence for the integrations it handles.
-	if build, ok := agent.LookupAdapter(filepath.Base(ac.Binary)); ok {
-		ln, err := build(ac, agent.AdapterOptions{
+	if build, ok := LookupAdapter(filepath.Base(ac.Binary)); ok {
+		ln, err := build(ac, AdapterOptions{
 			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
-			Container: opts.Container, Lifecycle: opts.Ctx,
+			Container: opts.Container, Runtime: opts.Runtime, Lifecycle: opts.Ctx,
 		})
-		if !errors.Is(err, agent.ErrUnhandled) {
+		if !errors.Is(err, ErrUnhandled) {
 			return ln, err
 		}
 	}
 
 	switch integ {
-	case config.IntegrationStreamJSON:
+	case core.IntegrationStreamJSON:
 		caps := streamJSONCaps(inputImage, profile.OutputImage)
 		caps.SessionFork = ac.Session.ForkFlag != ""
 		return headlessLauncher(ac, opts, auth, versionArgs, caps, headlessSpec{
 			newParser: func() agent.Parser { return parser.NewStreamJSON() },
 			invoke:    streamJSONInvoke(ac),
 		}), nil
-	case config.IntegrationExec:
+	case core.IntegrationExec:
 		newParser, err := execParserFactory(ac)
 		if err != nil {
 			return nil, err
 		}
 		return headlessLauncher(ac, opts, auth, versionArgs, execCaps(ac, inputImage, profile.OutputImage),
 			headlessSpec{newParser: newParser, invoke: textInvoke(ac)}), nil
-	case config.IntegrationACP:
+	case core.IntegrationACP:
 		return acpLauncher(ac, opts, auth, versionArgs), nil
-	case config.IntegrationServer:
+	case core.IntegrationServer:
 		// The dedicated opencode/codebuddy/codex adapters are registered by
 		// binary name and handle these before this switch; reaching here means an
 		// unsupported binary.
@@ -209,7 +215,6 @@ func newLauncher(ac config.AgentConfig, opts Options) (agent.Launcher, error) {
 // headlessSpec carries the per-integration pieces of a headless launcher. At
 // most one of parser and newParser is set.
 type headlessSpec struct {
-	caps      agent.Capabilities
 	invoke    agent.InvokeFunc
 	parser    agent.Parser
 	newParser func() agent.Parser
@@ -218,21 +223,21 @@ type headlessSpec struct {
 // headlessLauncher builds a headless (stdin/stdout) launcher with the shared
 // runner settings and the given per-integration pieces.
 func headlessLauncher(
-	ac config.AgentConfig, opts Options, auth agent.Authenticator, versionArgs []string,
+	ac core.AgentSpec, opts Options, auth agent.Authenticator, versionArgs []string,
 	caps agent.Capabilities, spec headlessSpec,
 ) agent.Launcher {
 	return agent.NewHeadlessLauncher(agent.LauncherConfig{
 		Name: ac.ID, Binary: ac.Binary, Capabilities: caps,
 		Parser: spec.parser, NewParser: spec.newParser, Invoke: spec.invoke,
 		Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
-		InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container,
+		InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container, Runtime: opts.Runtime,
 		VersionArgs: versionArgs, VersionOverride: ac.Version,
 	})
 }
 
 // execCaps derives a one-shot CLI's capabilities from its configured attachment
 // and structured-output support.
-func execCaps(ac config.AgentConfig, inputImage, outputImage []string) agent.Capabilities {
+func execCaps(ac core.AgentSpec, inputImage, outputImage []string) agent.Capabilities {
 	caps := textCaps(outputImage)
 	caps.OutputData = len(ac.OutputSchemaArgs) > 0 // structured output configured
 	caps.AttachFiles = len(ac.FileArgs) > 0        // files attached via CLI args
@@ -244,12 +249,12 @@ func execCaps(ac config.AgentConfig, inputImage, outputImage []string) agent.Cap
 
 // acpLauncher builds an ACP-over-stdio launcher.
 func acpLauncher(
-	ac config.AgentConfig, opts Options, auth agent.Authenticator, versionArgs []string,
+	ac core.AgentSpec, opts Options, auth agent.Authenticator, versionArgs []string,
 ) agent.Launcher {
 	return acp.NewLauncher(acp.Config{
 		Name: ac.ID, Binary: ac.Binary, Args: ac.Args, Env: envSlice(ac.Env),
 		Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
-		InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container,
+		InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container, Runtime: opts.Runtime,
 		VersionArgs: versionArgs, VersionOverride: ac.Version,
 	})
 }
@@ -257,7 +262,7 @@ func acpLauncher(
 // authenticator returns the CLI's authenticator: a built-in adapter for a known
 // CLI, or an unverifiable one for a generic CLI. The probed version lets the
 // adapter branch on version-specific behavior.
-func authenticator(ac config.AgentConfig) agent.Authenticator {
+func authenticator(ac core.AgentSpec) agent.Authenticator {
 	if a, ok := adapters.AuthFor(ac.Binary, ac.Version); ok {
 		return a
 	}
@@ -304,10 +309,10 @@ func textCaps(outputImage []string) agent.Capabilities {
 // execParserFactory validates the configured exec parser once and returns a
 // constructor. Each task gets its own parser instance because parsers may carry
 // per-task state and tasks run concurrently.
-func execParserFactory(ac config.AgentConfig) (func() agent.Parser, error) {
+func execParserFactory(ac core.AgentSpec) (func() agent.Parser, error) {
 	name := ac.Parser
 	if name == "" {
-		name = "text"
+		name = core.ParserText
 	}
 	pattern := ""
 	if ac.Regex != nil {
@@ -327,7 +332,7 @@ func execParserFactory(ac config.AgentConfig) (func() agent.Parser, error) {
 
 // streamJSONInvoke builds a duplex invocation: the prompt is written to stdin
 // and the pipe stays open for later turns.
-func streamJSONInvoke(ac config.AgentConfig) agent.InvokeFunc {
+func streamJSONInvoke(ac core.AgentSpec) agent.InvokeFunc {
 	return func(req *agent.Request) (*agent.Invocation, error) {
 		args := append([]string{}, ac.Args...)
 		args = append(args, sessionArgs(ac, req)...)
@@ -353,7 +358,7 @@ func streamJSONInvoke(ac config.AgentConfig) agent.InvokeFunc {
 // configured argument template. When the request carries an output schema and
 // the agent configures output_schema_args, the schema is written to a file and
 // the args (with {{.SchemaFile}}/{{.Schema}}) are appended.
-func textInvoke(ac config.AgentConfig) agent.InvokeFunc {
+func textInvoke(ac core.AgentSpec) agent.InvokeFunc {
 	return func(req *agent.Request) (*agent.Invocation, error) {
 		args := make([]string, 0, len(ac.Args)+len(ac.OutputSchemaArgs))
 		for _, a := range ac.Args {
@@ -428,7 +433,7 @@ func schemaArgs(tmpl []string, schema map[string]any) ([]string, error) {
 }
 
 // sessionArgs returns the flags that continue, resume, or fork a CLI session.
-func sessionArgs(ac config.AgentConfig, req *agent.Request) []string {
+func sessionArgs(ac core.AgentSpec, req *agent.Request) []string {
 	if req.SessionID != "" {
 		var args []string
 		if flag := agent.FirstNonEmpty(ac.Session.ResumeFlag, ac.Session.IDFlag); flag != "" {
@@ -448,7 +453,7 @@ func sessionArgs(ac config.AgentConfig, req *agent.Request) []string {
 // appendCommonFlags adds the model, system-prompt, structured-output, and
 // dangerous-mode flags shared by the Claude-family CLIs; other integrations use
 // argument templates.
-func appendCommonFlags(args []string, ac config.AgentConfig, req *agent.Request) []string {
+func appendCommonFlags(args []string, ac core.AgentSpec, req *agent.Request) []string {
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)
 	}

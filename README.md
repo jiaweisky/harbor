@@ -195,7 +195,7 @@ any unset reference.
 
 | key | type | required | default | meaning |
 |---|---|---|---|---|
-| `listen` | string | no | `127.0.0.1:8080` | bind address |
+| `listen` | string | **yes** | — | bind address (`host:port`) |
 | `base_url` | string | no | — | externally reachable URL used in agent cards |
 | `allow_insecure` | bool | no | `false` | allow a non-loopback bind with `auth.mode: none` |
 | `push_allow_private_networks` | bool | no | `false` | disable the SSRF guard on push webhooks |
@@ -215,10 +215,11 @@ any unset reference.
 |---|---|---|---|---|
 | `isolation` | string | no | `shared` | `shared` \| `worktree` \| `copy` (per-context working copies) |
 | `isolation_root` | string | for `worktree`/`copy` | — | base dir for per-context copies |
+| `copy_strategy` | string | no | `full` | copy isolation implementation: only `full` is implemented; `reflink`, `overlay`, and `hardlink` are recognized but rejected |
 | `inherit_env` | bool | no | `true` | inherit the parent env; `false` restricts to an allowlist |
 | `cli_home` | string | no | — | redirect the CLI's config/home here |
-| `state_dir` | string | no | temp dir `harbor` | runtime state (orphan-process records) |
-| `container` | object | no | — | run each CLI in a container (strong isolation) |
+| `state_dir` | string | **yes** | — | writable dir for CLI process records used for orphan cleanup; use a private per-user dir when several instances or users share a host |
+| `container` | object | no | — | run each CLI in a container (filesystem isolation; network and extra flags are deployer-owned) |
 | `require_container_for_dangerous` | bool | no | `false` | refuse `allow_dangerous` agents without a container |
 | `non_image_file_artifacts` | bool | no | `false` | emit a `FilePart` per changed non-image file |
 | `artifact_inline_max_bytes` | int | no | `268435456` | max bytes of one changed file inlined into a file or image artifact |
@@ -226,6 +227,20 @@ any unset reference.
 | `non_git_change_globs` | string[] | no | — | relative glob patterns enabling change capture outside git; empty disables it (and its artifacts) |
 | `raw_stream_dir` | string | no | — | write each task's raw stdout/stderr to this dir |
 | `raw_stream_compress` | bool | no | `false` | gzip the raw-stream files |
+
+With `sandbox.container`, `shared` and `worktree` isolation mount
+`agents[].workdir` (a git worktree keeps its metadata in the owning repository);
+`copy` isolation is self-contained and mounts only `isolation_root` (plus
+`cli_home`), so the original workdir is not visible to the agent. For `copy`,
+`isolation_root` must not be the workdir or an ancestor of it. `copy_strategy`
+selects the copy implementation. Only `full` is implemented, and it is
+portable: Go file APIs copy the tree but do not preserve ownership, ACLs,
+xattrs, or mtimes, and symlinks need privileges on Windows. The recognized but
+unimplemented names are platform-specific: `reflink` needs btrfs/XFS (`FICLONE`)
+on Linux, APFS on macOS, or ReFS on Windows; `overlay` is Linux-only;
+`hardlink` needs one filesystem and is not an isolation boundary. Availability
+is a runtime property and must be probed once an implementation exists;
+configuration currently rejects all three.
 
 `sandbox.file_artifacts` was renamed to `sandbox.non_image_file_artifacts`, and
 `sandbox.file_artifact_max_bytes` to `sandbox.artifact_inline_max_bytes`; the old
@@ -241,8 +256,18 @@ non-git workdirs. Workdirs inside a git repository keep using git.
 | key | type | required | default | meaning |
 |---|---|---|---|---|
 | `image` | string | **yes** | — | image providing the CLI |
-| `network` | string | no | `none` | `none` \| `bridge` |
-| `runtime` | string | no | `docker` | container runtime binary (e.g. `podman`) |
+| `runtime` | string | **yes** | — | container runtime with a Docker-compatible CLI: `docker` \| `podman` \| `nerdctl` |
+| `extra_args` | string[] | no | — | extra runtime flags passed verbatim before the image; deployer-owned and may weaken isolation |
+
+Container settings are deployer-owned: Harbor passes `image`, `runtime`, and
+`extra_args` through without constraining them. The sandbox bounds a
+prompt-injected agent under those choices, not the deployer who wrote them. The
+runtime's default network applies unless `extra_args` overrides it. Runtime
+availability is platform-specific: `docker` runs natively on Linux and through
+Docker Desktop on macOS/Windows; `podman` natively on Linux and through `podman
+machine` on macOS/Windows; `nerdctl` requires containerd and is Linux-only. At
+startup Harbor checks the platform, probes `<runtime> info`, and fails startup
+when the binary or daemon/VM is unavailable.
 
 ### `telemetry`
 
@@ -262,7 +287,7 @@ non-git workdirs. Workdirs inside a git repository keep using git.
 | `display_name` | string | **yes** | — | card `name` text |
 | `description` | string | **yes** | — | card description text |
 | `version` | string | no | probed | card version (skips probing) |
-| `workdir` | string | no | Harbor cwd | project dir the CLI is started in (its project root); must exist |
+| `workdir` | string | **yes** | — | project dir the CLI is started in (its project root); must exist; `"."` means Harbor's working directory and is stored absolute |
 | `args` | string[] | exec/acp rules | — | launch args. `exec` must contain `{{.Prompt}}`; `acp` needs the ACP subcommand |
 | `env` | map | no | — | extra environment for the CLI |
 | `parser` | string | no | `text` | `exec` framing: `text` \| `stream-json` \| `codex` \| `regex` |
@@ -376,6 +401,6 @@ curl -s http://127.0.0.1:8080/agents/codebuddy/.well-known/agent-card.json | jq
 - **New output format (no code change):** use `exec` with `parser: regex`.
 - **New parser or adapter (Go):** register a parser via
   `internal/parser.RegisterParser` or a full CLI adapter via
-  `agent.RegisterAdapter` (compile-time `init()`); see docs/DESIGN.md §8.
+  `integration.RegisterAdapter` (compile-time `init()`); see docs/DESIGN.md §8.
 - **Runtime adapter plugin:** build a Go plugin exporting `Register()` and list
   it under `plugins:` (optional, requires cgo on linux/darwin/freebsd).

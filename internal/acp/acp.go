@@ -36,6 +36,7 @@ type Config struct {
 	InheritEnv      bool
 	CLIHome         string
 	Container       *agent.ContainerSpec
+	Runtime         *agent.Runtime
 	VersionArgs     []string
 	VersionOverride string
 }
@@ -51,7 +52,7 @@ type Launcher struct {
 func NewLauncher(cfg Config) *Launcher {
 	return &Launcher{
 		cfg:    cfg,
-		runner: agent.NewRunner(cfg.MaxConcurrent, cfg.InheritEnv, cfg.CLIHome, cfg.Container),
+		runner: agent.NewRunner(cfg.MaxConcurrent, cfg.InheritEnv, cfg.CLIHome, cfg.Container, cfg.Runtime),
 	}
 }
 

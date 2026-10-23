@@ -4,11 +4,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
-
-	"github.com/jiaweisky/harbor/internal/agent"
 )
-
-func init() { Register("claude", func(_ string) agent.Authenticator { return claude{} }) }
 
 // claude authenticates via an API key or OAuth token in the environment, or a
 // credentials file under CLAUDE_CONFIG_DIR. On macOS the login state otherwise

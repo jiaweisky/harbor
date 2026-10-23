@@ -12,6 +12,7 @@ import (
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/integration"
 	"github.com/jiaweisky/harbor/internal/session"
 )
@@ -33,7 +34,7 @@ func TestResumeFreshInjectsAnswer(t *testing.T) {
 		t.Fatalf("integration.New: %v", err)
 	}
 	exec := NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
-		config.LimitsConfig{Timeout: 10 * time.Second})
+		core.Limits{Timeout: 10 * time.Second})
 	h := a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

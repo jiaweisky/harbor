@@ -3,7 +3,6 @@ package agent
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -19,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/jiaweisky/harbor/internal/sandbox"
 	"github.com/jiaweisky/harbor/internal/telemetry"
 )
 
@@ -46,39 +46,9 @@ func (p *Process) stop() {
 	p.stopOnce.Do(func() { close(p.stopped) })
 }
 
-// ContainerSpec runs a CLI inside a container for filesystem and network
-// isolation. Mounts lists host directories bind-mounted at identical paths
-// inside the container (the sandbox roots the CLI may touch), so paths inside
-// the container match the host and env vars such as PWD stay valid.
-type ContainerSpec struct {
-	Runtime string // container runtime binary (e.g. docker, podman)
-	Image   string
-	Network string   // none | bridge
-	Mounts  []string // host directories bind-mounted at their identical paths
-}
-
-// Raw stream logging is a process-wide, best-effort setting: when a directory
-// is configured, each CLI process's stdout and stderr are written there for
-// replay/debugging.
-var (
-	rawMu   sync.Mutex
-	rawDir  string
-	rawGzip bool
-)
-
-// SetRawStream configures raw stream logging (empty dir disables it). It is
-// process-global and should be set once at startup.
-func SetRawStream(dir string, compress bool) {
-	rawMu.Lock()
-	defer rawMu.Unlock()
-	rawDir, rawGzip = dir, compress
-}
-
-func rawStreamConfig() (string, bool) {
-	rawMu.Lock()
-	defer rawMu.Unlock()
-	return rawDir, rawGzip
-}
+// ContainerSpec is the container sandbox for one agent. It is owned by the
+// sandbox package; the alias keeps existing callers on the same type.
+type ContainerSpec = sandbox.Container
 
 // Runner spawns and supervises CLI subprocesses.
 type Runner struct {
@@ -86,20 +56,30 @@ type Runner struct {
 	inheritEnv bool
 	cliHome    string
 	container  *ContainerSpec
-	procs      sync.Map // taskID -> *Process
+	procs      *ProcRegistry
+	raw        *RawStream
+	live       sync.Map // taskID -> *Process
 }
 
 // NewRunner creates a Runner limiting concurrency to maxConcurrent (<=0 =
 // unbounded). When inheritEnv is false the child receives only an allowlisted
 // base environment plus the adapter-provided variables. When cliHome is set the
 // child's HOME (and XDG dirs) are redirected under it. When container is set the
-// CLI runs inside a container instead of directly on the host.
-func NewRunner(maxConcurrent int, inheritEnv bool, cliHome string, container *ContainerSpec) *Runner {
+// CLI runs inside a container instead of directly on the host. rt supplies
+// orphan tracking and raw stream logging and may be nil.
+func NewRunner(
+	maxConcurrent int, inheritEnv bool, cliHome string, container *ContainerSpec, rt *Runtime,
+) *Runner {
 	var sem chan struct{}
 	if maxConcurrent > 0 {
 		sem = make(chan struct{}, maxConcurrent)
 	}
-	return &Runner{sem: sem, inheritEnv: inheritEnv, cliHome: cliHome, container: container}
+	r := &Runner{sem: sem, inheritEnv: inheritEnv, cliHome: cliHome, container: container}
+	if rt != nil {
+		r.procs = rt.Procs
+		r.raw = rt.Raw
+	}
+	return r
 }
 
 // Start runs the CLI and streams normalized events parsed from its stdout.
@@ -138,7 +118,7 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 	cmd.Stderr = sink
 
 	// Optional raw stream logging (best effort; failures are ignored).
-	rawOut, rawErr := openRawStreams(taskID)
+	rawOut, rawErr := r.raw.open(taskID)
 	if rawErr != nil {
 		cmd.Stderr = io.MultiWriter(sink, rawErr)
 	}
@@ -169,9 +149,9 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 		rawOut:  rawOut,
 		rawErr:  rawErr,
 	}
-	r.procs.Store(taskID, proc)
-	if reg := activeProcs(); reg != nil {
-		reg.Add(proc.pgid, proc.cmd.Path)
+	r.live.Store(taskID, proc)
+	if r.procs != nil {
+		r.procs.Add(proc.pgid, proc.cmd.Path)
 	}
 	go r.watchCancellation(ctx, proc)
 	go r.readLoop(stdout, p, out, stderr, proc, taskID)
@@ -198,29 +178,7 @@ func (r *Runner) command(inv *Invocation, env []string) (string, []string) {
 	if r.container == nil {
 		return inv.Bin, inv.Args
 	}
-	return r.container.command(inv, env)
-}
-
-// command builds the container runtime invocation: bind-mount the sandbox roots
-// at their host paths, set the working directory, forward the environment, then
-// run the CLI. Environment values are not placed on the runtime argv (world
-// readable via /proc): only the variable names are passed with -e, so the
-// runtime reads each value from its own (owner-only) environment.
-func (c *ContainerSpec) command(inv *Invocation, env []string) (string, []string) {
-	args := []string{"run", "--rm", "-i", "--network", c.Network}
-	for _, m := range c.Mounts {
-		args = append(args, "-v", m+":"+m)
-	}
-	if inv.Dir != "" {
-		args = append(args, "-w", inv.Dir)
-	}
-	for _, kv := range env {
-		key, _, _ := strings.Cut(kv, "=")
-		args = append(args, "-e", key)
-	}
-	args = append(args, c.Image, inv.Bin)
-	args = append(args, inv.Args...)
-	return c.Runtime, args
+	return r.container.Command(inv.Bin, inv.Args, inv.Dir, env)
 }
 
 // feedStdin copies an optional initial payload and, unless the invocation wants
@@ -258,10 +216,10 @@ func (r *Runner) readLoop(
 	defer proc.span.End()
 	defer closeRaw(proc.rawOut)
 	defer closeRaw(proc.rawErr)
-	defer r.procs.CompareAndDelete(taskID, proc)
+	defer r.live.CompareAndDelete(taskID, proc)
 	defer func() {
-		if reg := activeProcs(); reg != nil {
-			reg.Remove(proc.pgid)
+		if r.procs != nil {
+			r.procs.Remove(proc.pgid)
 		}
 	}()
 
@@ -320,7 +278,7 @@ func (r *Runner) watchCancellation(ctx context.Context, proc *Process) {
 
 // Kill terminates the process group for taskID (SIGTERM, then SIGKILL).
 func (r *Runner) Kill(taskID string) {
-	v, ok := r.procs.LoadAndDelete(taskID)
+	v, ok := r.live.LoadAndDelete(taskID)
 	if !ok {
 		return
 	}
@@ -336,7 +294,7 @@ func (r *Runner) Kill(taskID string) {
 
 // Stdin returns the process stdin for duplex sessions.
 func (r *Runner) Stdin(taskID string) io.WriteCloser {
-	if v, ok := r.procs.Load(taskID); ok {
+	if v, ok := r.live.Load(taskID); ok {
 		return v.(*Process).stdin
 	}
 	return nil
@@ -504,57 +462,6 @@ func (w *stderrWriter) Write(p []byte) (int, error) {
 }
 
 func (w *stderrWriter) String() string { return w.kept.String() }
-
-// openRawStreams opens the raw stdout/stderr logs for a task when raw stream
-// logging is configured; either may be nil on failure.
-func openRawStreams(taskID string) (io.WriteCloser, io.WriteCloser) {
-	dir, compress := rawStreamConfig()
-	if dir == "" {
-		return nil, nil
-	}
-	return openRawFile(filepath.Join(dir, taskID+".out"), compress),
-		openRawFile(filepath.Join(dir, taskID+".err"), compress)
-}
-
-func openRawFile(path string, compress bool) io.WriteCloser {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil
-	}
-	if compress {
-		path += ".gz"
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return nil
-	}
-	if !compress {
-		return f
-	}
-	return &gzipFile{gz: gzip.NewWriter(f), f: f}
-}
-
-// closeRaw closes a raw stream writer if set.
-func closeRaw(w io.WriteCloser) {
-	if w != nil {
-		_ = w.Close()
-	}
-}
-
-// gzipFile gzips writes and closes the underlying file with the gzip writer.
-type gzipFile struct {
-	gz *gzip.Writer
-	f  *os.File
-}
-
-func (g *gzipFile) Write(p []byte) (int, error) { return g.gz.Write(p) }
-
-func (g *gzipFile) Close() error {
-	err := g.gz.Close()
-	if e := g.f.Close(); err == nil {
-		err = e
-	}
-	return err
-}
 
 // limitedBuffer keeps at most max bytes; extra writes are dropped.
 type limitedBuffer struct {

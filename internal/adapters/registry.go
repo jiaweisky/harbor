@@ -1,11 +1,10 @@
 // Package adapters holds per-CLI implementations of Harbor's CLI-specific
-// behavior. Each supported coding-agent CLI lives in its own file and registers
-// itself by binary base name, so the rest of Harbor stays CLI-agnostic.
+// authentication behavior. Each supported coding-agent CLI lives in its own
+// file; the table below is the single place that maps a binary to it.
 package adapters
 
 import (
 	"path/filepath"
-	"sync"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 )
@@ -15,25 +14,17 @@ import (
 // without touching any other package.
 type Factory func(version string) agent.Authenticator
 
-var (
-	mu       sync.RWMutex
-	registry = map[string]Factory{}
-)
-
-// Register associates a CLI binary base name with its authenticator factory. It
-// is called from each adapter's init.
-func Register(binary string, f Factory) {
-	mu.Lock()
-	registry[binary] = f
-	mu.Unlock()
+var authenticators = map[string]Factory{
+	"claude":    func(string) agent.Authenticator { return claude{} },
+	"codebuddy": func(string) agent.Authenticator { return codebuddy{} },
+	"codex":     func(string) agent.Authenticator { return codex{} },
+	"opencode":  func(string) agent.Authenticator { return opencode{} },
 }
 
 // AuthFor returns the authenticator for a CLI binary path or name at the given
 // version.
 func AuthFor(binary, version string) (agent.Authenticator, bool) {
-	mu.RLock()
-	f, ok := registry[filepath.Base(binary)]
-	mu.RUnlock()
+	f, ok := authenticators[filepath.Base(binary)]
 	if !ok {
 		return nil, false
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/integration"
 	"github.com/jiaweisky/harbor/internal/session"
 	"github.com/jiaweisky/harbor/internal/workspace"
@@ -37,7 +38,7 @@ func opencodeHandlerWith(
 		t.Fatalf("integration.New: %v", err)
 	}
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), ws,
-		config.LimitsConfig{Timeout: timeout})
+		core.Limits{Timeout: timeout})
 	return a2asrv.NewHandler(exec, a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true}))
 }
 

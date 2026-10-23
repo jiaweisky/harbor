@@ -68,25 +68,11 @@ func (r *ProcRegistry) persistLocked() {
 	_ = os.Rename(tmp, r.path)
 }
 
-var (
-	procsMu  sync.Mutex
-	procsReg *ProcRegistry
-)
-
-// InitProcs enables orphan tracking for this process. It is called once at
-// startup, after SweepOrphans.
-func InitProcs(dir string) {
-	path := filepath.Join(dir, fmt.Sprintf("%s%d", procFilePrefix, os.Getpid()))
-	procsMu.Lock()
-	procsReg = newProcRegistry(path)
-	procsMu.Unlock()
-}
-
-// activeProcs returns the process registry, or nil when tracking is disabled.
-func activeProcs() *ProcRegistry {
-	procsMu.Lock()
-	defer procsMu.Unlock()
-	return procsReg
+// NewProcRegistry starts an empty registry for this process under dir. Records
+// of live siblings are left alone; records from crashed instances are handled by
+// SweepOrphans.
+func NewProcRegistry(dir string) *ProcRegistry {
+	return newProcRegistry(filepath.Join(dir, fmt.Sprintf("%s%d", procFilePrefix, os.Getpid())))
 }
 
 // SweepOrphans kills CLI process groups recorded by previous Harbor runs that

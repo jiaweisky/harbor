@@ -36,6 +36,7 @@ type HTTPConfig struct {
 	InheritEnv      bool
 	CLIHome         string
 	Container       *agent.ContainerSpec
+	Runtime         *agent.Runtime
 	VersionArgs     []string
 	VersionOverride string
 	Lifecycle       context.Context
@@ -58,7 +59,7 @@ func NewHTTPLauncher(cfg HTTPConfig) *HTTPLauncher {
 	}
 	return &HTTPLauncher{
 		cfg:    cfg,
-		runner: agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container),
+		runner: agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container, cfg.Runtime),
 		client: &http.Client{},
 	}
 }

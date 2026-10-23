@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/agent"
-	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/plugins"
+	"github.com/jiaweisky/harbor/internal/sandbox"
 	"github.com/jiaweisky/harbor/internal/server"
 	"github.com/jiaweisky/harbor/internal/telemetry"
 )
@@ -42,14 +42,16 @@ func run() error {
 	flag.Parse()
 
 	cfg := config.MustLoad(*cfgPath)
-	if err := bridge.RequireAuthOnExposedBind(
-		cfg.Server.Listen, cfg.Server.Auth.Mode, cfg.Server.AllowInsecure,
-	); err != nil {
-		return fmt.Errorf("refusing to start: %w", err)
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// A configured container sandbox must work before the server accepts tasks.
+	if ct := cfg.Sandbox.Container; ct != nil {
+		if err := sandbox.CheckRuntime(ctx, ct.Runtime); err != nil {
+			return fmt.Errorf("sandbox.container: %w", err)
+		}
+	}
 
 	// Install OTLP trace export when configured; the returned shutdown flushes
 	// pending spans on exit.
@@ -74,14 +76,12 @@ func run() error {
 		return fmt.Errorf("plugins: %w", err)
 	}
 
-	// Optional per-task raw stdout/stderr logging for replay/debugging.
-	agent.SetRawStream(cfg.Sandbox.RawStreamDir, cfg.Sandbox.RawStreamCompress)
-
-	// Clean up CLI processes left behind by a previous crash, then track ours.
+	// Clean up orphaned CLIs from a previous crash, then build the runtime that
+	// tracks this process's children and logs their raw streams.
 	agent.SweepOrphans(cfg.Sandbox.StateDir)
-	agent.InitProcs(cfg.Sandbox.StateDir)
+	rt := agent.NewRuntime(cfg.Sandbox.StateDir, cfg.Sandbox.RawStreamDir, cfg.Sandbox.RawStreamCompress)
 
-	servers, err := server.New(ctx, cfg)
+	servers, err := server.New(ctx, cfg, rt)
 	if err != nil {
 		return err
 	}

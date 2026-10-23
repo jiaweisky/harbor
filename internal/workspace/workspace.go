@@ -23,15 +23,92 @@ const (
 	IsolationCopy     Isolation = "copy"
 )
 
+// CopyStrategy selects how copy isolation provisions a context directory.
+type CopyStrategy string
+
+const (
+	// CopyFull copies the tree with Go's file APIs and works on every platform.
+	// Ownership, ACLs, xattrs, and mtimes are not preserved; symlinks need
+	// privileges on Windows.
+	CopyFull CopyStrategy = "full"
+	// CopyReflink clones extents where the OS and filesystem support it:
+	// FICLONE on btrfs/XFS, clonefile on APFS, ReFS block cloning on Windows.
+	CopyReflink CopyStrategy = "reflink"
+	// CopyOverlay mounts a host-side overlay or snapshot; overlayfs exists only
+	// on Linux.
+	CopyOverlay CopyStrategy = "overlay"
+	// CopyHardlink links files from the source. It requires one filesystem and
+	// is not an isolation boundary: in-place writes reach the source.
+	CopyHardlink CopyStrategy = "hardlink"
+)
+
+// isolationStrategy describes how one isolation mode provisions a context
+// directory.
+type isolationStrategy struct {
+	// provision creates dst from src. nil marks a recognized but unimplemented
+	// strategy; configuration rejects it.
+	provision func(src, dst string) error
+	// needsSource reports whether the original workdir must stay visible when
+	// the CLI runs in a container.
+	needsSource bool
+}
+
+// copyStrategies lists the copy implementations. Only full is implemented; the
+// other entries are recognized names pending an implementation. Whether an
+// implementation can run (OS, filesystem, privileges) is a runtime property and
+// must be probed when it is added, not inferred here.
+var copyStrategies = map[CopyStrategy]isolationStrategy{
+	CopyFull:     {provision: copyTree, needsSource: false},
+	CopyReflink:  {needsSource: false},
+	CopyOverlay:  {needsSource: false},
+	CopyHardlink: {needsSource: true},
+}
+
+// CopyStrategyKnown reports whether s is a recognized copy strategy.
+func CopyStrategyKnown(s CopyStrategy) bool {
+	_, ok := copyStrategies[s]
+	return ok
+}
+
+// CopyStrategyImplemented reports whether this build has an implementation. It
+// does not promise the strategy is usable on the current platform or filesystem;
+// that needs a runtime probe.
+func CopyStrategyImplemented(s CopyStrategy) bool {
+	st, ok := copyStrategies[s]
+	return ok && st.provision != nil
+}
+
+// selectStrategy resolves a configured mode to its implementation. ok is false
+// for unknown or unimplemented modes.
+func selectStrategy(isolation Isolation, copyStrategy CopyStrategy) (isolationStrategy, bool) {
+	switch isolation {
+	case IsolationShared:
+		return isolationStrategy{needsSource: true}, true
+	case IsolationWorktree:
+		return isolationStrategy{provision: gitWorktree, needsSource: true}, true
+	case IsolationCopy:
+		if copyStrategy == "" {
+			copyStrategy = CopyFull
+		}
+		st, ok := copyStrategies[copyStrategy]
+		return st, ok && st.provision != nil
+	default:
+		return isolationStrategy{}, false
+	}
+}
+
 // Resolver returns the working directory for a task from the agent's configured
 // project directory. Under worktree/copy isolation each context gets its own
 // copy of that directory.
 type Resolver struct {
 	// workdir is the configured project directory (the directory the CLI is
 	// started in). Empty means the CLI inherits Harbor's working directory.
-	workdir   string
-	isolation Isolation
-	isoRoot   string
+	workdir      string
+	isolation    Isolation
+	isoRoot      string
+	copyStrategy CopyStrategy
+	provision    func(src, dst string) error
+	needsSource  bool
 
 	mu    sync.Mutex
 	bound map[string]string // contextID -> resolved directory
@@ -40,22 +117,40 @@ type Resolver struct {
 
 // NewResolver creates a shared-isolation resolver for workdir.
 func NewResolver(workdir string) *Resolver {
-	return NewResolverWithIsolation(workdir, IsolationShared, "")
+	return NewResolverWithIsolation(workdir, IsolationShared, "", "")
 }
 
 // NewResolverWithIsolation creates a resolver with an isolation strategy.
-// worktree/copy need isolationRoot, where per-context copies are created.
-func NewResolverWithIsolation(workdir string, isolation Isolation, isolationRoot string) *Resolver {
+// worktree/copy need isolationRoot, where per-context copies are created;
+// copyStrategy selects the copy implementation (empty means full).
+func NewResolverWithIsolation(
+	workdir string, isolation Isolation, isolationRoot string, copyStrategy CopyStrategy,
+) *Resolver {
 	if isolation == "" {
 		isolation = IsolationShared
 	}
-	return &Resolver{
-		workdir:   workdir,
-		isolation: isolation,
-		isoRoot:   isolationRoot,
-		bound:     map[string]string{},
-		locks:     newLockSet(),
+	st, ok := selectStrategy(isolation, copyStrategy)
+	if !ok {
+		// Config validation rejects unknown or unimplemented modes; keep the
+		// source mounted and fail on Resolve for direct callers.
+		st.needsSource = true
 	}
+	return &Resolver{
+		workdir:      workdir,
+		isolation:    isolation,
+		isoRoot:      isolationRoot,
+		copyStrategy: copyStrategy,
+		provision:    st.provision,
+		needsSource:  st.needsSource,
+		bound:        map[string]string{},
+		locks:        newLockSet(),
+	}
+}
+
+// NeedsSourceMount reports whether the original workdir must be visible inside a
+// container. It is true unless the selected strategy is self-contained.
+func (r *Resolver) NeedsSourceMount() bool {
+	return r == nil || r.needsSource
 }
 
 // Resolve returns the working directory for a context: the configured workdir, or
@@ -89,14 +184,13 @@ func (r *Resolver) Resolve(contextID string) (string, error) {
 
 // isolate creates a per-context working copy of the configured workdir.
 func (r *Resolver) isolate(contextID string) (string, error) {
-	var provision func(src, dst string) error
-	switch r.isolation {
-	case IsolationWorktree:
-		provision = gitWorktree
-	case IsolationCopy:
-		provision = copyTree
-	default:
-		return "", fmt.Errorf("unknown isolation %q", r.isolation)
+	if r.provision == nil {
+		if r.isolation == IsolationCopy {
+			return "", fmt.Errorf(
+				"isolation %q with copy strategy %q is not implemented", r.isolation, r.copyStrategy,
+			)
+		}
+		return "", fmt.Errorf("isolation %q is not implemented", r.isolation)
 	}
 	if r.isoRoot == "" {
 		return "", fmt.Errorf("isolation_root is required for %q", r.isolation)
@@ -108,7 +202,7 @@ func (r *Resolver) isolate(contextID string) (string, error) {
 	if err := os.MkdirAll(r.isoRoot, 0o755); err != nil {
 		return "", err
 	}
-	if err := provision(r.workdir, dst); err != nil {
+	if err := r.provision(r.workdir, dst); err != nil {
 		return "", fmt.Errorf("%s: %w", r.isolation, err)
 	}
 	return dst, nil

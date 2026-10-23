@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,7 +36,7 @@ func TestIsolationWorktree(t *testing.T) {
 	runGit(t, repo, "add", ".")
 	runGit(t, repo, "commit", "-m", "init")
 
-	r := workspace.NewResolverWithIsolation(repo, workspace.IsolationWorktree, iso)
+	r := workspace.NewResolverWithIsolation(repo, workspace.IsolationWorktree, iso, "")
 	a, err := r.Resolve("ctx-a")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -72,7 +73,7 @@ func TestIsolationCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := workspace.NewResolverWithIsolation(src, workspace.IsolationCopy, iso)
+	r := workspace.NewResolverWithIsolation(src, workspace.IsolationCopy, iso, "")
 	a, err := r.Resolve("ctx-a")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -145,7 +146,7 @@ func TestEmptyWorkdirPassesThrough(t *testing.T) {
 func TestResolveBindsToContext(t *testing.T) {
 	repo := t.TempDir()
 	runGit(t, repo, "init")
-	r := workspace.NewResolverWithIsolation(repo, workspace.IsolationCopy, t.TempDir())
+	r := workspace.NewResolverWithIsolation(repo, workspace.IsolationCopy, t.TempDir(), "")
 
 	first, err := r.Resolve("ctx")
 	if err != nil {
@@ -157,5 +158,65 @@ func TestResolveBindsToContext(t *testing.T) {
 	}
 	if again != first {
 		t.Fatalf("context binding not reused: %q != %q", again, first)
+	}
+}
+
+func TestIsolationNeedsSourceMount(t *testing.T) {
+	cases := map[workspace.Isolation]bool{
+		"":                          true,
+		workspace.IsolationShared:   true,
+		workspace.IsolationWorktree: true,
+		workspace.IsolationCopy:     false,
+	}
+	for isolation, want := range cases {
+		r := workspace.NewResolverWithIsolation(t.TempDir(), isolation, t.TempDir(), "")
+		if got := r.NeedsSourceMount(); got != want {
+			t.Errorf("%q: NeedsSourceMount() = %v, want %v", isolation, got, want)
+		}
+	}
+	var nilResolver *workspace.Resolver
+	if !nilResolver.NeedsSourceMount() {
+		t.Error("nil resolver must require the source mount")
+	}
+}
+
+func TestUnknownIsolationFailsResolve(t *testing.T) {
+	r := workspace.NewResolverWithIsolation(t.TempDir(), "not-implemented", t.TempDir(), "")
+	if !r.NeedsSourceMount() {
+		t.Error("unknown isolation must keep the source mounted")
+	}
+	if _, err := r.Resolve("ctx"); err == nil || !strings.Contains(err.Error(), "not implemented") {
+		t.Fatalf("Resolve error = %v, want a not-implemented error", err)
+	}
+}
+
+func TestCopyStrategyState(t *testing.T) {
+	if !workspace.CopyStrategyKnown(workspace.CopyFull) || !workspace.CopyStrategyImplemented(workspace.CopyFull) {
+		t.Error("full copy must be known and implemented")
+	}
+	for _, s := range []workspace.CopyStrategy{
+		workspace.CopyReflink, workspace.CopyOverlay, workspace.CopyHardlink,
+	} {
+		if !workspace.CopyStrategyKnown(s) || workspace.CopyStrategyImplemented(s) {
+			t.Errorf("%q: known = %v, implemented = %v; want known and unimplemented",
+				s, workspace.CopyStrategyKnown(s), workspace.CopyStrategyImplemented(s))
+		}
+	}
+	if workspace.CopyStrategyKnown("bogus") {
+		t.Error("bogus must not be a known copy strategy")
+	}
+}
+
+func TestUnimplementedCopyStrategyFailsResolve(t *testing.T) {
+	for _, s := range []workspace.CopyStrategy{
+		workspace.CopyReflink, workspace.CopyOverlay, workspace.CopyHardlink,
+	} {
+		r := workspace.NewResolverWithIsolation(t.TempDir(), workspace.IsolationCopy, t.TempDir(), s)
+		if !r.NeedsSourceMount() {
+			t.Errorf("%q: unimplemented copy must keep the source mounted", s)
+		}
+		if _, err := r.Resolve("ctx"); err == nil || !strings.Contains(err.Error(), "not implemented") {
+			t.Errorf("%q: Resolve error = %v, want a not-implemented error", s, err)
+		}
 	}
 }

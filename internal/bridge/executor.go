@@ -24,7 +24,7 @@ import (
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/changes"
-	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/telemetry"
 	"github.com/jiaweisky/harbor/internal/workspace"
 )
@@ -242,7 +242,7 @@ func (s *taskState) takeReap() context.CancelFunc {
 // task duration and the failure circuit breaker.
 func NewCLIExecutor(
 	ln agent.Launcher, sessions SessionStore, live *agent.LiveSessions,
-	ws *workspace.Resolver, limits config.LimitsConfig,
+	ws *workspace.Resolver, limits core.Limits,
 ) *CLIExecutor {
 	return &CLIExecutor{
 		launcher:    ln,

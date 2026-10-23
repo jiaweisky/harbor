@@ -35,6 +35,7 @@ type Config struct {
 	InheritEnv      bool
 	CLIHome         string
 	Container       *agent.ContainerSpec
+	Runtime         *agent.Runtime
 	Auth            agent.Authenticator
 	VersionArgs     []string
 	VersionOverride string
@@ -57,7 +58,7 @@ func NewServerLauncher(lifecycle context.Context, cfg Config) *Launcher {
 	}
 	return &Launcher{
 		cfg:       cfg,
-		runner:    agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container),
+		runner:    agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container, cfg.Runtime),
 		lifecycle: lifecycle,
 		client:    &http.Client{},
 	}

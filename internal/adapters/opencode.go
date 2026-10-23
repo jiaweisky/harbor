@@ -1,9 +1,5 @@
 package adapters
 
-import "github.com/jiaweisky/harbor/internal/agent"
-
-func init() { Register("opencode", func(_ string) agent.Authenticator { return opencode{} }) }
-
 // opencode resolves providers from its own configuration (opencode.json) and
 // the environment, so it is usable without a stored ticket and readiness must
 // not be gated on one.

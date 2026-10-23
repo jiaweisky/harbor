@@ -14,7 +14,7 @@ func TestSpawnServerReadsStderrEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewRunner(0, true, "", nil)
+	r := NewRunner(0, true, "", nil, nil)
 	defer r.Kill("t")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

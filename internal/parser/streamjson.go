@@ -199,7 +199,3 @@ func deltaText(rec []byte) (text, thinking string) {
 	}
 	return e.Event.Delta.Text, e.Event.Delta.Thinking
 }
-
-func init() {
-	RegisterParser("stream-json", func(string) (agent.Parser, error) { return NewStreamJSON(), nil })
-}

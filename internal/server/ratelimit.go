@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
 )
 
@@ -96,7 +95,7 @@ func (l *rateLimiter) middleware(agentID string, next http.Handler) http.Handler
 // address is used, so rotating a header cannot mint fresh buckets.
 func (l *rateLimiter) callerKey(r *http.Request) string {
 	if l.authEnabled {
-		if tok, ok := bridge.BearerToken(r.Header.Get("Authorization")); ok {
+		if tok, ok := BearerToken(r.Header.Get("Authorization")); ok {
 			return tokenKey(tok)
 		}
 	}

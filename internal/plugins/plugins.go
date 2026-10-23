@@ -1,7 +1,7 @@
 //go:build cgo && (linux || darwin || freebsd)
 
 // Package plugins loads Go plugins that register additional CLI adapters at
-// runtime (see agent.RegisterAdapter). It is an optional, experimental extension
+// runtime (see integration.RegisterAdapter). It is an optional, experimental extension
 // point: a plugin must export a function named "Register" with type func(),
 // which registers its adapters.
 package plugins

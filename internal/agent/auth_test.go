@@ -9,7 +9,7 @@ import (
 )
 
 func TestRunnerEnvRoots(t *testing.T) {
-	r := agent.NewRunner(0, true, "/base/home", nil)
+	r := agent.NewRunner(0, true, "/base/home", nil, nil)
 	if got := r.AuthBase(); got != "/base/home" {
 		t.Errorf("AuthBase() = %q", got)
 	}
@@ -28,7 +28,7 @@ func TestRunnerEnvRoots(t *testing.T) {
 }
 
 func TestAuthBaseFallsBackToRealHome(t *testing.T) {
-	r := agent.NewRunner(0, true, "", nil)
+	r := agent.NewRunner(0, true, "", nil, nil)
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Skip("no user home")
