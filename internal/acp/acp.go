@@ -20,6 +20,7 @@ import (
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/jsonrpc"
+	"github.com/jiaweisky/harbor/internal/sandbox"
 )
 
 // protocolVersion is the ACP protocol version Harbor speaks.
@@ -35,7 +36,7 @@ type Config struct {
 	MaxConcurrent   int
 	InheritEnv      bool
 	CLIHome         string
-	Container       *agent.ContainerSpec
+	Container       *sandbox.Container
 	Runtime         *agent.Runtime
 	VersionArgs     []string
 	VersionOverride string

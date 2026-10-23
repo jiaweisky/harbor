@@ -9,6 +9,8 @@ import (
 	"io"
 	"os/exec"
 	"sync/atomic"
+
+	"github.com/jiaweisky/harbor/internal/sandbox"
 )
 
 // ErrUnsupported indicates the session cannot accept out-of-band input.
@@ -40,7 +42,7 @@ type LauncherConfig struct {
 	// CLIHome, when set, isolates the CLI's HOME and config roots under it.
 	CLIHome string
 	// Container, when set, runs the CLI inside a container.
-	Container *ContainerSpec
+	Container *sandbox.Container
 	// Runtime supplies orphan tracking and raw stream logging (may be nil).
 	Runtime *Runtime
 	// VersionArgs is the flag(s) used to read the CLI version; nil skips probing.

@@ -3,13 +3,15 @@ package agent
 import (
 	"reflect"
 	"testing"
+
+	"github.com/jiaweisky/harbor/internal/sandbox"
 )
 
 // TestContainerSpecCommand verifies the container runtime argv: flags, mounts at
 // host paths, working directory, environment forwarding by name, deployer
 // ExtraArgs, image, and the wrapped CLI command.
 func TestContainerSpecCommand(t *testing.T) {
-	c := &ContainerSpec{
+	c := &sandbox.Container{
 		Runtime: "docker", Image: "img:latest",
 		Mounts:    []string{"/srv/work", "/home/cli"},
 		ExtraArgs: []string{"--read-only", "--pids-limit=512"},
@@ -38,7 +40,7 @@ func TestContainerSpecCommand(t *testing.T) {
 // TestContainerSpecCommandMinimal verifies a container run without mounts or a
 // workdir emits neither mounts nor -w.
 func TestContainerSpecCommandMinimal(t *testing.T) {
-	c := &ContainerSpec{Runtime: "podman", Image: "img"}
+	c := &sandbox.Container{Runtime: "podman", Image: "img"}
 	inv := &Invocation{Bin: "codex", Args: []string{"exec"}}
 
 	bin, args := c.Command(inv.Bin, inv.Args, inv.Dir, nil)

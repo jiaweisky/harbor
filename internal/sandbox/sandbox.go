@@ -17,26 +17,10 @@ import (
 
 // Container describes one agent's container sandbox.
 type Container struct {
-	Runtime   string // runtime binary (docker, podman, nerdctl, or a wrapper)
+	Runtime   string // runtime binary (docker, podman, nerdctl)
 	Image     string
 	Mounts    []string // host roots bind-mounted at their identical paths
 	ExtraArgs []string // deployer-provided runtime flags
-}
-
-// Mounts builds the bind-mount list. The source workdir is mounted only when the
-// isolation strategy needs it; the isolation root and CLI home are always
-// mounted when set.
-func Mounts(workdir string, needsSource bool, isolationRoot, cliHome string) []string {
-	var mounts []string
-	if needsSource && workdir != "" {
-		mounts = append(mounts, workdir)
-	}
-	for _, m := range []string{isolationRoot, cliHome} {
-		if m != "" {
-			mounts = append(mounts, m)
-		}
-	}
-	return mounts
 }
 
 // Command builds the runtime invocation: bind-mount the sandbox roots at their
@@ -50,17 +34,44 @@ func (c *Container) Command(bin string, args []string, dir string, env []string)
 	for _, m := range c.Mounts {
 		argv = append(argv, "-v", m+":"+m)
 	}
+
 	if dir != "" {
 		argv = append(argv, "-w", dir)
 	}
+
 	for _, kv := range env {
 		key, _, _ := strings.Cut(kv, "=")
 		argv = append(argv, "-e", key)
 	}
+
 	argv = append(argv, c.ExtraArgs...)
 	argv = append(argv, c.Image, bin)
 	argv = append(argv, args...)
 	return c.Runtime, argv
+}
+
+// Mounts builds the bind-mount list. The source workdir is mounted only when the
+// isolation strategy needs it; the isolation root and CLI home are always
+// mounted when set. A path that appears more than once is mounted once.
+func Mounts(workdir string, needsSource bool, isolationRoot, cliHome string) []string {
+	var mounts []string
+	add := func(path string) {
+		if path == "" {
+			return
+		}
+		for _, existing := range mounts {
+			if existing == path {
+				return
+			}
+		}
+		mounts = append(mounts, path)
+	}
+	if needsSource {
+		add(workdir)
+	}
+	add(isolationRoot)
+	add(cliHome)
+	return mounts
 }
 
 // infoTimeout bounds the startup probe of the container runtime.
@@ -70,35 +81,65 @@ const infoTimeout = 10 * time.Second
 // binary exists, and its daemon or VM is reachable. It runs once at startup so a
 // broken container sandbox fails before the first task instead of at task time.
 func CheckRuntime(ctx context.Context, rt core.ContainerRuntime) error {
-	switch rt {
-	case core.ContainerRuntimeDocker, core.ContainerRuntimePodman:
-		// Native on Linux; macOS and Windows run them through a VM.
-	case core.ContainerRuntimeNerdctl:
-		if runtime.GOOS != "linux" {
-			return fmt.Errorf("runtime %q is only supported on Linux", rt)
-		}
-	default:
-		return fmt.Errorf("runtime %q is not supported", rt)
+	if err := checkPlatform(runtime.GOOS, rt); err != nil {
+		return err
 	}
 	path, err := exec.LookPath(string(rt))
 	if err != nil {
 		return fmt.Errorf("runtime %q not found: %w", rt, err)
 	}
+
 	probeCtx, cancel := context.WithTimeout(ctx, infoTimeout)
 	defer cancel()
+
 	out, err := exec.CommandContext(probeCtx, path, "info").CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("runtime %q info probe: %w", rt, ctxErr)
+	}
 	if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("runtime %q did not answer info within %s", rt, infoTimeout)
 	}
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if i := strings.IndexByte(msg, '\n'); i >= 0 {
-			msg = strings.TrimSpace(msg[:i])
+	if msg := lastOutputLine(out); msg != "" {
+		return fmt.Errorf("runtime %q is not reachable: %w: %s", rt, err, msg)
+	}
+	return fmt.Errorf("runtime %q is not reachable: %w", rt, err)
+}
+
+// checkPlatform reports whether rt can run the container sandbox on goos.
+// Binding host paths at identical container paths requires a Linux host or a VM
+// that exposes those paths unchanged; native Windows cannot satisfy that.
+func checkPlatform(goos string, rt core.ContainerRuntime) error {
+	switch rt {
+	case core.ContainerRuntimeDocker, core.ContainerRuntimePodman:
+		// Native on Linux; macOS exposes host paths unchanged through its VM.
+		if goos == "windows" {
+			return fmt.Errorf(
+				"runtime %q is not supported for the container sandbox on Windows: "+
+					"run Harbor in WSL so host paths are valid inside the Linux container",
+				rt,
+			)
 		}
-		if msg != "" {
-			return fmt.Errorf("runtime %q is not reachable: %w: %s", rt, err, msg)
+	case core.ContainerRuntimeNerdctl:
+		if goos != "linux" {
+			return fmt.Errorf("runtime %q is only supported on Linux", rt)
 		}
-		return fmt.Errorf("runtime %q is not reachable: %w", rt, err)
+	default:
+		return fmt.Errorf("runtime %q is not supported", rt)
 	}
 	return nil
+}
+
+// lastOutputLine returns the last non-empty line of a runtime's combined output,
+// where the actual failure usually appears after any warnings.
+func lastOutputLine(out []byte) string {
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return line
+		}
+	}
+	return ""
 }

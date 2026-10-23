@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/sandbox"
 )
 
 type nopParser struct{}
@@ -120,7 +121,7 @@ func TestRunnerContainerRunsCLI(t *testing.T) {
 
 	dir := t.TempDir()
 	r := agent.NewRunner(1, true, "",
-		&agent.ContainerSpec{
+		&sandbox.Container{
 			Runtime: script, Image: "fakeimage", Mounts: []string{dir},
 			ExtraArgs: []string{"--read-only"},
 		}, nil)

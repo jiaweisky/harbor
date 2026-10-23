@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/sandbox"
 )
 
 // serverStartTimeout bounds how long to wait for a spawned server to listen.
@@ -34,7 +35,7 @@ type Config struct {
 	Env             []string
 	InheritEnv      bool
 	CLIHome         string
-	Container       *agent.ContainerSpec
+	Container       *sandbox.Container
 	Runtime         *agent.Runtime
 	Auth            agent.Authenticator
 	VersionArgs     []string

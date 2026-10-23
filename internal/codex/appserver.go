@@ -14,6 +14,7 @@ import (
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/jsonrpc"
+	"github.com/jiaweisky/harbor/internal/sandbox"
 )
 
 // Config configures a codex app-server launcher.
@@ -23,7 +24,7 @@ type Config struct {
 	Env             []string
 	InheritEnv      bool
 	CLIHome         string
-	Container       *agent.ContainerSpec
+	Container       *sandbox.Container
 	Runtime         *agent.Runtime
 	Auth            agent.Authenticator
 	VersionArgs     []string

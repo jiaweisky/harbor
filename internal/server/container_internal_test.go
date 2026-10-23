@@ -4,8 +4,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/sandbox"
 	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
@@ -37,7 +37,7 @@ func TestContainerSpecFromSandbox(t *testing.T) {
 				workspace.NewResolverWithIsolation(
 					"/srv/work", tc.isolation, "/srv/iso", s.CopyStrategy,
 				).NeedsSourceMount())
-			want := &agent.ContainerSpec{
+			want := &sandbox.Container{
 				Runtime: "docker", Image: "img:latest",
 				Mounts:    tc.want,
 				ExtraArgs: []string{"--read-only"},

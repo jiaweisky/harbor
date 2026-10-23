@@ -15,11 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jiaweisky/harbor/internal/sandbox"
-	"github.com/jiaweisky/harbor/internal/telemetry"
 )
 
 // ErrCLINotFound indicates the CLI binary is missing or not executable.
@@ -46,16 +46,12 @@ func (p *Process) stop() {
 	p.stopOnce.Do(func() { close(p.stopped) })
 }
 
-// ContainerSpec is the container sandbox for one agent. It is owned by the
-// sandbox package; the alias keeps existing callers on the same type.
-type ContainerSpec = sandbox.Container
-
 // Runner spawns and supervises CLI subprocesses.
 type Runner struct {
 	sem        chan struct{}
 	inheritEnv bool
 	cliHome    string
-	container  *ContainerSpec
+	container  *sandbox.Container
 	procs      *ProcRegistry
 	raw        *RawStream
 	live       sync.Map // taskID -> *Process
@@ -68,7 +64,7 @@ type Runner struct {
 // CLI runs inside a container instead of directly on the host. rt supplies
 // orphan tracking and raw stream logging and may be nil.
 func NewRunner(
-	maxConcurrent int, inheritEnv bool, cliHome string, container *ContainerSpec, rt *Runtime,
+	maxConcurrent int, inheritEnv bool, cliHome string, container *sandbox.Container, rt *Runtime,
 ) *Runner {
 	var sem chan struct{}
 	if maxConcurrent > 0 {
@@ -125,9 +121,10 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 
 	// One span per CLI subprocess, linked to the requesting task's span via ctx.
 	// It ends when the process exits (see readLoop).
-	ctx, span := telemetry.Start(ctx, "harbor.cli",
+	ctx, span := otel.Tracer("harbor").Start(ctx, "harbor.cli", trace.WithAttributes(
 		attribute.String("process.executable.name", filepath.Base(inv.Bin)),
-		attribute.String("harbor.workdir", inv.Dir))
+		attribute.String("harbor.workdir", inv.Dir),
+	))
 
 	if err := cmd.Start(); err != nil {
 		span.End()

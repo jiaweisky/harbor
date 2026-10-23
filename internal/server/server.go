@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -49,7 +50,7 @@ func sessionStore(sc config.ServerConfig, agentID string) (bridge.SessionStore, 
 // containerSpec builds the runner's container sandbox from the configuration, or
 // nil when no container is configured. The sandbox package owns the mount
 // policy; shared/worktree isolation needs the source workdir, copy does not.
-func containerSpec(s config.SandboxConfig, workdir string, needsSource bool) *agent.ContainerSpec {
+func containerSpec(s config.SandboxConfig, workdir string, needsSource bool) *sandbox.Container {
 	if s.Container == nil {
 		return nil
 	}
@@ -67,16 +68,18 @@ func containerSpec(s config.SandboxConfig, workdir string, needsSource bool) *ag
 // when enabled, protects only the JSON-RPC endpoints. rt supplies orphan
 // tracking and raw stream logging and may be nil for tests or embedding.
 func NewHandler(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (http.Handler, error) {
-	servers, err := New(ctx, cfg, rt)
+	servers, err := newServers(ctx, cfg, rt)
 	if err != nil {
 		return nil, err
 	}
 	return servers.HTTP, nil
 }
 
-// Servers bundles the HTTP handler and the resources the caller must release.
+// Servers bundles the HTTP handler, TLS configuration, and the resources the
+// caller must release.
 type Servers struct {
-	HTTP http.Handler
+	HTTP      http.Handler
+	TLSConfig *tls.Config
 
 	closers []io.Closer
 }
@@ -84,8 +87,27 @@ type Servers struct {
 // Close releases resources held by the servers, such as SQLite stores.
 func (s *Servers) Close() error { return closeAll(s.closers) }
 
-// New builds the HTTP handler for the configured agents.
+// New builds the HTTP handler for the configured agents and loads the listener
+// TLS configuration.
 func New(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Servers, error) {
+	tlsConfig, err := tlsConfigFor(cfg.Server.TLS)
+	if err != nil {
+		return nil, fmt.Errorf("server tls: %w", err)
+	}
+	servers, err := newServers(ctx, cfg, rt)
+	if err != nil {
+		return nil, err
+	}
+	servers.TLSConfig = tlsConfig
+	return servers, nil
+}
+
+// newServers builds the handler and releasable resources without reading
+// listener files, so callers that only need a handler are not coupled to TLS.
+func newServers(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Servers, error) {
+	if err := workspace.CheckCopyStrategy(cfg.Sandbox.Isolation, cfg.Sandbox.CopyStrategy); err != nil {
+		return nil, err
+	}
 	auth, err := authMiddleware(cfg.Server.Auth)
 	if err != nil {
 		return nil, err

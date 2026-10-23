@@ -14,6 +14,7 @@ import (
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/jsonrpc"
+	"github.com/jiaweisky/harbor/internal/sandbox"
 )
 
 // serveStartTimeout bounds how long to wait for a spawned server to listen.
@@ -35,7 +36,7 @@ type HTTPConfig struct {
 	Auth            agent.Authenticator
 	InheritEnv      bool
 	CLIHome         string
-	Container       *agent.ContainerSpec
+	Container       *sandbox.Container
 	Runtime         *agent.Runtime
 	VersionArgs     []string
 	VersionOverride string
