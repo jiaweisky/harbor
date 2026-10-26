@@ -24,6 +24,10 @@ import (
 // shutdownTimeout bounds graceful shutdown after a termination signal.
 const shutdownTimeout = 10 * time.Second
 
+// version is the harbor build version, overridable at link time with
+// -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		slog.Error("harbor exited with error", "err", err)
@@ -36,7 +40,13 @@ func main() {
 // request, so canceling it tears down in-flight tasks and their CLI processes.
 func run() error {
 	cfgPath := flag.String("config", "examples/agents.yaml", "path to agents.yaml")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return nil
+	}
 
 	cfg, err := cli.Load(*cfgPath)
 	if err != nil {
