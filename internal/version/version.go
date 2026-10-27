@@ -22,6 +22,7 @@ func Less(a, b string) (bool, bool) {
 	if !oka || !okb {
 		return false, false
 	}
+
 	return semver.Compare(ca, cb) < 0, true
 }
 
@@ -32,6 +33,8 @@ func canonical(s string) (string, bool) {
 		v := semver.Canonical("v" + m)
 		return v, v != ""
 	}
+
 	v := semver.Canonical(strings.TrimSpace(s))
+
 	return v, v != ""
 }
