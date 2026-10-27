@@ -19,6 +19,7 @@ func NewRegex(pattern string) (*Regex, error) {
 	if err != nil {
 		return nil, fmt.Errorf("regex parser: %w", err)
 	}
+
 	return &Regex{re: re}, nil
 }
 
@@ -28,13 +29,16 @@ func (p *Regex) Parse(rec []byte, out func(agent.Event)) error {
 	if m == nil {
 		return nil
 	}
+
 	text := m[0]
 	if len(m) > 1 {
 		text = m[1]
 	}
+
 	if len(text) > 0 {
 		out(agent.Event{Kind: agent.EventTextDelta, Text: string(text) + "\n", Raw: rec})
 	}
+
 	return nil
 }
 

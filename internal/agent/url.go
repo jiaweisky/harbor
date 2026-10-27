@@ -7,15 +7,19 @@ import "strings"
 // carry ANSI color codes and trailing text).
 func ListenURL(line string) (string, bool) {
 	i := strings.Index(line, "http://")
+
 	if i < 0 {
 		i = strings.Index(line, "https://")
 	}
+
 	if i < 0 {
 		return "", false
 	}
+
 	rest := line[i:]
 	if j := strings.IndexAny(rest, " \t\r\n"); j >= 0 {
 		rest = rest[:j]
 	}
+
 	return strings.TrimRight(rest, "/"), true
 }

@@ -44,14 +44,19 @@ func processAlive(pid int) bool {
 // reused PID is never killed by mistake.
 func processMatches(pid int, binary string) bool {
 	want := filepath.Base(binary)
+
 	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
 		argv0, _, _ := bytes.Cut(data, []byte{0})
+
 		return len(argv0) > 0 && filepath.Base(string(argv0)) == want
 	}
+
 	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
 	if err != nil {
 		return false
 	}
+
 	fields := strings.Fields(strings.TrimSpace(string(out)))
+
 	return len(fields) > 0 && filepath.Base(fields[0]) == want
 }

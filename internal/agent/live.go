@@ -15,6 +15,7 @@ func (l *LiveSessions) Get(taskID string) (Session, bool) {
 	if !ok {
 		return nil, false
 	}
+
 	return v.(Session), true
 }
 

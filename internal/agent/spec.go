@@ -143,32 +143,42 @@ type Capabilities struct {
 // InputModes projects input capabilities onto A2A MIME modes.
 func (c Capabilities) InputModes() []string {
 	modes := []string{}
+
 	if c.InputText {
 		modes = append(modes, "text/plain")
 	}
+
 	modes = append(modes, c.InputImage...)
+
 	if c.InputFile {
 		modes = append(modes, "application/octet-stream")
 	}
+
 	if c.InputData {
 		modes = append(modes, "application/json")
 	}
+
 	return modes
 }
 
 // OutputModes projects output capabilities onto A2A MIME modes.
 func (c Capabilities) OutputModes() []string {
 	modes := []string{}
+
 	if c.OutputText {
 		modes = append(modes, "text/plain")
 	}
+
 	if c.OutputData {
 		modes = append(modes, "application/json")
 	}
+
 	if c.OutputFile {
 		modes = append(modes, "text/x-diff")
 	}
+
 	modes = append(modes, c.OutputImage...)
+
 	return modes
 }
 
@@ -224,5 +234,6 @@ func FirstNonEmpty(values ...string) string {
 			return v
 		}
 	}
+
 	return ""
 }

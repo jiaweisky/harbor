@@ -37,15 +37,19 @@ func CheckStatus(ctx context.Context, binary string, env []string, auth Authenti
 	if auth == nil {
 		return true
 	}
+
 	args := auth.StatusArgs()
 	if len(args) == 0 {
 		return true
 	}
+
 	ctx, cancel := context.WithTimeout(ctx, authProbeTimeout)
 	defer cancel()
+
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
+
 	return auth.LoggedInStatus(string(out), err)
 }
 
@@ -57,9 +61,11 @@ func Authenticated(ctx context.Context, binary, home string, env []string, auth 
 	if auth == nil {
 		return true
 	}
+
 	if len(auth.StatusArgs()) > 0 {
 		return CheckStatus(ctx, binary, env, auth)
 	}
+
 	return auth.LoggedIn(home, EnvMap(env))
 }
 
@@ -78,5 +84,6 @@ func EnvMap(env []string) map[string]string {
 			m[k] = v
 		}
 	}
+
 	return m
 }

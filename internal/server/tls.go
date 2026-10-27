@@ -15,10 +15,12 @@ func tlsConfigFor(cfg config.TLSConfig) (*tls.Config, error) {
 	if cfg.CertFile == "" {
 		return nil, nil
 	}
+
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
 		return nil, err
 	}
+
 	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
 	if cfg.CAFile != "" {
 		pem, err := os.ReadFile(cfg.CAFile)
@@ -31,8 +33,10 @@ func tlsConfigFor(cfg config.TLSConfig) (*tls.Config, error) {
 		}
 		tlsCfg.ClientCAs = pool
 	}
+
 	if cfg.ClientAuth {
 		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
 	}
+
 	return tlsCfg, nil
 }

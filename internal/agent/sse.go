@@ -13,8 +13,10 @@ import (
 func ReadSSE(r io.Reader, fn func(event, data string) bool) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+
 	var event string
 	var data []string
+
 	dispatch := func() bool {
 		if event == "" && len(data) == 0 {
 			return true
@@ -23,6 +25,7 @@ func ReadSSE(r io.Reader, fn func(event, data string) bool) error {
 		event, data = "", nil
 		return ok
 	}
+
 	for sc.Scan() {
 		line := sc.Text()
 		switch {
@@ -38,6 +41,8 @@ func ReadSSE(r io.Reader, fn func(event, data string) bool) error {
 			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		}
 	}
+
 	dispatch()
+
 	return sc.Err()
 }

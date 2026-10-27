@@ -24,9 +24,11 @@ func (p *StreamJSON) parseControlRequest(rec []byte, out func(agent.Event)) {
 			RequestedSchema map[string]any `json:"requestedSchema"`
 		} `json:"request"`
 	}
+
 	if json.Unmarshal(rec, &m) != nil || m.RequestID == "" {
 		return
 	}
+
 	switch m.Request.Subtype {
 	case "can_use_tool":
 		switch m.Request.ToolName {
@@ -50,6 +52,7 @@ func planEvent(id string, input map[string]any, raw []byte) agent.Event {
 	if plan != "" {
 		text = "plan approval required:\n" + plan
 	}
+
 	return agent.Event{
 		Kind:      agent.EventPermissionRequest,
 		Text:      text,
@@ -78,10 +81,12 @@ func formEvent(id, message string, schema map[string]any, raw []byte) agent.Even
 		Schema: schema,
 		Resume: true,
 	}
+
 	// A single-choice form exposes its options directly.
 	if len(fields) == 1 && len(fields[0].enum) > 0 {
 		itx.Options = fields[0].enum
 	}
+
 	return agent.Event{
 		Kind:        agent.EventPermissionRequest,
 		Text:        formText(message, fields),
@@ -104,11 +109,13 @@ func formFields(schema map[string]any) []formField {
 	if len(props) == 0 {
 		return nil
 	}
+
 	names := make([]string, 0, len(props))
 	for name := range props {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+
 	fields := make([]formField, 0, len(names))
 	for _, name := range names {
 		p, _ := props[name].(map[string]any)
@@ -122,6 +129,7 @@ func formFields(schema map[string]any) []formField {
 		}
 		fields = append(fields, f)
 	}
+
 	return fields
 }
 
@@ -130,6 +138,7 @@ func formText(message string, fields []formField) string {
 	if len(fields) == 0 {
 		return message
 	}
+
 	var b strings.Builder
 	b.WriteString(message)
 	b.WriteString(" (reply with a content object keyed by field:")
@@ -140,6 +149,7 @@ func formText(message string, fields []formField) string {
 		}
 	}
 	b.WriteString(")")
+
 	return b.String()
 }
 
@@ -199,6 +209,7 @@ func interactionQuestions(qs []askUserQuestion) []agent.Question {
 	if len(qs) == 0 {
 		return nil
 	}
+
 	out := make([]agent.Question, 0, len(qs))
 	for _, q := range qs {
 		out = append(out, agent.Question{
@@ -207,6 +218,7 @@ func interactionQuestions(qs []askUserQuestion) []agent.Question {
 			Options:  questionLabels(q),
 		})
 	}
+
 	return out
 }
 
@@ -216,8 +228,10 @@ func askUserQuestions(input map[string]any) []askUserQuestion {
 	if err != nil {
 		return nil
 	}
+
 	var qs []askUserQuestion
 	_ = json.Unmarshal(b, &qs)
+
 	return qs
 }
 
@@ -226,6 +240,7 @@ func firstQuestionText(qs []askUserQuestion) string {
 	if len(qs) == 0 {
 		return ""
 	}
+
 	return qs[0].Question
 }
 
@@ -234,6 +249,7 @@ func firstQuestionOptions(qs []askUserQuestion) []string {
 	if len(qs) == 0 {
 		return nil
 	}
+
 	return questionLabels(qs[0])
 }
 
@@ -245,6 +261,7 @@ func questionLabels(q askUserQuestion) []string {
 			labels = append(labels, o.Label)
 		}
 	}
+
 	return labels
 }
 
@@ -253,16 +270,20 @@ func questionText(qs []askUserQuestion) string {
 	if len(qs) == 0 {
 		return "the agent is asking a question"
 	}
+
 	var b strings.Builder
 	for i, q := range qs {
 		if i > 0 {
 			b.WriteString("; ")
 		}
+
 		b.WriteString(q.Question)
+
 		if labels := questionLabels(q); len(labels) > 0 {
 			b.WriteString(" [" + strings.Join(labels, ", ") + "]")
 		}
 	}
+
 	return b.String()
 }
 
@@ -272,6 +293,7 @@ func permissionText(tool string, input map[string]any) string {
 	if t := permissionTarget(input); t != "" {
 		s += " (" + t + ")"
 	}
+
 	return s + " - reply allow or deny"
 }
 
@@ -282,5 +304,6 @@ func permissionTarget(input map[string]any) string {
 			return v
 		}
 	}
+
 	return ""
 }

@@ -34,10 +34,12 @@ func newRateLimiter(cfg *config.RateLimitConfig, authEnabled bool) *rateLimiter 
 	if cfg == nil || cfg.PerMinute <= 0 {
 		return nil
 	}
+
 	burst := cfg.Burst
 	if burst <= 0 {
 		burst = cfg.PerMinute
 	}
+
 	return &rateLimiter{
 		perMin:      float64(cfg.PerMinute),
 		burst:       float64(burst),
@@ -53,23 +55,29 @@ func (l *rateLimiter) allow(key string) bool {
 	if l == nil {
 		return true
 	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	now := l.now()
 	b := l.buckets[key]
 	if b == nil {
 		b = &bucket{tokens: l.burst, last: now}
 		l.buckets[key] = b
 	}
+
 	b.tokens += now.Sub(b.last).Seconds() * (l.perMin / 60)
 	if b.tokens > l.burst {
 		b.tokens = l.burst
 	}
+
 	b.last = now
+
 	if b.tokens < 1 {
 		return false
 	}
 	b.tokens--
+
 	return true
 }
 
@@ -79,6 +87,7 @@ func (l *rateLimiter) middleware(agentID string, next http.Handler) http.Handler
 	if l == nil {
 		return next
 	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !l.allow(agentID + "\x00" + l.callerKey(r)) {
 			w.Header().Set("Retry-After", "1")
@@ -99,9 +108,11 @@ func (l *rateLimiter) callerKey(r *http.Request) string {
 			return tokenKey(tok)
 		}
 	}
+
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
 	}
+
 	return r.RemoteAddr
 }
 

@@ -15,11 +15,13 @@ func EncodePermissionResponse(requestID, answer string) string {
 	if allow {
 		behavior = "allow"
 	}
+
 	inner := map[string]any{"allowed": allow, "behavior": behavior}
 	if reason := strings.TrimSpace(answer); !allow && reason != "" {
 		inner["reason"] = reason
 		inner["message"] = reason
 	}
+
 	return controlResponse(requestID, inner)
 }
 
@@ -44,6 +46,7 @@ func EncodeElicitationResponse(requestID, action string, content map[string]any)
 	if len(content) > 0 {
 		inner["content"] = content
 	}
+
 	return controlResponse(requestID, inner)
 }
 

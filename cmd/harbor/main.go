@@ -95,6 +95,7 @@ func run() error {
 			slog.Warn("server close", "err", err)
 		}
 	}()
+
 	srv := &http.Server{
 		Addr:    cfg.Server.Listen,
 		Handler: servers.HTTP,
@@ -111,19 +112,23 @@ func run() error {
 		}
 		serveErr <- srv.ListenAndServe()
 	}()
+
 	slog.Info("harbor listening", "addr", cfg.Server.Listen, "discovery", server.DiscoveryPath)
 
 	select {
 	case <-ctx.Done():
 		stop() // restore default signal handling so a second signal force-quits
 		slog.Info("shutting down", "timeout", shutdownTimeout)
+
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
+
 		return srv.Shutdown(shutdownCtx)
 	case err := <-serveErr:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
+
 		return err
 	}
 }

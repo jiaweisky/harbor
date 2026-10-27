@@ -99,10 +99,12 @@ func ProbeBinary(ctx context.Context, name, binary string, versionArgs []string,
 	if err != nil {
 		return Info{Name: name, Enabled: false, Err: err}
 	}
+
 	version := versionOverride
 	if version == "" {
 		version = DetectVersion(ctx, path, versionArgs)
 	}
+
 	return Info{Name: name, Path: path, Enabled: true, Version: version}
 }
 
@@ -115,14 +117,17 @@ func (l *HeadlessLauncher) Start(ctx context.Context, req *Request) (Session, er
 	if err != nil {
 		return nil, err
 	}
+
 	p := l.parser
 	if l.newParser != nil {
 		p = l.newParser()
 	}
+
 	events, err := l.runner.Start(ctx, TaskIDFrom(ctx), inv, p)
 	if err != nil {
 		return nil, err
 	}
+
 	return &lineSession{
 		events: events,
 		stdin:  l.runner.Stdin(TaskIDFrom(ctx)),
@@ -145,6 +150,7 @@ func (s *lineSession) Send(_ context.Context, in Input) error {
 	if !s.duplex || s.stdin == nil {
 		return ErrUnsupported
 	}
+
 	// An interaction is answered with a control_response; any other input is a
 	// normal user turn written as a stream-json message.
 	var frame string
@@ -162,6 +168,7 @@ func (s *lineSession) Send(_ context.Context, in Input) error {
 	default:
 		frame = EncodeStreamJSONUserMessage(in.Answer)
 	}
+
 	_, err := io.WriteString(s.stdin, frame)
 	return err
 }
@@ -178,6 +185,7 @@ func questionAnswers(in Input) map[string]string {
 		}
 		return answers
 	}
+
 	return map[string]string{in.Target: in.Answer}
 }
 
@@ -186,6 +194,7 @@ func (s *lineSession) Cancel() error {
 	if s.kill != nil {
 		s.kill()
 	}
+
 	return nil
 }
 
@@ -216,6 +225,7 @@ func EncodeStreamJSONInput(text string, images []Image) string {
 	if text != "" {
 		blocks = []string{text}
 	}
+
 	return EncodeStreamJSONBlocks(blocks, images)
 }
 
@@ -228,6 +238,7 @@ func EncodeStreamJSONBlocks(blocks []string, images []Image) string {
 			content = append(content, map[string]any{"type": "text", "text": b})
 		}
 	}
+
 	for _, img := range images {
 		content = append(content, map[string]any{
 			"type": "image",
@@ -238,10 +249,12 @@ func EncodeStreamJSONBlocks(blocks []string, images []Image) string {
 			},
 		})
 	}
+
 	msg := map[string]any{
 		"type":    "user",
 		"message": map[string]any{"role": "user", "content": content},
 	}
 	b, _ := json.Marshal(msg)
+
 	return string(b) + "\n"
 }

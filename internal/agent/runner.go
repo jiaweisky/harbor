@@ -70,11 +70,13 @@ func NewRunner(
 	if maxConcurrent > 0 {
 		sem = make(chan struct{}, maxConcurrent)
 	}
+
 	r := &Runner{sem: sem, inheritEnv: inheritEnv, cliHome: cliHome, container: container}
 	if rt != nil {
 		r.procs = rt.Procs
 		r.raw = rt.Raw
 	}
+
 	return r
 }
 
@@ -91,8 +93,8 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 	if inv.Dir != "" {
 		env = setEnv(env, "PWD", inv.Dir)
 	}
-	bin, args := r.command(inv, env)
 
+	bin, args := r.command(inv, env)
 	// exec.Command (not CommandContext): cancellation is handled here so the
 	// whole process group is terminated, not just the direct child.
 	cmd := exec.Command(bin, args...)
@@ -105,11 +107,13 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 		r.release()
 		return nil, err
 	}
+
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		r.release()
 		return nil, err
 	}
+
 	stderr, sink := stderrSink(inv)
 	cmd.Stderr = sink
 
@@ -146,10 +150,12 @@ func (r *Runner) Start(ctx context.Context, taskID string, inv *Invocation, p Pa
 		rawOut:  rawOut,
 		rawErr:  rawErr,
 	}
+
 	r.live.Store(taskID, proc)
 	if r.procs != nil {
 		r.procs.Add(proc.pgid, proc.cmd.Path)
 	}
+
 	go r.watchCancellation(ctx, proc)
 	go r.readLoop(stdout, p, out, stderr, proc, taskID)
 
@@ -165,7 +171,9 @@ func stderrSink(inv *Invocation) (fmt.Stringer, io.Writer) {
 		sw := newStderrWriter(inv.StderrLine)
 		return sw, sw
 	}
+
 	buf := newLimitedBuffer(64 << 10)
+
 	return buf, buf
 }
 
@@ -175,6 +183,7 @@ func (r *Runner) command(inv *Invocation, env []string) (string, []string) {
 	if r.container == nil {
 		return inv.Bin, inv.Args
 	}
+
 	return r.container.Command(inv.Bin, inv.Args, inv.Dir, env)
 }
 
@@ -189,6 +198,7 @@ func (r *Runner) feedStdin(stdin io.WriteCloser, inv *Invocation) {
 		}
 		return
 	}
+
 	go func() {
 		_, _ = io.Copy(stdin, inv.Stdin)
 		if !inv.KeepStdinOpen {
@@ -238,11 +248,13 @@ func (r *Runner) readLoop(
 		if proc.rawOut != nil {
 			_, _ = proc.rawOut.Write(line)
 		}
+
 		if rec := trimLine(line); len(rec) > 0 {
 			if perr := p.Parse(rec, emit); perr != nil {
 				emit(Event{Kind: EventError, Err: perr})
 			}
 		}
+
 		if readErr != nil {
 			if !errors.Is(readErr, io.EOF) {
 				emit(Event{Kind: EventError, Err: readErr})
@@ -250,6 +262,7 @@ func (r *Runner) readLoop(
 			break
 		}
 	}
+
 	_ = p.Flush(emit)
 
 	// Wait always runs so the process is reaped even after an early stop.
@@ -279,9 +292,11 @@ func (r *Runner) Kill(taskID string) {
 	if !ok {
 		return
 	}
+
 	p := v.(*Process)
 	p.stop()
 	terminateGroup(p)
+
 	select {
 	case <-p.done:
 	case <-time.After(5 * time.Second):
@@ -294,6 +309,7 @@ func (r *Runner) Stdin(taskID string) io.WriteCloser {
 	if v, ok := r.live.Load(taskID); ok {
 		return v.(*Process).stdin
 	}
+
 	return nil
 }
 
@@ -301,6 +317,7 @@ func (r *Runner) acquire(ctx context.Context) error {
 	if r.sem == nil {
 		return nil
 	}
+
 	select {
 	case r.sem <- struct{}{}:
 		return nil
@@ -334,6 +351,7 @@ func buildEnv(inherit bool, cliHome string, extra []string) []string {
 	if !inherit {
 		base = allowlistedEnv()
 	}
+
 	return append(base, append(extra, cliHomeEnv(cliHome)...)...)
 }
 
@@ -349,9 +367,11 @@ func (r *Runner) AuthBase() string {
 	if r.cliHome != "" {
 		return r.cliHome
 	}
+
 	if home, err := os.UserHomeDir(); err == nil {
 		return home
 	}
+
 	return ""
 }
 
@@ -364,6 +384,7 @@ func setEnv(env []string, key, value string) []string {
 			return env
 		}
 	}
+
 	return append(env, prefix+value)
 }
 
@@ -374,6 +395,7 @@ func allowlistedEnv() []string {
 			env = append(env, kv)
 		}
 	}
+
 	return env
 }
 
@@ -384,6 +406,7 @@ func cliHomeEnv(cliHome string) []string {
 	if cliHome == "" {
 		return nil
 	}
+
 	home := cliHome
 	return []string{
 		// Unix roots.
@@ -408,6 +431,7 @@ func classifyStartErr(err error) error {
 	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%w: %w", ErrCLINotFound, err)
 	}
+
 	return err
 }
 
@@ -416,6 +440,7 @@ func trimLine(line []byte) []byte {
 	if len(line) == 0 {
 		return nil
 	}
+
 	return append([]byte(nil), line...)
 }
 
@@ -423,6 +448,7 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
+
 	return s[:n] + "...(truncated)"
 }
 
@@ -442,6 +468,7 @@ func newStderrWriter(onLine func(string)) *stderrWriter {
 func (w *stderrWriter) Write(p []byte) (int, error) {
 	_, _ = w.kept.Write(p)
 	w.buf = append(w.buf, p...)
+
 	for {
 		i := bytes.IndexByte(w.buf, '\n')
 		if i < 0 {
@@ -452,9 +479,11 @@ func (w *stderrWriter) Write(p []byte) (int, error) {
 		}
 		w.buf = w.buf[i+1:]
 	}
+
 	if len(w.buf) > 64<<10 {
 		w.buf = w.buf[len(w.buf)-(64<<10):]
 	}
+
 	return len(p), nil
 }
 
@@ -473,8 +502,10 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 		if room > len(p) {
 			room = len(p)
 		}
+
 		b.buf = append(b.buf, p[:room]...)
 	}
+
 	return len(p), nil
 }
 

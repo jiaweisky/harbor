@@ -41,13 +41,17 @@ func (s *ServerSession) SetAbort(abort func()) {
 
 func (s *ServerSession) Cancel() error {
 	s.canceled.Store(true)
+
 	s.mu.Lock()
 	abort := s.abort
 	s.mu.Unlock()
+
 	if abort != nil {
 		abort()
 	}
+
 	s.cancel()
+
 	return nil
 }
 
@@ -60,6 +64,7 @@ func (s *ServerSession) EmitError(ctx context.Context, err error) {
 	if ctx.Err() != nil {
 		return
 	}
+
 	s.events <- Event{Kind: EventError, Err: err}
 }
 

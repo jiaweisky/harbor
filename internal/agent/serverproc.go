@@ -22,18 +22,23 @@ func (e *ServerEndpoint) URL(
 ) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
 	if e.baseURL != "" {
 		return e.baseURL, nil
 	}
+
 	if configured != "" {
 		e.baseURL = strings.TrimRight(configured, "/")
 		return e.baseURL, nil
 	}
+
 	base, err := spawn(ctx)
 	if err != nil {
 		return "", err
 	}
+
 	e.baseURL = base
+
 	return base, nil
 }
 
@@ -62,6 +67,7 @@ func SpawnServer(
 	if err != nil {
 		return "", err
 	}
+
 	exited := make(chan struct{})
 	go func() {
 		defer close(exited)
@@ -71,8 +77,10 @@ func SpawnServer(
 			}
 		}
 	}()
+
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+
 	select {
 	case url := <-urlCh:
 		return url, nil

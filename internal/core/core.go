@@ -66,6 +66,7 @@ func IntegrationNames(vals []Integration) string {
 	for _, v := range vals {
 		names = append(names, string(v))
 	}
+
 	return strings.Join(names, ", ")
 }
 

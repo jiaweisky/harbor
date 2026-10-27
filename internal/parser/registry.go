@@ -36,10 +36,12 @@ func Build(name core.ParserKind, pattern string) (agent.Parser, error) {
 	if name == "" {
 		name = core.ParserText
 	}
+
 	build, ok := builders[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown parser %q (known: %s)", name, strings.Join(Names(), ", "))
 	}
+
 	return build(pattern)
 }
 
@@ -50,5 +52,6 @@ func Names() []string {
 		names = append(names, string(name))
 	}
 	sort.Strings(names)
+
 	return names
 }
