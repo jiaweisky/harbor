@@ -12,9 +12,14 @@ import (
 	"github.com/jiaweisky/harbor/internal/opencode"
 )
 
-// init registers the built-in dedicated adapters. Each handles one CLI's complex
-// integrations (acp, server) and returns cli.ErrUnhandled for the generic
-// framing (stream-json, exec) handled by New. External CLIs register their
+// init registers the built-in dedicated adapters. Two integrations are built by
+// New's built-in switch with no per-CLI code: stream-json (spawn the CLI, feed
+// its stdin, read its stdout) and exec (one-shot runs from arg templates). The
+// dedicated adapters cover the integrations that need per-CLI protocol code —
+// ACP sessions and each CLI's HTTP server API — and return cli.ErrUnhandled for
+// stream-json and exec. A CLI therefore needs an entry here only when it
+// supports acp or server; one whose integrations are all stream-json or exec
+// has none (claude supports stream-json alone). External CLIs register their
 // builder with cli.AttachBuilder (known binary) or cli.Register (new binary)
 // from their own package's init, without editing this file.
 func init() {
@@ -67,6 +72,7 @@ func buildCodebuddy(ac core.AgentSpec, opts cli.Options) (agent.Launcher, error)
 			if ac.ServerProtocol == core.ServerProtocolACPStreamableHTTP {
 				args = []string{"--acp", "--acp-transport", "streamable-http"}
 			}
+
 			return acp.NewHTTPLauncher(acp.HTTPConfig{
 				Name: ac.ID, Binary: ac.Binary, Args: args, BaseURL: ac.ServerURL,
 				Env:     envSlice(ac.Env),
@@ -92,6 +98,7 @@ func buildCodex(ac core.AgentSpec, opts cli.Options) (agent.Launcher, error) {
 	if ac.Integration != core.IntegrationServer {
 		return nil, cli.ErrUnhandled
 	}
+
 	return codex.NewServerLauncher(opts.Ctx, codex.Config{
 		Name: ac.ID, Binary: ac.Binary,
 		Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
@@ -106,5 +113,6 @@ func profileVersionArgs(ac core.AgentSpec) []string {
 	if p, ok := cli.Lookup(ac.Binary); ok {
 		return p.VersionArgs
 	}
+
 	return nil
 }

@@ -32,6 +32,7 @@ type AgentSpecSource interface {
 // agent is refused rather than run against an unknown binary.
 func Build(ctx context.Context, src AgentSpecSource, opts Options) (agent.Launcher, agent.Info, error) {
 	ac := src.Spec()
+
 	path, err := exec.LookPath(ac.Binary)
 	if err != nil {
 		return nil, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Enabled: false, Err: err}, nil
@@ -56,10 +57,12 @@ func Build(ctx context.Context, src AgentSpecSource, opts Options) (agent.Launch
 
 	ac.Version = ver // reuse the probed version; avoids re-probing in the launcher
 	opts.Ctx = ctx
+
 	ln, err := New(ac, opts)
 	if err != nil {
 		return nil, agent.Info{}, err
 	}
+
 	// Harbor does not gate on its own credential guess: the CLI decides whether
 	// it can run, so a CLI that starts standalone is served as-is.
 	return ln, agent.Info{
@@ -85,6 +88,7 @@ func (l interactionLauncher) Capabilities() agent.Capabilities { return l.caps }
 // prompts.
 func applyInteractionMode(ln agent.Launcher, mode core.Interaction) (agent.Launcher, error) {
 	caps := ln.Capabilities()
+
 	switch mode {
 	case "", core.InteractionAuto:
 		return ln, nil
@@ -99,6 +103,7 @@ func applyInteractionMode(ln agent.Launcher, mode core.Interaction) (agent.Launc
 	default:
 		return nil, fmt.Errorf("unknown interaction mode %q", mode)
 	}
+
 	return interactionLauncher{Launcher: ln, caps: caps}, nil
 }
 
@@ -107,6 +112,7 @@ func infoSkills(ac core.AgentSpec) []agent.Skill {
 	if len(ac.Skills) == 0 {
 		return nil
 	}
+
 	out := make([]agent.Skill, 0, len(ac.Skills))
 	for _, s := range ac.Skills {
 		out = append(out, agent.Skill{
@@ -114,6 +120,7 @@ func infoSkills(ac core.AgentSpec) []agent.Skill {
 			Tags: s.Tags, Examples: s.Examples, InputModes: s.InputModes, OutputModes: s.OutputModes,
 		})
 	}
+
 	return out
 }
 
@@ -122,10 +129,12 @@ func infoSkills(ac core.AgentSpec) []agent.Skill {
 // empty it is resolved from the CLI's known profile.
 func New(src AgentSpecSource, opts Options) (agent.Launcher, error) {
 	ac := src.Spec()
+
 	ln, err := buildLauncher(ac, opts)
 	if err != nil {
 		return nil, err
 	}
+
 	return applyInteractionMode(ln, ac.Interaction)
 }
 
@@ -150,12 +159,14 @@ func buildLauncher(ac core.AgentSpec, opts Options) (agent.Launcher, error) {
 	if known {
 		versionArgs = profile.VersionArgs
 	}
+
 	// The agent's input images default to the CLI profile's list, so a launcher
 	// built without config defaults still advertises the CLI's capabilities.
 	inputImage := ac.InputImage
 	if len(inputImage) == 0 {
 		inputImage = profile.InputImage
 	}
+
 	auth := authenticator(ac)
 
 	// A dedicated adapter registered for this CLI (see adapters.go, or any
@@ -171,6 +182,7 @@ func buildLauncher(ac core.AgentSpec, opts Options) (agent.Launcher, error) {
 	case core.IntegrationStreamJSON:
 		caps := streamJSONCaps(inputImage, profile.OutputImage)
 		caps.SessionFork = ac.Session.ForkFlag != ""
+
 		return headlessLauncher(ac, opts, auth, versionArgs, caps, headlessSpec{
 			newParser: func() agent.Parser { return parser.NewStreamJSON() },
 			invoke:    streamJSONInvoke(ac),
@@ -180,6 +192,7 @@ func buildLauncher(ac core.AgentSpec, opts Options) (agent.Launcher, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		return headlessLauncher(ac, opts, auth, versionArgs, execCaps(ac, inputImage, profile.OutputImage),
 			headlessSpec{newParser: newParser, invoke: textInvoke(ac)}), nil
 	case core.IntegrationACP:
@@ -299,18 +312,22 @@ func execParserFactory(ac core.AgentSpec) (func() agent.Parser, error) {
 	if name == "" {
 		name = core.ParserText
 	}
+
 	pattern := ""
 	if ac.Regex != nil {
 		pattern = ac.Regex.Text
 	}
+
 	if _, err := parser.Build(name, pattern); err != nil {
 		return nil, err
 	}
+
 	return func() agent.Parser {
 		p, err := parser.Build(name, pattern)
 		if err != nil {
 			return parser.NewText()
 		}
+
 		return p
 	}, nil
 }
@@ -321,13 +338,15 @@ func streamJSONInvoke(ac core.AgentSpec) agent.InvokeFunc {
 	return func(req *agent.Request) (*agent.Invocation, error) {
 		args := append([]string{}, ac.Args...)
 		args = append(args, sessionArgs(ac, req)...)
-		args = appendCommonFlags(args, ac, req)
+		args = appendStreamJSONFlags(args, ac, req)
+
 		stdin := agent.EncodeStreamJSONBlocks(req.Blocks, req.Images)
 		if ac.SDKCaps {
 			// Declare SDK capabilities first so the CLI routes AskUserQuestion
 			// through can_use_tool.
 			stdin = agent.EncodeControlInitialize() + stdin
 		}
+
 		return &agent.Invocation{
 			Bin:           ac.Binary,
 			Args:          args,
@@ -349,6 +368,7 @@ func textInvoke(ac core.AgentSpec) agent.InvokeFunc {
 		for _, a := range ac.Args {
 			args = append(args, substitute(a, req))
 		}
+
 		args = append(args, sessionArgs(ac, req)...)
 		if req.OutputSchema != nil && len(ac.OutputSchemaArgs) > 0 {
 			schemaArgs, err := schemaArgs(ac.OutputSchemaArgs, req.OutputSchema)
@@ -357,8 +377,10 @@ func textInvoke(ac core.AgentSpec) agent.InvokeFunc {
 			}
 			args = append(args, schemaArgs...)
 		}
+
 		args = append(args, fileArgs(ac.FileArgs, req.Files)...)
 		args = append(args, imageArgs(ac.ImageArgs, req.ImageFiles)...)
+
 		return &agent.Invocation{
 			Bin:  ac.Binary,
 			Args: args,
@@ -384,12 +406,14 @@ func expandArgs(tmpl []string, placeholder string, values []string) []string {
 	if len(tmpl) == 0 || len(values) == 0 {
 		return nil
 	}
+
 	out := make([]string, 0, len(tmpl)*len(values))
 	for _, v := range values {
 		for _, a := range tmpl {
 			out = append(out, strings.ReplaceAll(a, placeholder, v))
 		}
 	}
+
 	return out
 }
 
@@ -401,19 +425,23 @@ func schemaArgs(tmpl []string, schema map[string]any) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal output schema: %w", err)
 	}
+
 	f, err := os.CreateTemp("", "harbor-schema-*.json")
 	if err != nil {
 		return nil, fmt.Errorf("write output schema: %w", err)
 	}
 	defer f.Close()
+
 	if _, err := f.Write(raw); err != nil {
 		return nil, fmt.Errorf("write output schema: %w", err)
 	}
+
 	out := make([]string, len(tmpl))
 	for i, a := range tmpl {
 		a = strings.ReplaceAll(a, "{{.SchemaFile}}", f.Name())
 		out[i] = strings.ReplaceAll(a, "{{.Schema}}", string(raw))
 	}
+
 	return out, nil
 }
 
@@ -421,38 +449,47 @@ func schemaArgs(tmpl []string, schema map[string]any) ([]string, error) {
 func sessionArgs(ac core.AgentSpec, req *agent.Request) []string {
 	if req.SessionID != "" {
 		var args []string
+
 		if flag := agent.FirstNonEmpty(ac.Session.ResumeFlag, ac.Session.IDFlag); flag != "" {
 			args = append(args, flag, req.SessionID)
 		}
+
 		if req.Fork && ac.Session.ForkFlag != "" {
 			args = append(args, ac.Session.ForkFlag)
 		}
+
 		return args
 	}
+
 	if req.Continue && ac.Session.ContinueFlag != "" {
 		return []string{ac.Session.ContinueFlag}
 	}
+
 	return nil
 }
 
-// appendCommonFlags adds the model, system-prompt, structured-output, and
-// dangerous-mode flags shared by the Claude-family CLIs; other integrations use
-// argument templates.
-func appendCommonFlags(args []string, ac core.AgentSpec, req *agent.Request) []string {
+// appendStreamJSONFlags adds the flags the stream-json invocation channel
+// accepts (model, system prompt, structured output, dangerous mode); exec and
+// other integrations express these via argument templates.
+func appendStreamJSONFlags(args []string, ac core.AgentSpec, req *agent.Request) []string {
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)
 	}
+
 	if req.SystemExtra != "" {
 		args = append(args, "--append-system-prompt", req.SystemExtra)
 	}
+
 	if req.OutputSchema != nil {
 		if b, err := json.Marshal(req.OutputSchema); err == nil {
 			args = append(args, "--json-schema", string(b))
 		}
 	}
+
 	if ac.AllowDangerous {
 		args = append(args, "--dangerously-skip-permissions")
 	}
+
 	return args
 }
 
@@ -460,6 +497,7 @@ func substitute(arg string, req *agent.Request) string {
 	arg = strings.ReplaceAll(arg, "{{.Prompt}}", req.Prompt)
 	arg = strings.ReplaceAll(arg, "{{.Model}}", req.Model)
 	arg = strings.ReplaceAll(arg, "{{.WorkDir}}", req.WorkDir)
+
 	return arg
 }
 
@@ -468,5 +506,6 @@ func envSlice(env map[string]string) []string {
 	for k, v := range env {
 		out = append(out, k+"="+v)
 	}
+
 	return out
 }
