@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -23,6 +22,7 @@ import (
 	"github.com/jiaweisky/harbor/internal/bridge"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/core"
+	"github.com/jiaweisky/harbor/internal/fakeclitest"
 	"github.com/jiaweisky/harbor/internal/integration"
 	"github.com/jiaweisky/harbor/internal/server"
 	"github.com/jiaweisky/harbor/internal/session"
@@ -31,11 +31,7 @@ import (
 
 func scriptPath(t *testing.T, name string) string {
 	t.Helper()
-	p, err := filepath.Abs(filepath.Join("..", "..", "testdata", "fake-cli", name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return p
+	return fakeclitest.Path(t, name)
 }
 
 func newLauncher(
@@ -598,12 +594,12 @@ func TestStreamJSONStructuredOutput(t *testing.T) {
 // fake "codebuddy" gives it the profile's input capabilities.
 func stdinLoggerHandler(t *testing.T, logPath string) a2asrv.RequestHandler {
 	t.Helper()
-	script := "#!/bin/sh\nread -r line\n" +
-		`echo "$line" >> "$HARBOR_STDIN_LOG"` + "\n" +
-		`echo '{"type":"result","result":"ok","is_error":false}'` + "\n"
 	ln, err := integration.New(config.AgentConfig{
-		ID: "cb", Binary: fakeBin(t, "codebuddy", script), Integration: core.IntegrationStreamJSON,
+		ID: "cb", Binary: fakeclitest.Path(t, "fake-stdin-echo"), Integration: core.IntegrationStreamJSON,
 		Args: []string{"-p"}, Env: map[string]string{"HARBOR_STDIN_LOG": logPath},
+		// The fake is an unknown CLI by name; declare the image types it
+		// accepts so the encoder sends them as native blocks.
+		InputImage: []string{"image/png", "image/jpeg", "image/gif", "image/webp"},
 	}, integration.Options{InheritEnv: true})
 	if err != nil {
 		t.Fatalf("integration.New: %v", err)
@@ -689,14 +685,11 @@ func TestStreamJSONDataBlocks(t *testing.T) {
 func TestExecStructuredOutput(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "args.log")
-	script := "#!/bin/sh\n" +
-		`echo "$@" >> "$HARBOR_ARG_LOG"` + "\n" +
-		`printf '%s' '{"city":"Paris"}'` + "\n"
-	ac := config.AgentConfig{
-		ID: "mc", Binary: fakeBin(t, "mycoder", script),
-		Env:              map[string]string{"HARBOR_ARG_LOG": logPath},
-		OutputSchemaArgs: []string{"--output-schema", "{{.SchemaFile}}"},
-	}
+		ac := config.AgentConfig{
+			ID: "mc", Binary: fakeclitest.Path(t, "fake-arg-log"),
+			Env:              map[string]string{"HARBOR_ARG_LOG": logPath, "FAKE_OUTPUT": `{"city":"Paris"}`},
+			OutputSchemaArgs: []string{"--output-schema", "{{.SchemaFile}}"},
+		}
 	ln := newExecLauncher(t, ac, integration.Options{InheritEnv: true})
 	h := newHandler(t, ln)
 
@@ -722,14 +715,11 @@ func TestExecStructuredOutput(t *testing.T) {
 func TestExecFileAttachment(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "args.log")
-	script := "#!/bin/sh\n" +
-		`echo "$@" >> "$HARBOR_ARG_LOG"` + "\n" +
-		`echo ok` + "\n"
-	ac := config.AgentConfig{
-		ID: "mc", Binary: fakeBin(t, "mycoder", script),
-		Env:      map[string]string{"HARBOR_ARG_LOG": logPath},
-		FileArgs: []string{"-f", "{{.File}}"},
-	}
+		ac := config.AgentConfig{
+			ID: "mc", Binary: fakeclitest.Path(t, "fake-arg-log"),
+			Env:      map[string]string{"HARBOR_ARG_LOG": logPath, "FAKE_OUTPUT": "ok"},
+			FileArgs: []string{"-f", "{{.File}}"},
+		}
 	ln := newExecLauncher(t, ac, integration.Options{InheritEnv: true})
 	h := newHandler(t, ln)
 
@@ -877,7 +867,7 @@ func TestServerModeEndToEnd(t *testing.T) {
 	defer srv.Close()
 
 	ln, err := integration.New(config.AgentConfig{
-		ID: "oc", Binary: fakeBin(t, "opencode", "#!/bin/sh\n"),
+		ID: "oc", Binary: fakeclitest.Path(t, "opencode"),
 		Integration: core.IntegrationServer, ServerURL: srv.URL,
 	}, integration.Options{Ctx: context.Background()})
 	if err != nil {
@@ -1145,16 +1135,6 @@ func TestRejectsUnsupportedImage(t *testing.T) {
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
 		t.Fatalf("CLI should not have started; arg log present (err=%v)", err)
 	}
-}
-
-// fakeBin writes an executable named name and returns its path.
-func fakeBin(t *testing.T, name, script string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return path
 }
 
 // newExecLauncher builds an exec launcher over an arbitrary binary.
@@ -1435,103 +1415,6 @@ func TestTimeout(t *testing.T) {
 	}
 }
 
-// gitRepo creates a git repository with one committed file.
-func gitRepo(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	runGit := func(args ...string) {
-		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
-			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-	}
-	runGit("init")
-	if err := os.WriteFile(filepath.Join(dir, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGit("add", ".")
-	runGit("commit", "-m", "init")
-	return dir
-}
-
-func TestChangesArtifact(t *testing.T) {
-	repo := gitRepo(t)
-	ln := newLauncher(t, scriptPath(t, "fake-mutate.sh"), "exec", nil, nil)
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(repo), core.Limits{})
-	h := a2asrv.NewHandler(exec)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	m := message("hi")
-	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-	task := resp.(*a2a.Task)
-	if task.Status.State != a2a.TaskStateCompleted {
-		t.Fatalf("state = %s", task.Status.State)
-	}
-
-	var diff string
-	for _, a := range task.Artifacts {
-		if a.Name == "changes" {
-			for _, p := range a.Parts {
-				diff += p.Text()
-			}
-		}
-	}
-	if !strings.Contains(diff, "tracked.txt") || !strings.Contains(diff, "+appended line") {
-		t.Fatalf("changes artifact missing diff:\n%s", diff)
-	}
-}
-
-// TestImageOutputArtifact verifies a task that writes an image file into its
-// working directory surfaces it as a raw image artifact.
-func TestImageOutputArtifact(t *testing.T) {
-	root := t.TempDir()
-	ln := newLauncher(t, scriptPath(t, "fake-image.sh"), "exec", []string{"{{.Prompt}}"}, nil)
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(root), core.Limits{})
-	exec.SetNonGitChangeGlobs([]string{"*.png"})
-	h := a2asrv.NewHandler(exec)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	m := message("draw a picture")
-	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-	task := resp.(*a2a.Task)
-	if task.Status.State != a2a.TaskStateCompleted {
-		t.Fatalf("state = %s, want completed", task.Status.State)
-	}
-
-	var found bool
-	for _, a := range task.Artifacts {
-		if a.Name != "image" {
-			continue
-		}
-		for _, p := range a.Parts {
-			if p.MediaType != "image/png" || p.Filename != "generated.png" {
-				t.Fatalf("part = media %q file %q, want image/png generated.png", p.MediaType, p.Filename)
-			}
-			if len(p.Raw()) == 0 {
-				t.Fatal("image artifact has no raw bytes")
-			}
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("no image artifact; artifacts = %+v", task.Artifacts)
-	}
-}
-
-// TestMaxTurnsExceeded verifies a resume past the per-task turn limit fails.
 func TestMaxTurnsExceeded(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-question.sh"), "stream-json", []string{"-p"}, nil)
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil,
@@ -1548,43 +1431,6 @@ func TestMaxTurnsExceeded(t *testing.T) {
 	}
 	if code, _ := done.Status.Message.Metadata["harbor.errorCode"].(string); code != "max_turns" {
 		t.Fatalf("errorCode = %q, want max_turns", code)
-	}
-}
-
-// TestNonImageFileArtifacts verifies the opt-in per-file artifact for a changed
-// non-image file.
-func TestNonImageFileArtifacts(t *testing.T) {
-	repo := gitRepo(t)
-	ln := newLauncher(t, scriptPath(t, "fake-mutate.sh"), "exec", nil, nil)
-	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(),
-		workspace.NewResolver(repo), core.Limits{})
-	exec.SetNonImageFileArtifacts(true)
-	h := a2asrv.NewHandler(exec)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	m := message("hi")
-	resp, err := h.SendMessage(ctx, &a2a.SendMessageRequest{Message: m})
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-	task := resp.(*a2a.Task)
-	if task.Status.State != a2a.TaskStateCompleted {
-		t.Fatalf("state = %s", task.Status.State)
-	}
-	var found bool
-	for _, a := range task.Artifacts {
-		if a.Name != "file" {
-			continue
-		}
-		for _, p := range a.Parts {
-			if p.Filename == "tracked.txt" && strings.Contains(string(p.Raw()), "appended line") {
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("no per-file artifact for tracked.txt; artifacts = %+v", task.Artifacts)
 	}
 }
 

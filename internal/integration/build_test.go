@@ -2,12 +2,11 @@ package integration_test
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/jiaweisky/harbor/internal/config"
+	"github.com/jiaweisky/harbor/internal/fakeclitest"
 	"github.com/jiaweisky/harbor/internal/integration"
 )
 
@@ -15,12 +14,8 @@ import (
 // arguments, so it acts as a stand-in for a known CLI.
 func fakeBinary(t *testing.T, name, versionOut string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
-	script := "#!/bin/sh\necho \"" + versionOut + "\"\n"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return path
+	t.Setenv("FAKE_VERSION", versionOut)
+	return fakeclitest.Path(t, name)
 }
 
 func TestBuildRejectsOldVersion(t *testing.T) {

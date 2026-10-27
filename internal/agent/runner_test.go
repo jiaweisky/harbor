@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/fakeclitest"
 	"github.com/jiaweisky/harbor/internal/sandbox"
 )
 
@@ -91,7 +92,7 @@ func TestRunnerSetsPWDToDir(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	inv := &agent.Invocation{Bin: "sh", Args: []string{"-c", `printf %s "$PWD"`}, Dir: dir}
+	inv := &agent.Invocation{Bin: fakeclitest.Path(t, "fake-pwd-env"), Dir: dir}
 	ch, err := r.Start(ctx, "t1", inv, agent.NewLineParser())
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -111,10 +112,7 @@ func TestRunnerSetsPWDToDir(t *testing.T) {
 // launched through the container runtime, with the task directory mounted at its
 // host path and the environment forwarded, and that its output still streams.
 func TestRunnerContainerRunsCLI(t *testing.T) {
-	script, err := filepath.Abs(filepath.Join("..", "..", "testdata", "fake-cli", "fake-docker.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	script := fakeclitest.Path(t, "fake-docker")
 	log := filepath.Join(t.TempDir(), "docker.log")
 	t.Setenv("FAKE_DOCKER_LOG", log)
 	t.Setenv("FAKE_DOCKER_IMAGE", "fakeimage")

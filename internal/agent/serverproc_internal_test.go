@@ -2,18 +2,16 @@ package agent
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/jiaweisky/harbor/internal/fakeclitest"
 )
 
 // TestSpawnServerReadsStderrEndpoint verifies a server that prints its listening
 // address to stderr (e.g. codebuddy's streamable-http endpoint) is discovered.
 func TestSpawnServerReadsStderrEndpoint(t *testing.T) {
-	script, err := filepath.Abs(filepath.Join("..", "..", "testdata", "fake-cli", "fake-server-stderr.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	script := fakeclitest.Path(t, "fake-server-stderr")
 	r := NewRunner(0, true, "", nil, nil)
 	defer r.Kill("t")
 

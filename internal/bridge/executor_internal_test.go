@@ -2,7 +2,6 @@ package bridge
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/core"
+	"github.com/jiaweisky/harbor/internal/fakeclitest"
 	"github.com/jiaweisky/harbor/internal/integration"
 	"github.com/jiaweisky/harbor/internal/session"
 )
@@ -21,10 +21,7 @@ import (
 // is gone (for example after a restart) resumes the CLI session and injects the
 // answer.
 func TestResumeFreshInjectsAnswer(t *testing.T) {
-	script, err := filepath.Abs(filepath.Join("..", "..", "testdata", "fake-cli", "fake-resume.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	script := fakeclitest.Path(t, "fake-resume")
 	ln, err := integration.New(config.AgentConfig{
 		ID: "rec", Binary: script, Integration: core.IntegrationStreamJSON,
 		Args:    []string{"-p"},

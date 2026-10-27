@@ -9,15 +9,13 @@ import (
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/acp"
+	"github.com/jiaweisky/harbor/internal/fakeclitest"
 	"github.com/jiaweisky/harbor/internal/agent"
 )
 
 func fakeACP(t *testing.T) string {
 	t.Helper()
-	p, err := filepath.Abs(filepath.Join("..", "..", "testdata", "fake-cli", "fake-acp.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := fakeclitest.Path(t, "fake-acp")
 	return p
 }
 
