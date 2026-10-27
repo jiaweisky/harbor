@@ -137,6 +137,58 @@ func TestServerLauncherStreamsDeltas(t *testing.T) {
 	}
 }
 
+func TestServerLauncherForwardsToolParts(t *testing.T) {
+	sent := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/session", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "ses_test"})
+	})
+	mux.HandleFunc("/event", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		frames := []string{
+			`{"type":"message.part.updated","properties":{"sessionID":"ses_test","part":{"id":"prt_1","type":"tool","tool":"bash","state":{"status":"running","input":{"command":"ls"}}}}}`,
+			`{"type":"message.part.updated","properties":{"sessionID":"ses_test","part":{"id":"prt_1","type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"ls"},"output":"main.go"}}}}`,
+		}
+		for _, f := range frames {
+			fmt.Fprint(w, "data: "+f+"\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		close(sent)
+		<-r.Context().Done()
+	})
+	mux.HandleFunc("/session/ses_test/message", func(w http.ResponseWriter, _ *http.Request) {
+		<-sent
+		time.Sleep(150 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"parts": []map[string]any{{"type": "text", "text": "done"}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ln := opencode.NewServerLauncher(context.Background(), opencode.Config{
+		Name: "oc", Binary: "opencode", BaseURL: srv.URL, Auth: cli.Unverified(),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	sess, err := ln.Start(ctx, &agent.Request{Prompt: "hi"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	evs := drain(sess)
+	if len(evs) != 5 || evs[0].Kind != agent.EventSession ||
+		evs[1].Kind != agent.EventToolCall || evs[1].Tool != "bash" ||
+		evs[2].Kind != agent.EventToolResult || evs[2].Text != "main.go" ||
+		evs[3].Kind != agent.EventTextDelta || evs[3].Text != "done" ||
+		evs[4].Kind != agent.EventDone {
+		t.Fatalf("events = %+v, want session, tool call, tool result, reply text, done", evs)
+	}
+}
+
 func TestServerLauncherError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
