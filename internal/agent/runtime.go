@@ -19,6 +19,7 @@ func NewRawStream(dir string, compress bool) *RawStream {
 	if dir == "" {
 		return nil
 	}
+
 	return &RawStream{dir: dir, compress: compress}
 }
 
@@ -31,13 +32,9 @@ type Runtime struct {
 }
 
 // NewRuntime builds the runtime facilities. An empty stateDir disables orphan
-// tracking; an empty rawDir disables raw stream logging.
-func NewRuntime(stateDir, rawDir string, rawCompress bool) *Runtime {
-	var procs *ProcRegistry
-	if stateDir != "" {
-		procs = NewProcRegistry(stateDir)
-	}
-	return &Runtime{Procs: procs, Raw: NewRawStream(rawDir, rawCompress)}
+// tracking; an empty rawStreamDir disables raw stream logging.
+func NewRuntime(stateDir, rawStreamDir string, rawStreamCompress bool) *Runtime {
+	return &Runtime{Procs: NewProcRegistry(stateDir), Raw: NewRawStream(rawStreamDir, rawStreamCompress)}
 }
 
 // open opens the task's raw stdout/stderr logs; both are nil when disabled.
@@ -45,6 +42,7 @@ func (r *RawStream) open(taskID string) (io.WriteCloser, io.WriteCloser) {
 	if r == nil {
 		return nil, nil
 	}
+
 	return openRawFile(filepath.Join(r.dir, taskID+".out"), r.compress),
 		openRawFile(filepath.Join(r.dir, taskID+".err"), r.compress)
 }
@@ -53,16 +51,20 @@ func openRawFile(path string, compress bool) io.WriteCloser {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil
 	}
+
 	if compress {
 		path += ".gz"
 	}
+
 	f, err := os.Create(path)
 	if err != nil {
 		return nil
 	}
+
 	if !compress {
 		return f
 	}
+
 	return &gzipFile{gz: gzip.NewWriter(f), f: f}
 }
 
@@ -86,5 +88,6 @@ func (g *gzipFile) Close() error {
 	if e := g.f.Close(); err == nil {
 		err = e
 	}
+
 	return err
 }

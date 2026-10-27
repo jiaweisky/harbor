@@ -30,9 +30,11 @@ type ProcRegistry struct {
 // SweepOrphans, and this registry tracks only this process's children.
 func newProcRegistry(path string) *ProcRegistry {
 	r := &ProcRegistry{path: path, live: map[int]string{}}
+
 	r.mu.Lock()
 	r.persistLocked()
 	r.mu.Unlock()
+
 	return r
 }
 
@@ -40,6 +42,7 @@ func newProcRegistry(path string) *ProcRegistry {
 func (r *ProcRegistry) Add(pgid int, binary string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	r.live[pgid] = binary
 	r.persistLocked()
 }
@@ -48,6 +51,7 @@ func (r *ProcRegistry) Add(pgid int, binary string) {
 func (r *ProcRegistry) Remove(pgid int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	delete(r.live, pgid)
 	r.persistLocked()
 }
@@ -57,21 +61,29 @@ func (r *ProcRegistry) persistLocked() {
 	if err := os.MkdirAll(filepath.Dir(r.path), 0o755); err != nil {
 		return
 	}
+
 	b, err := json.Marshal(r.live)
 	if err != nil {
 		return
 	}
+
 	tmp := r.path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return
 	}
+
 	_ = os.Rename(tmp, r.path)
 }
 
 // NewProcRegistry starts an empty registry for this process under dir. Records
 // of live siblings are left alone; records from crashed instances are handled by
-// SweepOrphans.
+// SweepOrphans. A nil ProcRegistry is returned when dir is empty, disabling
+// orphan tracking.
 func NewProcRegistry(dir string) *ProcRegistry {
+	if dir == "" {
+		return nil
+	}
+
 	return newProcRegistry(filepath.Join(dir, fmt.Sprintf("%s%d", procFilePrefix, os.Getpid())))
 }
 
@@ -97,6 +109,7 @@ func ownerAlive(path string) bool {
 	if err != nil {
 		return false
 	}
+
 	return processAlive(pid)
 }
 
@@ -106,16 +119,19 @@ func sweepFile(path string) {
 	if err != nil {
 		return
 	}
+
 	var live map[int]string
 	if json.Unmarshal(b, &live) != nil {
 		_ = os.Remove(path)
 		return
 	}
+
 	for pgid, binary := range live {
 		if pgid > 0 && processMatches(pgid, binary) {
 			killProcGroup(pgid)
 			slog.Warn("killed orphaned CLI process group", "pgid", pgid, "binary", binary)
 		}
 	}
+
 	_ = os.Remove(path)
 }
