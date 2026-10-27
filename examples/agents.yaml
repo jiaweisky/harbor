@@ -50,10 +50,6 @@ sandbox:
   # container: { image: "harbor/claude:latest", runtime: docker,
   #              extra_args: ["--network=none"] }   # flags are deployer-owned
   # require_container_for_dangerous: true   # refuse allow_dangerous without a container
-  # non_image_file_artifacts: true          # emit a FilePart per changed non-image file
-  # artifact_inline_max_bytes: 268435456       # max bytes inlined into one artifact
-  # diff_inline_max_bytes: 33554432           # max diff bytes before truncation
-  # non_git_change_globs: ["src/**"]          # opt-in change capture outside git
   # raw_stream_dir: "/var/log/harbor/raw"   # write raw CLI stdout/stderr per task
   # raw_stream_compress: true
 

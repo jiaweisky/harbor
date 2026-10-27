@@ -101,17 +101,9 @@ type SandboxConfig struct {
 	RequireContainerForDangerous bool `yaml:"require_container_for_dangerous"`
 	// NonImageFileArtifacts emits a per-file FilePart artifact for each changed
 	// non-image file, in addition to the textual diff (optional; bounded per
-	// file). Image artifacts are always emitted.
-	NonImageFileArtifacts bool `yaml:"non_image_file_artifacts"`
 	// ArtifactInlineMaxBytes bounds how much of one changed file is inlined into
-	// a file or image artifact; 0 uses the default.
-	ArtifactInlineMaxBytes int64 `yaml:"artifact_inline_max_bytes"`
 	// DiffInlineMaxBytes bounds the captured diff before it is truncated; 0 uses
-	// the default.
-	DiffInlineMaxBytes int64 `yaml:"diff_inline_max_bytes"`
 	// NonGitChangeGlobs enables change capture outside a git work tree. It lists
-	// relative glob patterns; an empty list disables non-git change capture.
-	NonGitChangeGlobs []string `yaml:"non_git_change_globs"`
 	// RawStreamDir, when set, writes each task's raw CLI stdout/stderr to a file
 	// under it for replay/debugging (optional).
 	RawStreamDir string `yaml:"raw_stream_dir"`

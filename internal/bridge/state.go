@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/agent"
-	"github.com/jiaweisky/harbor/internal/changes"
 )
 
 // structuredState tracks a task whose request asked for structured output, so
@@ -18,7 +17,7 @@ type structuredState struct{ emitted bool }
 
 // taskState is the transient state of one task execution. A single entry in
 // CLIExecutor.tasks owns everything a task holds while it runs: its process
-// lifetime (ctx/cancel), the workdir lock, the change baseline, the turn count,
+// lifetime (ctx/cancel), the workdir lock, the turn count,
 // the structured-output flag, and any pending interaction or paused-task reaper.
 // forget releases the entry and everything in it together.
 type taskState struct {
@@ -35,7 +34,6 @@ type taskState struct {
 	// goroutine (the task's own goroutine, Cancel, and the paused-task reaper).
 	mu          sync.Mutex
 	lock        func()
-	baseline    *changes.Baseline
 	structured  *structuredState
 	interaction *agent.Interaction
 	reap        context.CancelFunc
@@ -51,25 +49,6 @@ func (s *taskState) structuredState() *structuredState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.structured
-}
-
-func (s *taskState) setBaseline(b changes.Baseline) {
-	s.mu.Lock()
-	s.baseline = &b
-	s.mu.Unlock()
-}
-
-// takeBaseline returns the change baseline once, then clears it so a second
-// call does not re-emit the same changes.
-func (s *taskState) takeBaseline() (changes.Baseline, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.baseline == nil {
-		return changes.Baseline{}, false
-	}
-	b := *s.baseline
-	s.baseline = nil
-	return b, true
 }
 
 func (s *taskState) setLock(release func()) {

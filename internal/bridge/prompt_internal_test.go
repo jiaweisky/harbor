@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
-	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 )
@@ -120,14 +119,3 @@ func TestPromptURLBypassesCapabilityChecks(t *testing.T) {
 	}
 }
 
-func TestFileArtifactMetadata(t *testing.T) {
-	e := &CLIExecutor{}
-	evt := e.fileArtifact(&a2asrv.ExecutorContext{}, "x.txt", "file", "text/plain", []byte("hello"))
-	meta := evt.Artifact.Parts[0].Metadata
-	if meta["size"] != 5 {
-		t.Fatalf("size = %v", meta["size"])
-	}
-	if sum, _ := meta["sha256"].(string); len(sum) != 64 {
-		t.Fatalf("sha256 = %v", meta["sha256"])
-	}
-}

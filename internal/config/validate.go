@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/bmatcuk/doublestar/v4"
 
 	"github.com/jiaweisky/harbor/internal/core"
 )
@@ -124,22 +123,7 @@ func (c *Config) validateSandboxBasics() error {
 	if c.Sandbox.StateDir == "" {
 		return fmt.Errorf("sandbox.state_dir is required")
 	}
-	if c.Sandbox.ArtifactInlineMaxBytes < 0 {
-		return fmt.Errorf("sandbox.artifact_inline_max_bytes must not be negative")
-	}
-	if c.Sandbox.DiffInlineMaxBytes < 0 {
-		return fmt.Errorf("sandbox.diff_inline_max_bytes must not be negative")
-	}
 
-	for _, g := range c.Sandbox.NonGitChangeGlobs {
-		g = filepath.ToSlash(strings.TrimSpace(g))
-		if g == "" || filepath.IsAbs(g) || hasParentSegment(g) {
-			return fmt.Errorf("sandbox.non_git_change_globs must be relative patterns: %q", g)
-		}
-		if !doublestar.ValidatePattern(g) {
-			return fmt.Errorf("sandbox.non_git_change_globs has an invalid pattern: %q", g)
-		}
-	}
 	return nil
 }
 

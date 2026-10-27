@@ -16,7 +16,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jiaweisky/harbor/internal/agent"
-	"github.com/jiaweisky/harbor/internal/changes"
 	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/telemetry"
 )
@@ -76,10 +75,6 @@ type CLIExecutor struct {
 	breaker                *breaker      // nil disables
 	tasks                  sync.Map      // taskID -> *taskState (all per-task transient state)
 	maxTurns               int
-	nonImageArtifacts      bool     // emit an artifact for each changed non-image file
-	artifactInlineMaxBytes int64    // max changed-file bytes inlined; 0 uses the default
-	diffInlineMaxBytes     int64    // max diff bytes; 0 uses the default
-	nonGitChangeGlobs      []string // opt-in globs for change capture outside git
 	taskLookup             func(context.Context, a2a.TaskID) (*a2a.Task, bool)
 	idem                   *idemCache // messageId -> taskID (duplicate-send guard)
 	metrics                *agentMetrics
@@ -106,24 +101,6 @@ func NewCLIExecutor(
 		idem:        newIdemCache(4096),
 		metrics:     &agentMetrics{},
 	}
-}
-
-// SetNonImageFileArtifacts enables emitting a per-file artifact for each changed
-// non-image file.
-func (e *CLIExecutor) SetNonImageFileArtifacts(on bool) { e.nonImageArtifacts = on }
-
-// SetArtifactInlineMaxBytes bounds how much of one changed file is inlined into a
-// file or image artifact; 0 uses the default.
-func (e *CLIExecutor) SetArtifactInlineMaxBytes(n int64) { e.artifactInlineMaxBytes = n }
-
-// SetDiffInlineMaxBytes bounds the captured diff before it is truncated; 0 uses
-// the default.
-func (e *CLIExecutor) SetDiffInlineMaxBytes(n int64) { e.diffInlineMaxBytes = n }
-
-// SetNonGitChangeGlobs enables non-git change capture for the given relative
-// glob patterns; an empty list disables it.
-func (e *CLIExecutor) SetNonGitChangeGlobs(globs []string) {
-	e.nonGitChangeGlobs = append([]string(nil), globs...)
 }
 
 // SetKeepaliveInterval makes the executor emit a lightweight working update
@@ -277,11 +254,8 @@ func (e *CLIExecutor) start(
 	if req.OutputSchema != nil {
 		st.setStructured(&structuredState{})
 	}
-	st.setLock(e.workspace.Lock(req.WorkDir))
-	if req.WorkDir != "" {
-		st.setBaseline(changes.Snapshot(req.WorkDir, e.nonGitChangeGlobs...))
-	}
-	e.launchAndPump(ctx, st, ec, taskID, req, false, yield)
+		st.setLock(e.workspace.Lock(req.WorkDir))
+		e.launchAndPump(ctx, st, ec, taskID, req, false, yield)
 }
 
 // launchAndPump starts the CLI for a prepared task and pumps its events. A
@@ -557,7 +531,11 @@ func emitTrace(ec *a2asrv.ExecutorContext, emit func(a2a.Event) bool, ev agent.E
 		return emit(traceStatus(ec, "tool_call", "tool: "+ev.Tool,
 			map[string]any{"tool": ev.Tool, "input": ev.ToolInput}))
 	case agent.EventToolResult:
-		return emit(traceStatus(ec, "tool_result", "tool result", nil))
+		meta := map[string]any{}
+		if ev.Text != "" {
+			meta["output"] = ev.Text
+		}
+		return emit(traceStatus(ec, "tool_result", "tool result", meta))
 	case agent.EventUsage:
 		return emit(traceStatus(ec, "usage", "usage", usageMeta(ev.Usage)))
 	}
@@ -632,7 +610,6 @@ func (e *CLIExecutor) finish(
 		return
 	}
 	e.emitStructuredFallback(st, ec, sink, emit)
-	e.emitChanges(ec, taskID, emit)
 	e.breaker.Success()
 	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil))
 }
@@ -640,7 +617,6 @@ func (e *CLIExecutor) finish(
 // complete finishes a task on a terminal event the CLI reported, without
 // waiting for the process to exit (a duplex CLI keeps running for more input).
 func (e *CLIExecutor) complete(ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool) {
-	e.emitChanges(ec, taskID, emit)
 	e.breaker.Success()
 	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil))
 	e.forget(taskID)
@@ -659,12 +635,11 @@ func (e *CLIExecutor) idleTimeoutFail(
 	e.fail(ec, taskID, emit, codeTimeout, "task idle timeout")
 }
 
-// fail captures a task's changes and emits a failed status with a
-// machine-readable code, then releases the task's state.
+// fail emits a failed status with a machine-readable code, then releases
+// the task's state.
 func (e *CLIExecutor) fail(
 	ec *a2asrv.ExecutorContext, taskID string, emit func(a2a.Event) bool, code, msg string,
 ) {
-	e.emitChanges(ec, taskID, emit)
 	e.breaker.Failure()
 	emit(failedStatus(ec, code, msg))
 	e.forget(taskID)

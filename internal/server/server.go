@@ -44,6 +44,7 @@ func sessionStore(sc config.ServerConfig, agentID string) (bridge.SessionStore, 
 	if sc.Store != config.StoreSQLite || sc.SessionStoreDir == "" {
 		return session.New(), nil
 	}
+
 	return session.NewSQLiteStore(filepath.Join(sc.SessionStoreDir, agentID+".db"))
 }
 
@@ -54,6 +55,7 @@ func containerSpec(s config.SandboxConfig, workdir string, needsSource bool) *sa
 	if s.Container == nil {
 		return nil
 	}
+
 	return &sandbox.Container{
 		Runtime:   string(s.Container.Runtime),
 		Image:     s.Container.Image,
@@ -73,10 +75,12 @@ func NewHandler(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (htt
 	if cfg.Sandbox.Isolation != "" && cfg.Sandbox.Isolation != workspace.IsolationShared {
 		return nil, fmt.Errorf("server.NewHandler cannot manage isolation resources; use server.New")
 	}
+
 	servers, err := newServers(ctx, cfg, rt)
 	if err != nil {
 		return nil, err
 	}
+
 	return servers.HTTP, nil
 }
 
@@ -99,11 +103,14 @@ func New(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Servers, 
 	if err != nil {
 		return nil, fmt.Errorf("server tls: %w", err)
 	}
+
 	servers, err := newServers(ctx, cfg, rt)
 	if err != nil {
 		return nil, err
 	}
+
 	servers.TLSConfig = tlsConfig
+
 	return servers, nil
 }
 
@@ -115,9 +122,11 @@ func newServers(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Se
 	); err != nil {
 		return nil, err
 	}
+
 	if cfg.Sandbox.Isolation == workspace.IsolationOverlayFS && cfg.Sandbox.Container != nil {
 		return nil, fmt.Errorf("sandbox.container cannot be combined with isolation overlayfs")
 	}
+
 	if cfg.Sandbox.Isolation == workspace.IsolationCopy && cfg.Sandbox.CopyStrategy == workspace.CopyCow {
 		for i := range cfg.Agents {
 			if err := workspace.CheckCopySource(cfg.Agents[i].Workdir, cfg.Sandbox.IsolationRoot); err != nil {
@@ -125,23 +134,28 @@ func newServers(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Se
 			}
 		}
 	}
+
 	auth, err := authMiddleware(cfg.Server.Auth)
 	if err != nil {
 		return nil, err
 	}
+
 	taskStore, err := newTaskStore(cfg.Server)
 	if err != nil {
 		return nil, err
 	}
+
 	var closers []io.Closer
 	if c, ok := taskStore.(io.Closer); ok {
 		closers = append(closers, c)
 	}
+
 	isolationLock, err := workspace.LockIsolationRoot(cfg.Sandbox.Isolation, cfg.Sandbox.IsolationRoot)
 	if err != nil {
 		_ = closeAll(closers)
 		return nil, err
 	}
+
 	if err := workspace.PrepareIsolation(cfg.Sandbox.Isolation, cfg.Sandbox.IsolationRoot); err != nil {
 		if isolationLock != nil {
 			_ = isolationLock.Close()
@@ -170,13 +184,16 @@ func newServers(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Se
 		keepalive:      inactivity / 2,
 		closers:        closers,
 	}
+
 	for i := range cfg.Agents {
 		b.addAgent(ctx, cfg.Agents[i])
 	}
+
 	// Release views before releasing the isolation_root lock.
 	if isolationLock != nil {
 		b.closers = append(b.closers, isolationLock)
 	}
+
 	if len(b.cards) == 0 {
 		_ = closeAll(b.closers)
 		return nil, fmt.Errorf("no agents available; check the agent config and that their binaries exist")
@@ -190,6 +207,7 @@ func newServers(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Se
 	mux.HandleFunc("/metrics", metricsHandler(b.execs))
 
 	httpHandler := traceMiddleware(CORSMiddleware(cfg.Server.CORSAllowedOrigins, mux))
+
 	return &Servers{HTTP: httpHandler, closers: b.closers}, nil
 }
 
@@ -201,6 +219,7 @@ func closeAll(closers []io.Closer) error {
 			err = e
 		}
 	}
+
 	return err
 }
 
@@ -211,10 +230,12 @@ func newTaskStore(sc config.ServerConfig) (taskstore.Store, error) {
 	if sc.Store != config.StoreSQLite || sc.StorePath == "" {
 		return taskstore.NewInMemory(nil), nil
 	}
+
 	ts, err := store.NewSQLiteStore(sc.StorePath)
 	if err != nil {
 		return nil, fmt.Errorf("task store: %w", err)
 	}
+
 	return ts, nil
 }
 
@@ -225,6 +246,7 @@ func taskLookupFunc(ts taskstore.Store) func(context.Context, a2a.TaskID) (*a2a.
 		if err != nil || st == nil || st.Task == nil {
 			return nil, false
 		}
+
 		return st.Task, true
 	}
 }
@@ -248,6 +270,7 @@ func inactivityTimeout(sc config.ServerConfig) time.Duration {
 	if sc.AgentInactivityTimeout != nil {
 		return *sc.AgentInactivityTimeout
 	}
+
 	return 10 * time.Minute
 }
 
@@ -277,6 +300,7 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	resolver := workspace.NewResolverWithScope(ac.ID, ac.Workdir,
 		b.cfg.Sandbox.Isolation, b.cfg.Sandbox.IsolationRoot, b.cfg.Sandbox.CopyStrategy)
 	b.closers = append(b.closers, resolver)
+
 	ln, info, err := integration.Build(ctx, ac, integration.Options{
 		InheritEnv: b.cfg.Sandbox.InheritEnvEnabled(),
 		CLIHome:    b.cfg.Sandbox.CLIHome,
@@ -287,35 +311,38 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 		slog.Warn("agent disabled", "id", ac.ID, "err", err)
 		return
 	}
+
 	if !info.Enabled {
 		slog.Warn("binary missing", "id", ac.ID, "err", info.Err)
 		return
 	}
+
 	sessions, err := sessionStore(b.cfg.Server, ac.ID)
 	if err != nil {
 		slog.Warn("agent disabled", "id", ac.ID, "err", err)
 		return
 	}
+
 	if c, ok := sessions.(io.Closer); ok {
 		b.closers = append(b.closers, c)
 	}
+
 	exec := bridge.NewCLIExecutor(ln, sessions, agent.NewLiveSessions(), resolver, ac.Limits.Core())
-	exec.SetNonImageFileArtifacts(b.cfg.Sandbox.NonImageFileArtifacts)
-	exec.SetArtifactInlineMaxBytes(b.cfg.Sandbox.ArtifactInlineMaxBytes)
-	exec.SetDiffInlineMaxBytes(b.cfg.Sandbox.DiffInlineMaxBytes)
-	exec.SetNonGitChangeGlobs(b.cfg.Sandbox.NonGitChangeGlobs)
-	exec.SetTaskLookup(b.taskLookup)
+					exec.SetTaskLookup(b.taskLookup)
+
 	// Enable the keepalive only when the agent also has a Harbor-side bound, so
 	// that suppressing the server watchdog for a long silent step does not leave
 	// a genuinely hung CLI running with no timeout to reap it.
 	if ac.Limits.Timeout > 0 || ac.Limits.IdleTimeout > 0 {
 		exec.SetKeepaliveInterval(b.keepalive)
 	}
+
 	handler := a2asrv.NewHandler(exec, b.handlerOptions...)
 
 	path := AgentPath(ac.ID)
 	card := bridge.BuildCard(ln, info, EndpointURL(b.cfg.Server.BaseURL, ac.ID), b.bearer)
 	limit := b.cfg.Server.MaxRequestBytes
+
 	b.mux.Handle(path, b.auth(b.rl.middleware(ac.ID, maxBytes(limit, a2asrv.NewJSONRPCHandler(handler)))))
 	// The HTTP+JSON (A2A REST) binding, mounted under the agent's base path.
 	rest := http.StripPrefix(path+bridge.RESTMount, a2asrv.NewRESTHandler(handler))
@@ -325,6 +352,7 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	b.cards = append(b.cards, card)
 	b.execs = append(b.execs, exec)
 	b.authReady[ac.ID] = ln.AuthReady(ctx)
+
 	slog.Info("agent ready", "id", ac.ID, "integration", ac.Integration, "endpoint", path)
 }
 
@@ -351,6 +379,7 @@ func readinessHandler(execs []*bridge.CLIExecutor, authReady map[string]bool) ht
 	return func(w http.ResponseWriter, _ *http.Request) {
 		agents := make(map[string]agentReadiness, len(execs))
 		ready := false
+
 		for _, e := range execs {
 			name := e.Name()
 			rdy := e.Ready()
@@ -359,10 +388,13 @@ func readinessHandler(execs []*bridge.CLIExecutor, authReady map[string]bool) ht
 				ready = true
 			}
 		}
+
 		w.Header().Set("Content-Type", "application/json")
+
 		if !ready {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
+
 		_ = json.NewEncoder(w).Encode(map[string]any{"ready": ready, "agents": agents})
 	}
 }
@@ -373,6 +405,7 @@ func maxBytes(n int64, next http.Handler) http.Handler {
 	if n <= 0 {
 		return next
 	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, n)
 		next.ServeHTTP(w, r)
@@ -387,6 +420,7 @@ func metricsHandler(execs []*bridge.CLIExecutor) http.HandlerFunc {
 		for _, e := range execs {
 			snaps = append(snaps, e.Snapshot())
 		}
+
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		bridge.WritePrometheus(w, snaps)
 	}

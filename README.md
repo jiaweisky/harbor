@@ -221,10 +221,6 @@ any unset reference.
 | `state_dir` | string | **yes** | — | writable dir for CLI process records used for orphan cleanup; use a private per-user dir when several instances or users share a host |
 | `container` | object | no | — | run each CLI in a container (filesystem isolation; network and extra flags are deployer-owned) |
 | `require_container_for_dangerous` | bool | no | `false` | refuse `allow_dangerous` agents without a container |
-| `non_image_file_artifacts` | bool | no | `false` | emit a `FilePart` per changed non-image file |
-| `artifact_inline_max_bytes` | int | no | `268435456` | max bytes of one changed file inlined into a file or image artifact |
-| `diff_inline_max_bytes` | int | no | `33554432` | max captured diff bytes before truncation |
-| `non_git_change_globs` | string[] | no | — | relative glob patterns enabling change capture outside git; empty disables it (and its artifacts) |
 | `raw_stream_dir` | string | no | — | write each task's raw stdout/stderr to this dir |
 | `raw_stream_compress` | bool | no | `false` | gzip the raw-stream files |
 
@@ -257,14 +253,8 @@ Changing any of them starts a new per-context tree; the previous directory stays
 under `isolation_root` and is not reused. Trees created by versions that keyed
 only by context ID are likewise not reused.
 
-`sandbox.file_artifacts` was renamed to `sandbox.non_image_file_artifacts`, and
-`sandbox.file_artifact_max_bytes` to `sandbox.artifact_inline_max_bytes`; the old
-keys are rejected.
 
-Change capture outside git is opt-in: configure `sandbox.non_git_change_globs`
-with relative patterns such as `src/**` or `*.md`. The baseline only hashes
-matching files; unset or empty disables diffs and file/image artifacts for
-non-git workdirs. Workdirs inside a git repository keep using git.
+
 
 `sandbox.container`:
 

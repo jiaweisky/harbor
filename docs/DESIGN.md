@@ -613,7 +613,6 @@ func (e *CLIExecutor) pump(ec *a2asrv.ExecutorContext, sess agent.Session,
         }
     }
     co.Flush(emit)
-    e.emitChanges(ec, yield) // emit the code-change artifact before the terminal state
     e.live.Del(ec.TaskID())
     yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil), nil)
 }
@@ -688,21 +687,25 @@ A coding agent only makes sense inside a **real codebase**, and a CLI treats its
   - `overlayfs` (Linux only): mount a per-context view with the workdir as a read-only lower layer and `upper`/`work` under `sandbox.isolation_root`. It requires mount privileges, cannot be combined with `sandbox.container`, and keeps upper layers across restarts so a resumed context reuses its changes.
 - **cwd and `PWD`**: the child process is started with the resolved directory as **cwd**, and **`PWD`** is set to it in sync — `exec` only changes the kernel cwd and does not update the inherited `PWD`, while some CLIs (e.g. opencode) determine the session/project directory from `PWD`; if not synchronized, they read and write Harbor's cwd.
 
-### 6.8 Collecting Code Changes and Expressing Them as Artifacts
+### 6.8 Expressing File Changes
 
-The core output of a coding agent is **code changes**, which must be delivered as an artifact rather than only as final text.
+Modification information reaches the client through the CLI's event stream, per
+integration: claude/codebuddy (stream-json) forward tool inputs and tool
+results (an Edit carries the before/after text, a Write the full content);
+codex emits `file_change` items (paths and change kinds) and
+`command_execution` items; ACP integrations forward `tool_call` content and
+`rawInput`. Harbor normalizes these into events (§6.2), so every client sees
+what the agent did as it happens.
 
-- **Baseline snapshot**: record a baseline at task start — for a git repository store `HEAD`; for a non-git directory record the hashes of `sandbox.non_git_change_globs` matches only (unset disables non-git capture).
-- **Produce the diff**: at terminal state (or after a tool reports an edit), compute the changes: for git use `git diff <base>` (including tracked) + untracked files; for non-git compare against the baseline hashes to generate an added/modified/removed summary.
-- **artifact form**:
-  - **diff artifact**: `Name="changes"`, `TextPart`; git unified diffs use `text/x-diff`, non-git summaries use `text/plain`; bounded by `sandbox.diff_inline_max_bytes` (default 32 MiB);
-  - **per-file artifact (already implemented, optional)**: when `sandbox.non_image_file_artifacts: true`, in addition to the diff, each changed non-image file is emitted as its own `FilePart` (MIME determined by extension, bounded by `sandbox.artifact_inline_max_bytes`, default 256 MiB; image artifacts are always emitted). Outside git, change capture is opt-in via `sandbox.non_git_change_globs`; unset/empty disables diffs and file/image artifacts for that workdir;
-  - diff artifact metadata: `{"files":[...],"truncated":bool,"format":"unified"|"summary"}`; file/image artifacts use `{"path":...}`; an omitted artifact adds `{"omitted":true,"size":...}`.
-- **Streaming vs finalization**: by default it is delivered **once at finalization** (stable); if the CLI can report per-file edits (tool_result carrying a path), `ArtifactUpdateEvent` can be emitted incrementally per file.
-- **Boundary**: only collect changes within the resolved workdir; very long diffs are trimmed and marked `truncated`; binaries report only paths.
-- In coordination with §6.7: in `worktree` mode the diff is relative to that context's baseline.
-- **Concurrency affects diff reliability**: in `shared` mode, concurrent runs in the same directory mix in others' changes → the diff is unreliable; production should use `worktree` or lock by directory (§6.7).
-- **Planned git snapshot**: replace the HEAD-only baseline with a per-task shadow snapshot repository and baseline/current git trees, so pre-existing dirty/untracked changes are excluded and untracked content is included. See `SNAPSHOT-DESIGN.md`.
+Harbor does not compute diffs or push changed files as artifacts. A filesystem
+diff cannot tell whether a changed file is a deliverable the client wants, and
+the event stream already carries the modification content. For durable
+delivery of generated files (images, reports), attach a storage MCP tool to
+the agent: the agent uploads the file and cites the URL in its output, and the
+client fetches it on demand. The codebuddy run-stream integration
+(`server_protocol: http`) streams only the final text and a tool summary, so
+deployments that need its change visibility should configure
+`server_protocol: acp`, whose stream carries the full event set.
 
 ### 6.9 Request Metadata and Error-Code Contract
 
@@ -853,7 +856,14 @@ Key point: **capability validation up front** — if the media type/interaction 
 
 **Image input (already implemented, codebuddy's stream-json)**: once the profile's `InputImage` (png/jpeg/gif/webp) is declared, images in `FilePart(raw)` are **no longer persisted** but sent as a native **image content block** (base64) with the first user message over stdin, so the model sees the pixels directly; URL images are passed through as text and metadata. Real-machine testing with codebuddy: sending a pure red PNG → answered `Red`. claude's stream-json input returns `[Unsupported Image]` for images, so `InputImage` is **not** declared for it (images fall back to persisting + path reference).
 
-**Image output (already implemented)**: at task end, in addition to the existing diff, `emitChanges` emits **newly added/changed image files** in the workdir (by extension png/jpg/jpeg/gif/webp, each ≤8MiB) as **raw image artifacts** (`FilePart`, with `MediaType`/`Filename`/`path` metadata) — so text-to-image results (e.g. images persisted by codebuddy `--text-to-image-model`) reach the client as images rather than merely as diff lines. `Profile.OutputImage` declares the producible image MIME, projected via `Capabilities.OutputImage` into the card's `defaultOutputModes` (already declared for codebuddy). Note: the mechanism is generic workdir monitoring and is not bound to a specific CLI.
+**Generated file delivery (via storage tools)**: files the agent generates
+(images, reports) are delivered by attaching a storage MCP tool to the agent:
+the agent uploads the file and cites the URL in its output, and the client
+fetches it on demand (the tool call and its result URL reach the client
+through the event stream). `Profile.OutputImage` declares the producible
+image MIME, projected via `Capabilities.OutputImage` into the card's
+`defaultOutputModes` (already declared for codebuddy), so clients can
+advertise the capability without Harbor inspecting the workdir.
 
 **Structured output (already implemented)**:
 - **stream-json**: when the request metadata `harbor.outputSchema` provides a JSON Schema, Harbor appends `--json-schema`, and the CLI's `structured_output` is parsed into `EventStructuredOutput` and returned as a `result` DataPart artifact (real-machine tested with claude/codebuddy).
@@ -1204,17 +1214,14 @@ harbor/
 │   │   ├── discovery.go        # aggregate discovery endpoint (codebuddy compat)
 │   │   └── server.go           # routing / transport assembly
 │   ├── config/                 # YAML parsing and validation
-│   ├── artifact/               # change capture / diff -> A2A artifact
 │   ├── sandbox/                # workdir / env / container
 │   └── store/                  # taskstore / sessionstore / live sessions
 ├── docs/
 │   ├── DESIGN.md               # this document
-│   ├── SNAPSHOT-DESIGN.md      # planned git snapshot baseline
 │   └── interaction.md          # interaction extension JSON schema
 ├── examples/
 │   ├── agents.yaml
 │   └── client/                 # a2a client call examples
-├── testdata/fake-cli/          # fake CLI scripts (deterministic tests)
 └── go.mod
 ```
 
@@ -1584,10 +1591,6 @@ type SandboxConfig struct {
     StateDir       string           `yaml:"state_dir"`       // orphan process records
     Container      *ContainerConfig `yaml:"container"`       // optional strong isolation
     RequireContainerForDangerous bool `yaml:"require_container_for_dangerous"` // dangerous-mode hardening
-    NonImageFileArtifacts         bool   `yaml:"non_image_file_artifacts"`    // per-file non-image artifacts
-    ArtifactInlineMaxBytes        int64    `yaml:"artifact_inline_max_bytes"`   // max bytes inlined per artifact
-    DiffInlineMaxBytes            int64    `yaml:"diff_inline_max_bytes"`       // max diff bytes before truncation
-    NonGitChangeGlobs             []string `yaml:"non_git_change_globs"`      // opt-in non-git change patterns
     RawStreamDir                  string `yaml:"raw_stream_dir"`              // raw stream output dir
     RawStreamCompress             bool   `yaml:"raw_stream_compress"`          // gzip raw stream files
 }
