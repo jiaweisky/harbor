@@ -22,6 +22,7 @@ func TestSQLiteStoreSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
+	defer s.Close()
 	task := &a2a.Task{ID: "t1", ContextID: "c1", Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}
 	if _, err := s.Create(ctx, task); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -31,6 +32,7 @@ func TestSQLiteStoreSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
+	defer reopened.Close()
 	got, err := reopened.Get(ctx, "t1")
 	if err != nil {
 		t.Fatalf("Get after reopen: %v", err)
@@ -48,6 +50,7 @@ func TestSQLiteStoreVersions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Close()
 	task := &a2a.Task{ID: "t1", ContextID: "c1", Status: a2a.TaskStatus{State: a2a.TaskStateSubmitted}}
 	v, err := s.Create(ctx, task)
 	if err != nil || v != taskstore.TaskVersion(1) {
@@ -80,6 +83,7 @@ func TestSQLiteStoreListRequiresUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Close()
 	if _, err := s.List(context.Background(), &a2a.ListTasksRequest{}); !errors.Is(err, a2a.ErrUnauthenticated) {
 		t.Fatalf("List err = %v, want ErrUnauthenticated", err)
 	}

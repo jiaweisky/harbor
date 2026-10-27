@@ -15,12 +15,14 @@ func TestSQLiteStorePersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
+	defer s.Close()
 	s.Bind("ctx-1", "ses-1")
 
 	reopened, err := session.NewSQLiteStore(path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
+	defer reopened.Close()
 	if got, ok := reopened.Get("ctx-1"); !ok || got != "ses-1" {
 		t.Fatalf("Get = %q, %v; want ses-1, true", got, ok)
 	}
@@ -32,6 +34,7 @@ func TestSQLiteStoreRebind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Close()
 	s.Bind("ctx", "ses-1")
 	s.Bind("ctx", "ses-2")
 	if got, _ := s.Get("ctx"); got != "ses-2" {
