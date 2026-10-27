@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"errors"
-	"path/filepath"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 	"github.com/jiaweisky/harbor/internal/core"
@@ -65,7 +64,7 @@ func init() {
 
 // LookupDescriptor returns the descriptor for a binary path or name.
 func LookupDescriptor(binary string) (Descriptor, bool) {
-	d, ok := descriptors[filepath.Base(binary)]
+	d, ok := descriptors[baseName(binary)]
 	return d, ok
 }
 
@@ -74,16 +73,19 @@ func AuthFor(binary, version string) agent.Authenticator {
 	if d, ok := LookupDescriptor(binary); ok && d.Auth != nil {
 		return d.Auth(version)
 	}
+
 	return Unverified()
 }
 
 // AttachBuilder attaches a dedicated launcher builder to a known CLI.
 func AttachBuilder(binary string, build Builder) {
-	binary = filepath.Base(binary)
+	binary = baseName(binary)
+
 	d, ok := LookupDescriptor(binary)
 	if !ok {
 		d = Descriptor{Binary: binary}
 	}
+
 	d.Build = build
 	descriptors[d.Binary] = d
 }
@@ -91,7 +93,7 @@ func AttachBuilder(binary string, build Builder) {
 // Register adds or replaces a descriptor. Plugins use this to add a CLI Harbor
 // does not know about.
 func Register(d Descriptor) {
-	d.Binary = filepath.Base(d.Binary)
+	d.Binary = baseName(d.Binary)
 	descriptors[d.Binary] = d
 }
 
@@ -101,5 +103,6 @@ func LookupProfile(binary string) (Profile, bool) {
 	if d, ok := LookupDescriptor(binary); ok && d.Profile.Binary != "" {
 		return d.Profile, true
 	}
+
 	return Lookup(binary)
 }

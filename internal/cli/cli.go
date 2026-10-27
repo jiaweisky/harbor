@@ -5,6 +5,7 @@ package cli
 
 import (
 	"path/filepath"
+	"strings"
 
 	"github.com/jiaweisky/harbor/internal/core"
 )
@@ -47,6 +48,7 @@ func (p Profile) Supports(i core.Integration) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -82,12 +84,30 @@ var knownProfiles = []Profile{
 }
 
 // Lookup returns the profile for a binary path or name.
-func Lookup(binary string) (Profile, bool) {
+// baseName normalizes a binary path or name for registry lookups: the base
+// name without the executable extension Windows appends (.exe, .cmd, .bat,
+// .ps1). Without this, a registry keyed by "codebuddy" never matches the
+// codebuddy.cmd that Windows PATH resolution hands to Harbor, silently
+// disabling profiles, auth, and dedicated adapters on that platform.
+func baseName(binary string) string {
 	name := filepath.Base(binary)
+	if ext := filepath.Ext(name); ext != "" {
+		switch strings.ToLower(ext) {
+		case ".exe", ".cmd", ".bat", ".ps1":
+			return strings.TrimSuffix(name, ext)
+		}
+	}
+	return name
+}
+
+func Lookup(binary string) (Profile, bool) {
+	name := baseName(binary)
+
 	for _, p := range knownProfiles {
 		if p.Binary == name {
 			return p, true
 		}
 	}
+
 	return Profile{}, false
 }
