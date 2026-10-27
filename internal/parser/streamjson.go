@@ -3,6 +3,7 @@ package parser
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/jiaweisky/harbor/internal/agent"
 )
@@ -25,6 +26,7 @@ func (p *StreamJSON) Parse(rec []byte, out func(agent.Event)) error {
 		out(agent.Event{Kind: agent.EventTextDelta, Text: string(rec) + "\n", Raw: rec})
 		return nil
 	}
+
 	var typ string
 	_ = json.Unmarshal(raw["type"], &typ)
 
@@ -42,6 +44,7 @@ func (p *StreamJSON) Parse(rec []byte, out func(agent.Event)) error {
 	case "result":
 		p.parseResult(rec, out)
 	}
+
 	return nil
 }
 
@@ -53,6 +56,7 @@ func (p *StreamJSON) Flush(func(agent.Event)) error { return nil }
 // otherwise silent stream from looking idle to a liveness watchdog).
 func (p *StreamJSON) parseStreamEvent(rec []byte, out func(agent.Event)) {
 	text, thinking := deltaText(rec)
+
 	switch {
 	case thinking != "":
 		out(agent.Event{Kind: agent.EventThinking, Text: thinking, Raw: rec})
@@ -63,12 +67,19 @@ func (p *StreamJSON) parseStreamEvent(rec []byte, out func(agent.Event)) {
 	}
 }
 
-// parseSystem captures the CLI session id.
+// parseSystem captures the CLI session id. Real CLIs emit several system
+// subtypes over one run (claude sends thinking_tokens progress records, for
+// example); only the init announcement binds the session.
 func (p *StreamJSON) parseSystem(rec []byte, out func(agent.Event)) {
 	var s struct {
+		Subtype   string `json:"subtype"`
 		SessionID string `json:"session_id"`
 	}
+
 	_ = json.Unmarshal(rec, &s)
+	if s.Subtype != "init" || s.SessionID == "" {
+		return
+	}
 	out(agent.Event{Kind: agent.EventSession, SessionID: s.SessionID, Raw: rec})
 }
 
@@ -93,11 +104,13 @@ func (p *StreamJSON) parseAssistant(rec []byte, out func(agent.Event)) {
 	}
 }
 
-// parseUser surfaces tool results echoed back by the CLI (best effort).
+// parseUser surfaces tool results echoed back by the CLI (best effort): the
+// tool's text output travels on the event so the client sees what the tool
+// produced, not just that it ran.
 func (p *StreamJSON) parseUser(rec []byte, out func(agent.Event)) {
 	for _, b := range contentBlocks(rec) {
 		if b.typ == "tool_result" {
-			out(agent.Event{Kind: agent.EventToolResult, Raw: rec})
+			out(agent.Event{Kind: agent.EventToolResult, Text: b.contentText, Raw: rec})
 		}
 	}
 }
@@ -115,17 +128,21 @@ func (p *StreamJSON) parseResult(rec []byte, out func(agent.Event)) {
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
 	}
+
 	_ = json.Unmarshal(rec, &r)
 	if r.IsError {
 		out(agent.Event{Kind: agent.EventError, Err: errors.New(r.Result), Raw: rec})
 		return
 	}
+
 	if data := structuredData(r.StructuredOutput); data != nil {
 		out(agent.Event{Kind: agent.EventStructuredOutput, Data: data, Raw: rec})
 	}
+
 	if !p.sawText {
 		out(agent.Event{Kind: agent.EventTextFinal, Text: r.Result, SessionID: r.SessionID, Raw: rec})
 	}
+
 	if r.Usage != nil || r.CostUSD > 0 {
 		u := &agent.Usage{CostUSD: r.CostUSD}
 		if r.Usage != nil {
@@ -134,6 +151,7 @@ func (p *StreamJSON) parseResult(rec []byte, out func(agent.Event)) {
 		}
 		out(agent.Event{Kind: agent.EventUsage, Usage: u, Raw: rec})
 	}
+
 	out(agent.Event{Kind: agent.EventDone, Raw: rec})
 }
 
@@ -143,19 +161,22 @@ func structuredData(raw json.RawMessage) map[string]any {
 	if len(raw) == 0 {
 		return nil
 	}
+
 	var data map[string]any
 	if json.Unmarshal(raw, &data) != nil || data == nil {
 		return nil
 	}
+
 	return data
 }
 
 type contentBlock struct {
-	typ      string
-	text     string
-	thinking string
-	name     string
-	input    map[string]any
+	typ         string
+	text        string
+	thinking    string
+	name        string
+	input       map[string]any
+	contentText string // text carried by a tool_result block
 }
 
 // contentBlocks extracts message content blocks from a record.
@@ -168,19 +189,53 @@ func contentBlocks(rec []byte) []contentBlock {
 				Thinking string         `json:"thinking"`
 				Name     string         `json:"name"`
 				Input    map[string]any `json:"input"`
+				Content  json.RawMessage `json:"content"`
 			} `json:"content"`
 		} `json:"message"`
 	}
+
 	if err := json.Unmarshal(rec, &msg); err != nil {
 		return nil
 	}
+
 	blocks := make([]contentBlock, 0, len(msg.Message.Content))
 	for _, c := range msg.Message.Content {
 		blocks = append(blocks, contentBlock{
 			typ: c.Type, text: c.Text, thinking: c.Thinking, name: c.Name, input: c.Input,
+			contentText: toolResultText(c.Content),
 		})
 	}
+
 	return blocks
+}
+
+// toolResultText extracts the text of a tool_result block's content, which the
+// CLIs send either as a plain string or as an array of content blocks.
+func toolResultText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+
+	var blocks []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+
+	parts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		if b.Text != "" {
+			parts = append(parts, b.Text)
+		}
+	}
+
+	return strings.Join(parts, "\n")
 }
 
 // deltaText extracts the assistant text and extended-thinking text from a
@@ -194,8 +249,10 @@ func deltaText(rec []byte) (text, thinking string) {
 			} `json:"delta"`
 		} `json:"event"`
 	}
+
 	if err := json.Unmarshal(rec, &e); err != nil {
 		return "", ""
 	}
+
 	return e.Event.Delta.Text, e.Event.Delta.Thinking
 }

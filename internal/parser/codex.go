@@ -18,17 +18,40 @@ type Codex struct{}
 // NewCodex creates a codex JSONL parser.
 func NewCodex() *Codex { return &Codex{} }
 
+// codexItem is one item of a completed turn. The known fields are decoded for
+// the common item types; Raw keeps the whole item so file_change events can
+// forward codex's own change structure verbatim.
 type codexItem struct {
-	Type    string `json:"type"`
-	Text    string `json:"text"`
-	Content string `json:"content"`
-	Command string `json:"command"`
+	Type    string          `json:"type"`
+	Text    string          `json:"text"`
+	Content string          `json:"content"`
+	Command string          `json:"command"`
+	Raw     json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON decodes the known item fields and captures the raw item.
+func (i *codexItem) UnmarshalJSON(data []byte) error {
+	type alias codexItem
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*i = codexItem(a)
+	i.Raw = append(i.Raw, data...)
+	return nil
+}
+
+// codexUsage carries the token counts codex reports on a completed turn.
+type codexUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 type codexEvent struct {
 	Type     string     `json:"type"`
 	ThreadID string     `json:"thread_id"`
 	Item     *codexItem `json:"item"`
+	Usage    *codexUsage `json:"usage"`
 	Error    *struct {
 		Message string `json:"message"`
 	} `json:"error"`
@@ -47,6 +70,11 @@ func (p *Codex) Parse(rec []byte, out func(agent.Event)) error {
 			out(agent.Event{Kind: agent.EventSession, SessionID: env.ThreadID, Raw: rec})
 		}
 	case "turn.completed":
+		if env.Usage != nil {
+			out(agent.Event{Kind: agent.EventUsage, Usage: &agent.Usage{
+				InputTokens: env.Usage.InputTokens, OutputTokens: env.Usage.OutputTokens,
+			}, Raw: rec})
+		}
 		out(agent.Event{Kind: agent.EventDone, Raw: rec})
 	case "turn.failed":
 		out(agent.Event{Kind: agent.EventError, Err: codexError(env.Error), Raw: rec})
@@ -75,6 +103,13 @@ func emitCodexItem(item *codexItem, rec []byte, out func(agent.Event)) {
 	case "command_execution":
 		out(agent.Event{Kind: agent.EventToolCall, Tool: "shell",
 			ToolInput: map[string]any{"command": item.Command}, Raw: rec})
+	case "file_change":
+		// The item carries codex's own change structure (per-file kinds and
+		// diffs); forward it verbatim as the tool input so the client sees the
+		// modification exactly as codex reported it.
+		input := map[string]any{}
+		_ = json.Unmarshal(item.Raw, &input)
+		out(agent.Event{Kind: agent.EventToolCall, Tool: "file_change", ToolInput: input, Raw: rec})
 	}
 }
 

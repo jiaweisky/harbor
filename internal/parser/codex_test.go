@@ -16,6 +16,27 @@ func collect(t *testing.T, p agent.Parser, rec string) []agent.Event {
 	return events
 }
 
+func TestCodexFileChangeAndUsage(t *testing.T) {
+	p := parser.NewCodex()
+
+	fileChange := `{"type":"item.completed","item":{"type":"file_change","changes":{"/w/main.go":{"kind":"update","unified_diff":"--- a\n+++ b"}}}}`
+	evs := collect(t, p, fileChange)
+	if len(evs) != 1 || evs[0].Kind != agent.EventToolCall || evs[0].Tool != "file_change" {
+		t.Fatalf("file_change: %+v", evs)
+	}
+	if input, _ := evs[0].ToolInput["changes"].(map[string]any); len(input) == 0 {
+		t.Fatalf("file_change input = %+v, want the verbatim item", evs[0].ToolInput)
+	}
+
+	usageTurn := `{"type":"turn.completed","usage":{"input_tokens":11,"output_tokens":22}}`
+	evs = collect(t, p, usageTurn)
+	if len(evs) != 2 || evs[0].Kind != agent.EventUsage || evs[0].Usage == nil ||
+		evs[0].Usage.InputTokens != 11 || evs[0].Usage.OutputTokens != 22 ||
+		evs[1].Kind != agent.EventDone {
+		t.Fatalf("turn.completed with usage: %+v", evs)
+	}
+}
+
 func TestCodexParse(t *testing.T) {
 	p := parser.NewCodex()
 

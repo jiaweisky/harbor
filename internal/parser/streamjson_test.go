@@ -194,6 +194,25 @@ func TestStreamJSONStructuredOutput(t *testing.T) {
 	}
 }
 
+func TestStreamJSONToolResultCarriesOutput(t *testing.T) {
+	stringContent := `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]}}`
+	blockContent := `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"line1"},{"type":"text","text":"line2"}]}]}}`
+
+	p := parser.NewStreamJSON()
+	evs := collect(t, p, stringContent)
+	evs = append(evs, collect(t, p, blockContent)...)
+
+	if len(evs) != 2 || evs[0].Kind != agent.EventToolResult || evs[1].Kind != agent.EventToolResult {
+		t.Fatalf("events = %+v, want two tool results", evs)
+	}
+	if evs[0].Text != "done" {
+		t.Fatalf("string content text = %q, want %q", evs[0].Text, "done")
+	}
+	if evs[1].Text != "line1\nline2" {
+		t.Fatalf("block content text = %q, want %q", evs[1].Text, "line1\nline2")
+	}
+}
+
 func TestStreamJSONAskUserQuestion(t *testing.T) {
 	p := parser.NewStreamJSON()
 	rec := `{"type":"control_request","request_id":"perm_q1",` +
