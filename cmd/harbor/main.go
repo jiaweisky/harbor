@@ -92,7 +92,7 @@ func run() error {
 	}
 	defer func() {
 		if err := servers.Close(); err != nil {
-			slog.Warn("store close", "err", err)
+			slog.Warn("server close", "err", err)
 		}
 	}()
 	srv := &http.Server{

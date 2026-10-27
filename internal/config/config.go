@@ -89,9 +89,9 @@ type AuthConfig struct {
 
 // SandboxConfig configures workspace and env constraints.
 type SandboxConfig struct {
-	Isolation     core.Isolation    `yaml:"isolation"`      // shared | worktree | copy
-	IsolationRoot string            `yaml:"isolation_root"` // base dir for worktree/copy (required for those)
-	CopyStrategy  core.CopyStrategy `yaml:"copy_strategy"`  // copy only: full (default) is implemented
+	Isolation     core.Isolation    `yaml:"isolation"`      // shared | worktree | copy | overlayfs
+	IsolationRoot string            `yaml:"isolation_root"` // required for worktree/copy/overlayfs
+	CopyStrategy  core.CopyStrategy `yaml:"copy_strategy"`  // copy only: full | cow
 	InheritEnv    *bool             `yaml:"inherit_env"`    // default true; false restricts to an allowlisted env
 	CLIHome       string            `yaml:"cli_home"`       // optional root for the CLI's config/home
 	StateDir      string            `yaml:"state_dir"`      // required; CLI process records for orphan cleanup

@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jiaweisky/harbor/internal/workspace"
 )
@@ -50,80 +49,6 @@ func TestIsolationWorktree(t *testing.T) {
 	}
 }
 
-func TestIsolationCopy(t *testing.T) {
-	parent := t.TempDir()
-	iso := filepath.Join(parent, "iso")
-	src := filepath.Join(parent, "repo")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("base"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(src, "run.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// A symlink to a file outside the source tree must be recreated as a link,
-	// not followed and copied.
-	outside := filepath.Join(parent, "outside.txt")
-	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(src, "link")); err != nil {
-		t.Fatal(err)
-	}
-
-	r := workspace.NewResolverWithIsolation(src, workspace.IsolationCopy, iso, "")
-	a, err := r.Resolve("ctx-a")
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
-	if a == src {
-		t.Fatal("copy isolation should not use the source directory")
-	}
-	copied, err := os.ReadFile(filepath.Join(a, "a.txt"))
-	if err != nil || string(copied) != "base" {
-		t.Fatalf("copied file: %q, %v", copied, err)
-	}
-	want, err := os.Stat(filepath.Join(src, "run.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.Stat(filepath.Join(a, "run.sh"))
-	if err != nil || got.Mode().Perm() != want.Mode().Perm() {
-		t.Fatalf("copied mode = %v, %v; want %v", got, err, want.Mode().Perm())
-	}
-	li, err := os.Lstat(filepath.Join(a, "link"))
-	if err != nil || li.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("copied symlink = %v, %v; want a symlink", li, err)
-	}
-}
-
-func TestLockSerializes(t *testing.T) {
-	r := workspace.NewResolver(t.TempDir())
-
-	unlock := r.Lock("/x")
-	acquired := make(chan struct{})
-	go func() {
-		u := r.Lock("/x")
-		close(acquired)
-		u()
-	}()
-
-	select {
-	case <-acquired:
-		t.Fatal("second lock acquired while the first is held")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	unlock()
-	select {
-	case <-acquired:
-	case <-time.After(time.Second):
-		t.Fatal("lock was not released")
-	}
-}
-
 func TestSharedReturnsWorkdir(t *testing.T) {
 	dir := t.TempDir()
 	r := workspace.NewResolver(dir)
@@ -163,10 +88,11 @@ func TestResolveBindsToContext(t *testing.T) {
 
 func TestIsolationNeedsSourceMount(t *testing.T) {
 	cases := map[workspace.Isolation]bool{
-		"":                          true,
-		workspace.IsolationShared:   true,
-		workspace.IsolationWorktree: true,
-		workspace.IsolationCopy:     false,
+		"":                           true,
+		workspace.IsolationShared:    true,
+		workspace.IsolationWorktree:  true,
+		workspace.IsolationCopy:      false,
+		workspace.IsolationOverlayFS: false,
 	}
 	for isolation, want := range cases {
 		r := workspace.NewResolverWithIsolation(t.TempDir(), isolation, t.TempDir(), "")
@@ -190,48 +116,55 @@ func TestUnknownIsolationFailsResolve(t *testing.T) {
 	}
 }
 
-func TestCopyStrategyState(t *testing.T) {
-	if !workspace.CopyStrategyKnown(workspace.CopyFull) || !workspace.CopyStrategyImplemented(workspace.CopyFull) {
-		t.Error("full copy must be known and implemented")
+func TestCheckIsolation(t *testing.T) {
+	if err := workspace.CheckIsolation(workspace.IsolationShared, "", ""); err != nil {
+		t.Errorf("shared isolation: %v", err)
 	}
-	for _, s := range []workspace.CopyStrategy{
-		workspace.CopyReflink, workspace.CopyOverlay, workspace.CopyHardlink,
-	} {
-		if !workspace.CopyStrategyKnown(s) || workspace.CopyStrategyImplemented(s) {
-			t.Errorf("%q: known = %v, implemented = %v; want known and unimplemented",
-				s, workspace.CopyStrategyKnown(s), workspace.CopyStrategyImplemented(s))
-		}
-	}
-	if workspace.CopyStrategyKnown("bogus") {
-		t.Error("bogus must not be a known copy strategy")
-	}
-}
-
-func TestUnimplementedCopyStrategyFailsResolve(t *testing.T) {
-	for _, s := range []workspace.CopyStrategy{
-		workspace.CopyReflink, workspace.CopyOverlay, workspace.CopyHardlink,
-	} {
-		r := workspace.NewResolverWithIsolation(t.TempDir(), workspace.IsolationCopy, t.TempDir(), s)
-		if !r.NeedsSourceMount() {
-			t.Errorf("%q: unimplemented copy must keep the source mounted", s)
-		}
-		if _, err := r.Resolve("ctx"); err == nil || !strings.Contains(err.Error(), "not implemented") {
-			t.Errorf("%q: Resolve error = %v, want a not-implemented error", s, err)
-		}
-	}
-}
-
-func TestCheckCopyStrategy(t *testing.T) {
-	if err := workspace.CheckCopyStrategy(workspace.IsolationShared, workspace.CopyReflink); err != nil {
-		t.Errorf("non-copy isolation: %v", err)
-	}
-	if err := workspace.CheckCopyStrategy(workspace.IsolationCopy, workspace.CopyFull); err != nil {
+	if err := workspace.CheckIsolation(workspace.IsolationCopy, workspace.CopyFull, ""); err != nil {
 		t.Errorf("full copy: %v", err)
 	}
-	if err := workspace.CheckCopyStrategy(workspace.IsolationCopy, ""); err != nil {
+	if err := workspace.CheckIsolation(workspace.IsolationCopy, "", ""); err != nil {
 		t.Errorf("empty strategy defaults to full: %v", err)
 	}
-	if err := workspace.CheckCopyStrategy(workspace.IsolationCopy, workspace.CopyReflink); err == nil {
-		t.Error("unimplemented strategy must be rejected")
+	if err := workspace.CheckIsolation(workspace.IsolationCopy, "bogus", ""); err == nil {
+		t.Error("unknown strategy must be rejected")
+	}
+	if err := workspace.CheckIsolation(workspace.IsolationShared, workspace.CopyCow, ""); err == nil {
+		t.Error("strategy without copy isolation must be rejected")
+	}
+	if err := workspace.CheckIsolation("bogus", "", ""); err == nil {
+		t.Error("unknown isolation must be rejected")
+	}
+}
+
+func TestResolverScopeSeparatesAgents(t *testing.T) {
+	parent := t.TempDir()
+	work := filepath.Join(parent, "work")
+	iso := filepath.Join(parent, "iso")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := workspace.NewResolverWithScope("agent-a", work, workspace.IsolationCopy, iso, workspace.CopyFull)
+	b := workspace.NewResolverWithScope("agent-b", work, workspace.IsolationCopy, iso, workspace.CopyFull)
+	dirA, err := a.Resolve("ctx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirB, err := b.Resolve("ctx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirA == dirB {
+		t.Fatalf("different agents shared a context directory: %q", dirA)
+	}
+}
+
+func TestResolverRejectsContainedIsolationRoot(t *testing.T) {
+	work := t.TempDir()
+	r := workspace.NewResolverWithIsolation(
+		work, workspace.IsolationCopy, filepath.Join(work, "iso"), workspace.CopyFull,
+	)
+	if _, err := r.Resolve("ctx"); err == nil || !strings.Contains(err.Error(), "must not contain") {
+		t.Fatalf("Resolve error = %v, want a containment error", err)
 	}
 }

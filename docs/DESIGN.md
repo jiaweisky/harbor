@@ -684,7 +684,8 @@ A coding agent only makes sense inside a **real codebase**, and a CLI treats its
 - **Isolation strategy** (`sandbox.isolation`, configuration; determines concurrency safety):
   - `shared`: run directly in the configured directory (fastest; concurrent runs in the same directory interfere and are **lock-serialized by directory**).
   - `worktree` (recommended): when the directory is a git repository, create a `git worktree` for **each context** (under `sandbox.isolation_root`) for isolation and concurrency.
-  - `copy`: for non-git directories, copy the directory per context.
+  - `copy`: for non-git directories, copy the directory per context. `sandbox.copy_strategy` selects `full` (portable copy) or `cow` (FICLONE/clonefile copy-on-write, probed at startup).
+  - `overlayfs` (Linux only): mount a per-context view with the workdir as a read-only lower layer and `upper`/`work` under `sandbox.isolation_root`. It requires mount privileges, cannot be combined with `sandbox.container`, and keeps upper layers across restarts so a resumed context reuses its changes.
 - **cwd and `PWD`**: the child process is started with the resolved directory as **cwd**, and **`PWD`** is set to it in sync — `exec` only changes the kernel cwd and does not update the inherited `PWD`, while some CLIs (e.g. opencode) determine the session/project directory from `PWD`; if not synchronized, they read and write Harbor's cwd.
 
 ### 6.8 Collecting Code Changes and Expressing Them as Artifacts
@@ -973,7 +974,7 @@ func init() {
 3. **Workdir**: each agent runs in its configured `agents[].workdir` (its project root), which is required and must exist; `"."` means Harbor's working directory (see §6.7 for details).
 4. **Environment variables**: **by default the launching user's environment is inherited** (many CLIs depend on it); when `sandbox.inherit_env: false`, only a whitelist (`PATH`/`HOME`/`LANG`/`LC_ALL`/`TERM`/`TMPDIR`) + `agents[].env` are injected, to reduce credential exposure.
 5. **Dangerous switches made explicit**: `--dangerously-skip-permissions`/`-y`/`bypassPermissions` can only be enabled by the deployer in the configuration (`agents[].allow_dangerous`, default `false`), with **no environment-variable bypass**, and are highlighted with warnings in the startup log. Hardening (already implemented, optional): when `sandbox.require_container_for_dangerous: true`, any `allow_dangerous` agent may only start if `sandbox.container` is configured; otherwise `config.Load` errors out and refuses to start.
-6. **Optional container sandbox (already implemented)**: when `sandbox.container: {image, runtime, extra_args}` is enabled, each CLI process starts with `<runtime> run --rm -i` (the `Runner`, covering exec/stream-json/acp and the long-running process of server). The agent's **workdir** (for `shared`/`worktree` isolation), the `isolation_root`, and `cli_home` are bind-mounted at their **host original paths** (`-v <path>:<path>`), and the workdir is specified via `-w`, so `PWD` and each CLI's configuration root remain valid inside the container; `copy` isolation is self-contained, so the original workdir stays unmounted (`copy_strategy` selects the implementation; only the portable `full` copy is implemented, while reflink/overlay/hardlink await platform-specific implementations and are rejected at startup). The environment is forwarded entry by entry via `--env` (including the results of `inherit_env`/`cli_home`). `runtime` is required (fixed set: `docker`, `podman`, `nerdctl`; nerdctl is Linux-only, docker and podman are VM-backed on macOS, and Windows hosts must run Harbor in WSL because native host paths are not valid inside a Linux container); `extra_args` are passed through verbatim before the image and are deployer-owned (they can weaken isolation, and they set the network mode; the runtime default applies otherwise). The image must ship the corresponding CLI. Trade-off: in-container paths match the host, so `inv.Bin` is not rewritten; image selection, runtime flags, and credential injection are the deployer's responsibility. At startup Harbor probes `<runtime> info` and refuses to start when the binary or its daemon is unavailable.
+6. **Optional container sandbox (already implemented)**: when `sandbox.container: {image, runtime, extra_args}` is enabled, each CLI process starts with `<runtime> run --rm -i` (the `Runner`, covering exec/stream-json/acp and the long-running process of server). The agent's **workdir** (for `shared`/`worktree` isolation), the `isolation_root`, and `cli_home` are bind-mounted at their **host original paths** (`-v <path>:<path>`), and the workdir is specified via `-w`, so `PWD` and each CLI's configuration root remain valid inside the container; `copy` and `overlayfs` isolation are self-contained, so the original workdir stays unmounted (`copy_strategy` selects `full` or `cow`; `overlayfs` is Linux-only and cannot be combined with `sandbox.container`). The environment is forwarded entry by entry via `--env` (including the results of `inherit_env`/`cli_home`). `runtime` is required (fixed set: `docker`, `podman`, `nerdctl`; nerdctl is Linux-only, docker and podman are VM-backed on macOS, and Windows hosts must run Harbor in WSL because native host paths are not valid inside a Linux container); `extra_args` are passed through verbatim before the image and are deployer-owned (they can weaken isolation, and they set the network mode; the runtime default applies otherwise). The image must ship the corresponding CLI. Trade-off: in-container paths match the host, so `inv.Bin` is not rewritten; image selection, runtime flags, and credential injection are the deployer's responsibility. At startup Harbor probes `<runtime> info` and refuses to start when the binary or its daemon is unavailable.
 7. **Resource limits**: concurrency cap, CPU/memory (`ulimit`/cgroup), per-task timeout and maximum turns, to prevent runaway loops.
 8. **Audit log**: record `user → agent → prompt summary → taskId → result status`, with sensitive content redactable.
 9. **Network**: CORS allows trusted domains only; the AgentCard may be public but the invocation interface requires authentication.
@@ -1233,8 +1234,9 @@ server:
   cors_allowed_origins: ["https://ops.example.com"]
 
 sandbox:
-  isolation: shared                  # shared | worktree | copy
-  # isolation_root: "/srv/iso"       # required for worktree/copy
+  isolation: shared                  # shared | worktree | copy | overlayfs
+  # isolation_root: "/srv/iso"       # required for worktree/copy/overlayfs
+  # copy_strategy: full               # copy only: full | cow
   inherit_env: true
   cli_home: "/srv/harbor-cli-home"   # optional: redirect the CLI config/home here
   state_dir: "/var/lib/harbor"       # required: runtime state (orphan records)
@@ -1574,9 +1576,9 @@ type AuthConfig struct {
 }
 
 type SandboxConfig struct {
-    Isolation      string           `yaml:"isolation"`       // shared | worktree | copy
-    IsolationRoot  string           `yaml:"isolation_root"`  // for worktree/copy
-    CopyStrategy   string           `yaml:"copy_strategy"`   // copy only: full (implemented)
+    Isolation      string           `yaml:"isolation"`       // shared | worktree | copy | overlayfs
+    IsolationRoot  string           `yaml:"isolation_root"`  // for worktree/copy/overlayfs
+    CopyStrategy   string           `yaml:"copy_strategy"`   // copy only: full | cow
     InheritEnv     *bool            `yaml:"inherit_env"`     // default true
     CLIHome        string           `yaml:"cli_home"`        // redirect the CLI config/home
     StateDir       string           `yaml:"state_dir"`       // orphan process records

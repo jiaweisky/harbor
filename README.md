@@ -213,9 +213,9 @@ any unset reference.
 
 | key | type | required | default | meaning |
 |---|---|---|---|---|
-| `isolation` | string | no | `shared` | `shared` \| `worktree` \| `copy` (per-context working copies) |
-| `isolation_root` | string | for `worktree`/`copy` | — | base dir for per-context copies |
-| `copy_strategy` | string | no | `full` | copy isolation implementation: only `full` is implemented; `reflink`, `overlay`, and `hardlink` are recognized but rejected |
+| `isolation` | string | no | `shared` | `shared` \| `worktree` \| `copy` \| `overlayfs` (per-context working views) |
+| `isolation_root` | string | for `worktree`/`copy`/`overlayfs` | — | base dir for per-context views |
+| `copy_strategy` | string | no | `full` | copy isolation implementation: `full` or `cow` (copy-on-write clone) |
 | `inherit_env` | bool | no | `true` | inherit the parent env; `false` restricts to an allowlist |
 | `cli_home` | string | no | — | redirect the CLI's config/home here |
 | `state_dir` | string | **yes** | — | writable dir for CLI process records used for orphan cleanup; use a private per-user dir when several instances or users share a host |
@@ -230,17 +230,32 @@ any unset reference.
 
 With `sandbox.container`, `shared` and `worktree` isolation mount
 `agents[].workdir` (a git worktree keeps its metadata in the owning repository);
-`copy` isolation is self-contained and mounts only `isolation_root` (plus
-`cli_home`), so the original workdir is not visible to the agent. For `copy`,
-`isolation_root` must not be the workdir or an ancestor of it. `copy_strategy`
-selects the copy implementation. Only `full` is implemented, and it is
+`copy` is self-contained and mounts only `isolation_root` (plus `cli_home`), so
+the original workdir is not visible to the agent. `overlayfs` cannot be combined
+with `sandbox.container`. For `copy` and `overlayfs`, `isolation_root` and the
+workdir must not contain each other; otherwise a copy or overlay would include
+its own destination.
+
+`copy_strategy` selects how `copy` materializes each context. `full` is
 portable: Go file APIs copy the tree but do not preserve ownership, ACLs,
-xattrs, or mtimes, and symlinks need privileges on Windows. The recognized but
-unimplemented names are platform-specific: `reflink` needs btrfs/XFS (`FICLONE`)
-on Linux, APFS on macOS, or ReFS on Windows; `overlay` is Linux-only;
-`hardlink` needs one filesystem and is not an isolation boundary. Availability
-is a runtime property and must be probed once an implementation exists;
-configuration currently rejects all three.
+xattrs, or mtimes, and symlinks need privileges on Windows. `cow` clones file
+data with FICLONE (Linux) or clonefile (macOS), so the view costs little until
+it is written; startup checks that the workdir and `isolation_root` share a
+filesystem and probes the `isolation_root` clone support, failing when the
+mechanism is unavailable. `overlayfs` is a Linux-only mount view with
+read-only lower layers and per-context writable upper layers. It requires
+`CAP_SYS_ADMIN` in Harbor's mount namespace (for example, run Harbor in a user
+namespace that grants it) and cannot be combined with `sandbox.container`.
+
+Harbor takes an exclusive lock on `isolation_root`, so a second instance fails
+to start. At startup, after taking the lock, it removes stale copy staging
+directories and unmounts stale overlayfs views; on shutdown it detaches active
+overlayfs mounts while keeping their upper layers for resumed contexts.
+
+Isolation directories are keyed by the agent, workdir, and isolation mode.
+Changing any of them starts a new per-context tree; the previous directory stays
+under `isolation_root` and is not reused. Trees created by versions that keyed
+only by context ID are likewise not reused.
 
 `sandbox.file_artifacts` was renamed to `sandbox.non_image_file_artifacts`, and
 `sandbox.file_artifact_max_bytes` to `sandbox.artifact_inline_max_bytes`; the old

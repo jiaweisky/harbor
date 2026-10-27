@@ -8,7 +8,6 @@ import (
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/core"
 	"github.com/jiaweisky/harbor/internal/plugins"
-	"github.com/jiaweisky/harbor/internal/workspace"
 )
 
 // Load reads a config file, loads configured plugins, and applies the CLI
@@ -16,9 +15,6 @@ import (
 func Load(path string) (*config.Config, error) {
 	cfg, err := config.Load(path)
 	if err != nil {
-		return nil, err
-	}
-	if err := workspace.CheckCopyStrategy(cfg.Sandbox.Isolation, cfg.Sandbox.CopyStrategy); err != nil {
 		return nil, err
 	}
 	if err := plugins.Load(cfg.Plugins); err != nil {

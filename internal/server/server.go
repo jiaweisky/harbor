@@ -49,7 +49,7 @@ func sessionStore(sc config.ServerConfig, agentID string) (bridge.SessionStore, 
 
 // containerSpec builds the runner's container sandbox from the configuration, or
 // nil when no container is configured. The sandbox package owns the mount
-// policy; shared/worktree isolation needs the source workdir, copy does not.
+// policy; shared/worktree isolation needs the source workdir, copy/overlayfs do not.
 func containerSpec(s config.SandboxConfig, workdir string, needsSource bool) *sandbox.Container {
 	if s.Container == nil {
 		return nil
@@ -67,7 +67,12 @@ func containerSpec(s config.SandboxConfig, workdir string, needsSource bool) *sa
 // first-agent card, and the aggregate discovery endpoint. The auth middleware,
 // when enabled, protects only the JSON-RPC endpoints. rt supplies orphan
 // tracking and raw stream logging and may be nil for tests or embedding.
+// It rejects non-shared isolation because it cannot return the closers that
+// release isolation locks and mounts; use New and close the returned Servers.
 func NewHandler(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (http.Handler, error) {
+	if cfg.Sandbox.Isolation != "" && cfg.Sandbox.Isolation != workspace.IsolationShared {
+		return nil, fmt.Errorf("server.NewHandler cannot manage isolation resources; use server.New")
+	}
 	servers, err := newServers(ctx, cfg, rt)
 	if err != nil {
 		return nil, err
@@ -84,7 +89,7 @@ type Servers struct {
 	closers []io.Closer
 }
 
-// Close releases resources held by the servers, such as SQLite stores.
+// Close releases stores, isolation locks, and mounted per-context views.
 func (s *Servers) Close() error { return closeAll(s.closers) }
 
 // New builds the HTTP handler for the configured agents and loads the listener
@@ -105,8 +110,20 @@ func New(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Servers, 
 // newServers builds the handler and releasable resources without reading
 // listener files, so callers that only need a handler are not coupled to TLS.
 func newServers(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Servers, error) {
-	if err := workspace.CheckCopyStrategy(cfg.Sandbox.Isolation, cfg.Sandbox.CopyStrategy); err != nil {
+	if err := workspace.CheckIsolation(
+		cfg.Sandbox.Isolation, cfg.Sandbox.CopyStrategy, cfg.Sandbox.IsolationRoot,
+	); err != nil {
 		return nil, err
+	}
+	if cfg.Sandbox.Isolation == workspace.IsolationOverlayFS && cfg.Sandbox.Container != nil {
+		return nil, fmt.Errorf("sandbox.container cannot be combined with isolation overlayfs")
+	}
+	if cfg.Sandbox.Isolation == workspace.IsolationCopy && cfg.Sandbox.CopyStrategy == workspace.CopyCow {
+		for i := range cfg.Agents {
+			if err := workspace.CheckCopySource(cfg.Agents[i].Workdir, cfg.Sandbox.IsolationRoot); err != nil {
+				return nil, fmt.Errorf("agent %q: %w", cfg.Agents[i].ID, err)
+			}
+		}
 	}
 	auth, err := authMiddleware(cfg.Server.Auth)
 	if err != nil {
@@ -119,6 +136,18 @@ func newServers(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Se
 	var closers []io.Closer
 	if c, ok := taskStore.(io.Closer); ok {
 		closers = append(closers, c)
+	}
+	isolationLock, err := workspace.LockIsolationRoot(cfg.Sandbox.Isolation, cfg.Sandbox.IsolationRoot)
+	if err != nil {
+		_ = closeAll(closers)
+		return nil, err
+	}
+	if err := workspace.PrepareIsolation(cfg.Sandbox.Isolation, cfg.Sandbox.IsolationRoot); err != nil {
+		if isolationLock != nil {
+			_ = isolationLock.Close()
+		}
+		_ = closeAll(closers)
+		return nil, err
 	}
 
 	pushStore := push.NewInMemoryStore()
@@ -143,6 +172,10 @@ func newServers(ctx context.Context, cfg *config.Config, rt *agent.Runtime) (*Se
 	}
 	for i := range cfg.Agents {
 		b.addAgent(ctx, cfg.Agents[i])
+	}
+	// Release views before releasing the isolation_root lock.
+	if isolationLock != nil {
+		b.closers = append(b.closers, isolationLock)
 	}
 	if len(b.cards) == 0 {
 		_ = closeAll(b.closers)
@@ -241,8 +274,9 @@ type agentBuilder struct {
 // routes. A build error or missing binary disables the agent with a warning
 // rather than failing startup.
 func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
-	resolver := workspace.NewResolverWithIsolation(ac.Workdir,
+	resolver := workspace.NewResolverWithScope(ac.ID, ac.Workdir,
 		b.cfg.Sandbox.Isolation, b.cfg.Sandbox.IsolationRoot, b.cfg.Sandbox.CopyStrategy)
+	b.closers = append(b.closers, resolver)
 	ln, info, err := integration.Build(ctx, ac, integration.Options{
 		InheritEnv: b.cfg.Sandbox.InheritEnvEnabled(),
 		CLIHome:    b.cfg.Sandbox.CLIHome,

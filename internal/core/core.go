@@ -151,25 +151,26 @@ func (a AgentSpec) Spec() AgentSpec { return a }
 type Isolation string
 
 const (
-	IsolationShared   Isolation = "shared"
-	IsolationWorktree Isolation = "worktree"
-	IsolationCopy     Isolation = "copy"
+	IsolationShared    Isolation = "shared"
+	IsolationWorktree  Isolation = "worktree"
+	IsolationCopy      Isolation = "copy"
+	IsolationOverlayFS Isolation = "overlayfs"
 )
 
-// CopyStrategy selects how copy isolation provisions a context directory.
+// CopyStrategy selects how copy isolation materializes a context directory.
 type CopyStrategy string
 
 const (
-	CopyFull     CopyStrategy = "full"
-	CopyReflink  CopyStrategy = "reflink"
-	CopyOverlay  CopyStrategy = "overlay"
-	CopyHardlink CopyStrategy = "hardlink"
+	// CopyFull copies file data with regular reads and writes.
+	CopyFull CopyStrategy = "full"
+	// CopyCow clones file data copy-on-write when the filesystem supports it.
+	CopyCow CopyStrategy = "cow"
 )
 
 // Known reports whether the copy strategy is a recognized value.
 func (s CopyStrategy) Known() bool {
 	switch s {
-	case CopyFull, CopyReflink, CopyOverlay, CopyHardlink:
+	case CopyFull, CopyCow:
 		return true
 	}
 	return false

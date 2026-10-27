@@ -43,9 +43,9 @@ sandbox:
   state_dir: "/var/lib/harbor"
   inherit_env: true                  # false restricts the CLI env to an allowlist
   # Optional per-context isolation for concurrent tasks on the same project.
-  # isolation: shared                # shared | worktree | copy
-  # isolation_root: "/srv/iso"       # required for worktree/copy
-  # copy_strategy: full              # copy only; reflink/overlay/hardlink are not implemented
+  # isolation: shared                # shared | worktree | copy | overlayfs
+  # isolation_root: "/srv/iso"       # required for worktree/copy/overlayfs
+  # copy_strategy: full              # copy only: full | cow
   # cli_home: "/srv/harbor-cli-home" # redirect the CLI config/home here
   # container: { image: "harbor/claude:latest", runtime: docker,
   #              extra_args: ["--network=none"] }   # flags are deployer-owned

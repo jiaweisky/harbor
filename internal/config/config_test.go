@@ -644,6 +644,60 @@ agents:
 	}
 }
 
+func TestCopyIsolationRootMustNotBeInsideWorkdir(t *testing.T) {
+	work := t.TempDir()
+	root := filepath.Join(work, "iso")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+  isolation: copy
+  isolation_root: ` + strconv.Quote(root) + `
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+    workdir: ` + strconv.Quote(work) + `
+`
+	_, err := loadConfig(t, writeConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "must not contain") {
+		t.Fatalf("expected a workdir containment error, got %v", err)
+	}
+}
+
+func TestCopyIsolationRootSymlinkedInsideWorkdir(t *testing.T) {
+	work := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(work, link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	body := `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+  isolation: copy
+  isolation_root: ` + strconv.Quote(filepath.Join(link, "a", "b")) + `
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+    workdir: ` + strconv.Quote(work) + `
+`
+	_, err := loadConfig(t, writeConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "must not contain") {
+		t.Fatalf("expected a symlinked containment error, got %v", err)
+	}
+}
+
 func TestCopyStrategy(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -651,10 +705,8 @@ func TestCopyStrategy(t *testing.T) {
 		strategy  string
 		wantErr   string
 	}{
-		{"full implemented", "copy", "full", ""},
-		{"reflink unimplemented", "copy", "reflink", "not implemented"},
-		{"overlay unimplemented", "copy", "overlay", "not implemented"},
-		{"hardlink unimplemented", "copy", "hardlink", "not implemented"},
+		{"full", "copy", "full", ""},
+		{"cow", "copy", "cow", ""},
 		{"unknown", "copy", "magic", "must be one of"},
 		{"without copy", "shared", "full", "only valid"},
 	}
@@ -689,6 +741,77 @@ agents:
 				t.Fatalf("expected an error containing %q, got %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+func TestOverlayFSRejectsContainer(t *testing.T) {
+	body := `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+  isolation: overlayfs
+  isolation_root: "/tmp/harbor-test-iso"
+  container:
+    runtime: docker
+    image: "img:latest"
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`
+	_, err := loadConfig(t, writeConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("expected a container/overlayfs error, got %v", err)
+	}
+}
+
+func TestOverlayFSWorkdirMustNotContainRoot(t *testing.T) {
+	work := filepath.Join(t.TempDir(), "project")
+	root := filepath.Join(work, "iso")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+  isolation: overlayfs
+  isolation_root: ` + strconv.Quote(root) + `
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+    workdir: ` + strconv.Quote(work) + `
+`
+	_, err := loadConfig(t, writeConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "must not contain") {
+		t.Fatalf("expected an isolation_root containment error, got %v", err)
+	}
+}
+
+func TestOverlayFSRequiresRoot(t *testing.T) {
+	body := `
+version: 1
+sandbox:
+  state_dir: "/tmp/harbor-test-state"
+  isolation: overlayfs
+agents:
+  - id: oc
+    display_name: "oc"
+    description: "Test agent for the oc CLI."
+    binary: opencode
+    integration: exec
+    args: ["run", "{{.Prompt}}"]
+`
+	_, err := loadConfig(t, writeConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "isolation_root") {
+		t.Fatalf("expected an isolation_root error, got %v", err)
 	}
 }
 
