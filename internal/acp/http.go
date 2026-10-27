@@ -58,6 +58,7 @@ func NewHTTPLauncher(cfg HTTPConfig) *HTTPLauncher {
 	if cfg.Lifecycle == nil {
 		cfg.Lifecycle = context.Background()
 	}
+
 	return &HTTPLauncher{
 		cfg:    cfg,
 		runner: agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container, cfg.Runtime),
@@ -87,11 +88,13 @@ func (l *HTTPLauncher) Start(ctx context.Context, req *agent.Request) (agent.Ses
 	if err != nil {
 		return nil, err
 	}
+
 	base := acpBase(raw)
 	connID, err := l.connect(ctx, base)
 	if err != nil {
 		return nil, err
 	}
+
 	return l.establish(ctx, base, connID, req)
 }
 
@@ -112,6 +115,7 @@ const acpPath = "/api/v1/acp"
 func (l *HTTPLauncher) establish(ctx context.Context, base, connID string, req *agent.Request) (*session, error) {
 	ch := make(chan agent.Event, 16)
 	linkCtx, stopLink := context.WithCancel(context.Background())
+
 	var once sync.Once
 	stop := func() {
 		once.Do(func() {
@@ -123,6 +127,7 @@ func (l *HTTPLauncher) establish(ctx context.Context, base, connID string, req *
 
 	s := &session{events: ch, kill: stop}
 	w := &postWriter{ctx: linkCtx, client: l.client, url: base + acpPath, connID: connID, headers: l.cfg.Headers}
+
 	c := &conn{Conn: jsonrpc.New(w), s: s}
 	w.handle = c.Handle
 	s.conn = c
@@ -145,14 +150,17 @@ func (l *HTTPLauncher) establish(ctx context.Context, base, connID string, req *
 		stop()
 		return nil, err
 	}
+
 	sessionID, err := handshakeHTTP(ctx, c, cwd, req.SessionID)
 	if err != nil {
 		stop()
 		return nil, err
 	}
+
 	c.setEmit(func(e agent.Event) { ch <- e })
 	c.emitEvent(agent.Event{Kind: agent.EventSession, SessionID: sessionID})
 	s.startPrompt(ctx, sessionID, req.Prompt)
+
 	return s, nil
 }
 
@@ -163,6 +171,7 @@ func (l *HTTPLauncher) spawn(ctx context.Context) (string, error) {
 		Args: append([]string(nil), l.cfg.Args...),
 		Env:  append([]string(nil), l.cfg.Env...),
 	}
+
 	return agent.SpawnServer(ctx, l.cfg.Lifecycle, l.runner, l.cfg.Name+":server", inv, serveStartTimeout)
 }
 
@@ -171,13 +180,16 @@ func (l *HTTPLauncher) connect(ctx context.Context, base string) (string, error)
 	var out struct {
 		ConnectionID string `json:"connectionId"`
 	}
+
 	url := base + acpPath + "/connect"
 	if err := agent.PostJSON(ctx, l.client, url, "acp connect", l.cfg.Headers, map[string]any{}, &out); err != nil {
 		return "", err
 	}
+
 	if out.ConnectionID == "" {
 		return "", errors.New("acp connect: no connection id")
 	}
+
 	return out.ConnectionID, nil
 }
 
@@ -185,16 +197,19 @@ func (l *HTTPLauncher) connect(ctx context.Context, base string) (string, error)
 func (l *HTTPLauncher) disconnect(base, connID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, base+acpPath, nil)
 	if err != nil {
 		return
 	}
+
 	applyHeaders(req, l.cfg.Headers)
 	req.Header.Set(connIDHeader, connID)
 	resp, err := l.client.Do(req)
 	if err != nil {
 		return
 	}
+
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 }
@@ -204,24 +219,29 @@ func (l *HTTPLauncher) disconnect(base, connID string) {
 // the connection until the link is stopped.
 func (l *HTTPLauncher) readInbound(ctx context.Context, base, connID string, c *conn, stop func(), ready chan<- error) {
 	defer stop()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+acpPath, nil)
 	if err != nil {
 		ready <- err
 		return
 	}
+
 	req.Header.Set("accept", "text/event-stream")
 	applyHeaders(req, l.cfg.Headers)
 	req.Header.Set(connIDHeader, connID)
+
 	resp, err := l.client.Do(req)
 	if err != nil {
 		ready <- err
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		ready <- fmt.Errorf("acp subscribe: %s", resp.Status)
 		return
 	}
+
 	ready <- nil
 	feedSSE(resp.Body, c.Handle)
 }
@@ -232,22 +252,27 @@ func handshakeHTTP(ctx context.Context, c *conn, cwd, resumeID string) (string, 
 	if err := initialize(ctx, c); err != nil {
 		return "", err
 	}
+
 	if resumeID == "" {
 		return openSession(ctx, c, cwd)
 	}
+
 	res, err := c.Conn.Request(ctx, "session/load", map[string]any{
 		"sessionId": resumeID, "cwd": cwd, "mcpServers": []any{},
 	})
 	if err != nil {
 		return "", fmt.Errorf("acp session/load: %w", err)
 	}
+
 	var ns newSessionResponse
 	if json.Unmarshal(res, &ns) == nil && ns.SessionID != "" {
 		c.setSessionID(ns.SessionID)
 		return ns.SessionID, nil
 	}
+
 	// session/load need not echo the id; keep the requested one.
 	c.setSessionID(resumeID)
+
 	return resumeID, nil
 }
 
@@ -269,20 +294,26 @@ func (w *postWriter) Write(p []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("accept", "application/json, text/event-stream")
 	applyHeaders(req, w.headers)
 	req.Header.Set(connIDHeader, w.connID)
+
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return 0, err
 	}
-	if resp.StatusCode/100 != 2 {
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
+
 		return 0, fmt.Errorf("acp http: %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
+
 	go w.readReply(resp.Body)
+
 	return len(p), nil
 }
 
