@@ -104,6 +104,51 @@ func TestSessionUpdateEmitsEvents(t *testing.T) {
 	}
 }
 
+func TestSessionUpdateCarriesEditContentAndPlan(t *testing.T) {
+	c, _, _ := newTestConn()
+	var got []agent.Event
+	emit := func(ev agent.Event) { got = append(got, ev) }
+	c.setEmit(emit)
+
+	c.Handle(updateRecord(map[string]any{
+		"sessionUpdate": "tool_call", "title": "edit", "kind": "edit",
+		"content": []map[string]any{{"type": "text", "text": "--- a\n+++ b"}},
+		"rawInput": map[string]any{"path": "main.go"},
+	}))
+	c.Handle(updateRecord(map[string]any{
+		"sessionUpdate": "tool_call_update", "status": "completed", "toolCallId": "t1",
+		"content": []map[string]any{{"type": "text", "text": "applied"}},
+		"rawInput": map[string]any{"toolCallId": "t1"},
+	}))
+	c.Handle(updateRecord(map[string]any{
+		"sessionUpdate": "plan",
+		"entries": []map[string]any{
+			{"content": "read code", "priority": "high", "status": "completed"},
+			{"content": "fix bug", "priority": "high", "status": "in_progress"},
+		},
+	}))
+
+	if len(got) != 3 {
+		t.Fatalf("got %d events: %+v", len(got), got)
+	}
+	if got[0].Kind != agent.EventToolCall || got[0].Text != "--- a\n+++ b" {
+		t.Fatalf("tool call = %+v, want the edit diff in text", got[0])
+	}
+	if got[0].ToolInput["path"] != "main.go" {
+		t.Fatalf("tool input = %+v, want rawInput forwarded", got[0].ToolInput)
+	}
+	if got[1].Kind != agent.EventToolResult || got[1].Text != "applied" {
+		t.Fatalf("tool result = %+v, want content text", got[1])
+	}
+	if got[1].ToolInput["toolCallId"] != "t1" {
+		t.Fatalf("tool result input = %+v, want the finished update's rawInput", got[1].ToolInput)
+	}
+	if got[2].Kind != agent.EventThinking ||
+		got[2].Text != "[completed] read code\n[in_progress] fix bug" {
+		t.Fatalf("plan = %+v, want rendered entries", got[2])
+	}
+}
+
 func TestToolCallUpdateOnlyEmitsWhenFinished(t *testing.T) {
 	c, _, _ := newTestConn()
 	var got []agent.Event

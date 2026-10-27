@@ -50,13 +50,69 @@ func (f *fakeServer) handler() http.Handler {
 	mux.HandleFunc("/api/v1/runs/run-1/stream", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "text/event-stream")
 		_, _ = w.Write([]byte("event: message\n" +
-			`data: {"status":"completed","content":{"markdown":"pong"}}` + "\n\n"))
+			`data: {"status":"completed","content":{"markdown":"pong"},"agent":{"sessionId":"ses_x","toolCalls":[{"name":"Write","file":"a.txt"}]}}` + "\n\n"))
 		_, _ = w.Write([]byte("event: done\ndata: {}\n\n"))
 	})
 	mux.HandleFunc("/api/v1/runs/run-1/cancel", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	return mux
+}
+
+func TestServerLauncherStreamsChunks(t *testing.T) {
+	var mu sync.Mutex
+	streamed := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/runs", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"runId":"run-9","status":"accepted"}}`))
+	})
+	mux.HandleFunc("/api/v1/runs/run-9/stream", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		mu.Lock()
+		streamed = true
+		mu.Unlock()
+		_, _ = w.Write([]byte("event: message\n" +
+			`data: {"status":"streaming","content":{"chunk":"he"}}` + "\n\n"))
+		_, _ = w.Write([]byte("event: message\n" +
+			`data: {"status":"streaming","content":{"chunk":"llo"}}` + "\n\n"))
+		_, _ = w.Write([]byte("event: message\n" +
+			`data: {"status":"completed","content":{"markdown":"hello"}}` + "\n\n"))
+		_, _ = w.Write([]byte("event: done\ndata: {}\n\n"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ln := codebuddy.NewServerLauncher(context.Background(), codebuddy.Config{Name: "cb", BaseURL: srv.URL})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	sess, err := ln.Start(ctx, &agent.Request{Prompt: "hi"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	var text string
+	var done bool
+	for ev := range sess.Events() {
+		switch ev.Kind {
+		case agent.EventTextDelta:
+			text += ev.Text
+		case agent.EventDone:
+			done = true
+		}
+	}
+	if !done {
+		t.Fatal("no EventDone")
+	}
+	// The streamed chunks count once; the final full text must not duplicate
+	// them.
+	if text != "hello" {
+		t.Fatalf("text = %q, want hello streamed once", text)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !streamed {
+		t.Fatal("fake stream never ran")
+	}
 }
 
 func TestServerLauncherTurn(t *testing.T) {
@@ -74,12 +130,15 @@ func TestServerLauncherTurn(t *testing.T) {
 	}
 	var sessionID, text string
 	var done bool
+	var toolCalls []agent.Event
 	for ev := range sess.Events() {
 		switch ev.Kind {
 		case agent.EventSession:
 			sessionID = ev.SessionID
 		case agent.EventTextDelta:
 			text += ev.Text
+		case agent.EventToolCall:
+			toolCalls = append(toolCalls, ev)
 		case agent.EventDone:
 			done = true
 		case agent.EventError:
@@ -91,6 +150,10 @@ func TestServerLauncherTurn(t *testing.T) {
 	}
 	if text != "pong" {
 		t.Fatalf("text = %q, want pong", text)
+	}
+	if len(toolCalls) != 1 || toolCalls[0].Tool != "Write" ||
+		toolCalls[0].ToolInput["file"] != "a.txt" {
+		t.Fatalf("tool calls = %+v, want one Write summary", toolCalls)
 	}
 	if sessionID == "" {
 		t.Fatal("no session id reported for a new conversation")

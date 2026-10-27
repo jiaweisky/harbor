@@ -5,6 +5,7 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -191,8 +192,8 @@ func (s *serverSession) run(ctx context.Context, l *Launcher, base string, req *
 	// Subscribe before prompting so no deltas are missed.
 	streamCtx, stopStream := context.WithCancel(ctx)
 	defer stopStream()
-	deltas := make(chan string, 64)
-	go l.streamDeltas(streamCtx, base, sid, deltas)
+	events := make(chan agent.Event, 64)
+	go l.streamEvents(streamCtx, base, sid, s, events)
 
 	type replyResult struct {
 		text string
@@ -207,21 +208,23 @@ func (s *serverSession) run(ctx context.Context, l *Launcher, base string, req *
 	streamed := false
 	for {
 		select {
-		case delta, ok := <-deltas:
+		case ev, ok := <-events:
 			if !ok {
-				deltas = nil
+				events = nil
 				continue
 			}
-			streamed = true
-			s.Emit(agent.Event{Kind: agent.EventTextDelta, Text: delta})
+			if ev.Kind == agent.EventTextDelta {
+				streamed = true
+			}
+			s.Emit(ev)
 		case r := <-reply:
 			if r.err != nil {
 				s.EmitError(ctx, r.err)
 				return
 			}
-			// The stream may have buffered deltas the select has not read yet;
-			// flush them before finishing so no text is dropped.
-			s.drainDeltas(deltas)
+			// The stream may have buffered events the select has not read yet;
+			// flush them before finishing so no event is dropped.
+			s.drainEvents(events)
 			if !streamed && r.text != "" {
 				s.Emit(agent.Event{Kind: agent.EventTextDelta, Text: r.text})
 			}
@@ -233,24 +236,25 @@ func (s *serverSession) run(ctx context.Context, l *Launcher, base string, req *
 	}
 }
 
-// drainDeltas emits any text deltas still buffered, without blocking.
-func (s *serverSession) drainDeltas(deltas <-chan string) {
+// drainEvents emits any events still buffered, without blocking.
+func (s *serverSession) drainEvents(events <-chan agent.Event) {
 	for {
 		select {
-		case d, ok := <-deltas:
+		case ev, ok := <-events:
 			if !ok {
 				return
 			}
-			s.Emit(agent.Event{Kind: agent.EventTextDelta, Text: d})
+			s.Emit(ev)
 		default:
 			return
 		}
 	}
 }
 
-// streamDeltas reads the server's event stream and forwards text deltas for one
-// session. It closes out when the stream ends or the context is canceled.
-func (l *Launcher) streamDeltas(ctx context.Context, base, sid string, out chan<- string) {
+// streamEvents reads the server's event stream and forwards the events of one
+// session: text and reasoning deltas, plus tool parts as tool calls and
+// results. It closes out when the stream ends or the context is canceled.
+func (l *Launcher) streamEvents(ctx context.Context, base, sid string, s *serverSession, out chan<- agent.Event) {
 	defer close(out)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/event", nil)
 	if err != nil {
@@ -262,33 +266,137 @@ func (l *Launcher) streamDeltas(ctx context.Context, base, sid string, out chan<
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return
 	}
+	toolCalled := map[string]string{}
+	reasoningSeen := map[string]string{}
 	_ = agent.ReadSSE(resp.Body, func(_, data string) bool {
 		var ev sseEvent
 		if json.Unmarshal([]byte(data), &ev) != nil {
 			return true
 		}
-		if ev.Type != "message.part.delta" || ev.Properties.SessionID != sid ||
-			ev.Properties.Field != "text" || ev.Properties.Delta == "" {
+		if ev.Properties.SessionID != sid {
 			return true
 		}
-		select {
-		case out <- ev.Properties.Delta:
-			return true
-		case <-ctx.Done():
-			return false
+		if ev.Type == "message.part.delta" {
+			var kind agent.EventKind
+			switch ev.Properties.Field {
+			case "text":
+				kind = agent.EventTextDelta
+			case "reasoning":
+				kind = agent.EventThinking
+			}
+			if kind == 0 || ev.Properties.Delta == "" {
+				return true
+			}
+			select {
+			case out <- agent.Event{Kind: kind, Text: ev.Properties.Delta}:
+				return true
+			case <-ctx.Done():
+				return false
+			}
 		}
+		if ev.Type != "message.part.updated" {
+			return true
+		}
+
+		var part opencodePart
+		if json.Unmarshal(ev.Properties.Part, &part) != nil {
+			return true
+		}
+		// Reasoning parts arrive as whole-part updates (no deltas), so forward
+		// each changed text as a thinking event.
+		if part.Type == "reasoning" && part.Text != "" && reasoningSeen[part.ID] != part.Text {
+			reasoningSeen[part.ID] = part.Text
+			return s.emitTo(ctx, out, agent.Event{Kind: agent.EventThinking, Text: part.Text})
+		}
+		if part.Type != "tool" {
+			return true
+		}
+		switch part.State.Status {
+		case "pending", "running":
+			// The server re-sends the part on every state tick. The pending
+			// tick carries an empty input; the call event goes out on the
+			// first tick that actually carries the tool's input.
+			if toolCalled[part.ID] != "" || len(part.State.Input) == 0 {
+				return true
+			}
+			toolCalled[part.ID] = "call"
+			return s.emitTo(ctx, out, agent.Event{
+				Kind: agent.EventToolCall, Tool: part.Tool, ToolInput: part.State.Input,
+			})
+		case "completed", "error":
+			// Ensure the call event exists even when no earlier tick carried
+			// an input, then deliver the result once.
+			if toolCalled[part.ID] == "" {
+				toolCalled[part.ID] = "call"
+				return s.emitTo(ctx, out, agent.Event{
+					Kind: agent.EventToolCall, Tool: part.Tool, ToolInput: part.State.Input,
+				})
+			}
+			if toolCalled[part.ID] != "done" {
+				toolCalled[part.ID] = "done"
+				return s.emitTo(ctx, out, agent.Event{
+					Kind: agent.EventToolResult, Text: outputText(part.State.Output),
+				})
+			}
+			return true
+		}
+		return true
 	})
+}
+
+// emitTo sends one event to out unless the context is done first.
+func (s *serverSession) emitTo(ctx context.Context, out chan<- agent.Event, ev agent.Event) bool {
+	select {
+	case out <- ev:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// outputText renders a tool part's output: the string opencode sent, or the
+// compact JSON of a structured one.
+func outputText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+
+	var buf bytes.Buffer
+	if json.Compact(&buf, raw) != nil {
+		return string(raw)
+	}
+
+	return buf.String()
 }
 
 // sseEvent is the subset of a server-sent event Harbor consumes.
 type sseEvent struct {
 	Type       string `json:"type"`
 	Properties struct {
-		SessionID string `json:"sessionID"`
-		Field     string `json:"field"`
-		Delta     string `json:"delta"`
+		SessionID string          `json:"sessionID"`
+		Field     string          `json:"field"`
+		Delta     string          `json:"delta"`
+		Part      json.RawMessage `json:"part"`
 	} `json:"properties"`
+}
+
+// opencodePart is the subset of a message part Harbor forwards beyond text.
+type opencodePart struct {
+	ID    string `json:"id"`
+	Type  string `json:"type"`
+	Text  string `json:"text"`
+	Tool  string `json:"tool"`
+	State struct {
+		Status string          `json:"status"`
+		Input  map[string]any  `json:"input"`
+		Output json.RawMessage `json:"output"`
+	} `json:"state"`
 }

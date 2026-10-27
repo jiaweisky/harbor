@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jiaweisky/harbor/internal/agent"
@@ -161,15 +162,23 @@ func (l *Launcher) post(ctx context.Context, url string, body, out any) error {
 // serverSession streams one run's turn over the HTTP API.
 type serverSession struct {
 	*agent.ServerSession
+
+	streamed atomic.Bool // streaming chunks were seen; the final full text is skipped
 }
 
-// messageEvent is the payload of a `message` server-sent event: the agent's
-// reply text, plus a status that may mark the run as failed.
+// messageEvent is the payload of a `message` server-sent event. A streaming
+// status carries the reply chunk being generated; a completed status carries
+// the full reply text plus a summary of the tool calls the agent made.
 type messageEvent struct {
 	Status  string `json:"status"`
 	Content struct {
 		Markdown string `json:"markdown"`
+		Chunk    string `json:"chunk"`
 	} `json:"content"`
+	Agent struct {
+		SessionID string           `json:"sessionId"`
+		ToolCalls []map[string]any `json:"toolCalls"`
+	} `json:"agent"`
 }
 
 // run performs one turn: start the run, read its stream, and emit the result.
@@ -216,7 +225,7 @@ func (s *serverSession) stream(ctx context.Context, l *Launcher, base, runID str
 		return false, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return false, fmt.Errorf("codebuddy server: stream %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
@@ -257,10 +266,30 @@ func (s *serverSession) handleEvent(event, data string) (sawText, done bool, err
 		if m.Status == "failed" || m.Status == "error" {
 			return false, false, errors.New("codebuddy server: run failed")
 		}
-		if m.Content.Markdown == "" {
-			return false, false, nil
+		// Streaming chunks carry the reply incrementally; once they were seen,
+		// the final full text would duplicate them and is skipped.
+		if m.Content.Chunk != "" {
+			s.streamed.Store(true)
+			s.Emit(agent.Event{Kind: agent.EventTextDelta, Text: m.Content.Chunk})
+			return true, false, nil
+		}
+		if s.streamed.Load() || m.Content.Markdown == "" {
+			return s.streamed.Load(), false, nil
 		}
 		s.Emit(agent.Event{Kind: agent.EventTextDelta, Text: m.Content.Markdown})
+		// The completed message summarizes the run's tool calls; forward each
+		// entry verbatim so the client sees what the agent did even though this
+		// API streams no per-tool events.
+		for _, tc := range m.Agent.ToolCalls {
+			name, _ := tc["name"].(string)
+			if name == "" {
+				name, _ = tc["type"].(string)
+			}
+			if name == "" {
+				name = "tool"
+			}
+			s.Emit(agent.Event{Kind: agent.EventToolCall, Tool: name, ToolInput: tc})
+		}
 		return true, false, nil
 	}
 	return false, false, nil

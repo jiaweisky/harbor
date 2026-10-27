@@ -106,6 +106,7 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 		Env:           append([]string(nil), l.cfg.Env...),
 		KeepStdinOpen: true,
 	}
+
 	d := &dispatcher{}
 	events, err := l.runner.Start(ctx, taskID, inv, d)
 	if err != nil {
@@ -126,6 +127,7 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	// Report the session id so the executor can continue it in a later task.
 	c.emitEvent(agent.Event{Kind: agent.EventSession, SessionID: sessionID})
 	s.startPrompt(ctx, sessionID, req.Prompt)
+
 	return s, nil
 }
 
@@ -137,11 +139,14 @@ func absWorkDir(dir string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+
 		dir = wd
 	}
+
 	if !filepath.IsAbs(dir) {
 		return "", fmt.Errorf("acp: working directory must be absolute: %q", dir)
 	}
+
 	return dir, nil
 }
 
@@ -153,6 +158,7 @@ func initialize(ctx context.Context, c *conn) error {
 	}); err != nil {
 		return fmt.Errorf("acp initialize: %w", err)
 	}
+
 	return nil
 }
 
@@ -162,11 +168,13 @@ func openSession(ctx context.Context, c *conn, cwd string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("acp session/new: %w", err)
 	}
+
 	var ns newSessionResponse
 	if json.Unmarshal(res, &ns) != nil || ns.SessionID == "" {
 		return "", fmt.Errorf("acp session/new: missing session id")
 	}
 	c.setSessionID(ns.SessionID)
+
 	return ns.SessionID, nil
 }
 
@@ -178,22 +186,27 @@ func handshake(ctx context.Context, c *conn, cwd, resumeID string) (string, erro
 	if err := initialize(ctx, c); err != nil {
 		return "", err
 	}
+
 	if resumeID == "" {
 		return openSession(ctx, c, cwd)
 	}
+
 	res, err := c.Conn.Request(ctx, "session/load", map[string]any{
 		"sessionId": resumeID, "cwd": cwd, "mcpServers": []any{},
 	})
 	if err != nil {
 		return openSession(ctx, c, cwd)
 	}
+
 	var ns newSessionResponse
 	if json.Unmarshal(res, &ns) == nil && ns.SessionID != "" {
 		c.setSessionID(ns.SessionID)
 		return ns.SessionID, nil
 	}
+
 	// session/load need not echo the id; keep the requested one.
 	c.setSessionID(resumeID)
+
 	return resumeID, nil
 }
 
@@ -214,10 +227,12 @@ func (s *session) Events() <-chan agent.Event { return s.events }
 // permission option id; an empty answer cancels the request.
 func (s *session) Send(_ context.Context, in agent.Input) error {
 	s.mu.Lock()
+
 	if len(s.permIDs) == 0 {
 		s.mu.Unlock()
 		return agent.ErrUnsupported
 	}
+
 	id := s.permIDs[0]
 	s.permIDs = s.permIDs[1:]
 	s.mu.Unlock()
@@ -226,6 +241,7 @@ func (s *session) Send(_ context.Context, in agent.Input) error {
 	if in.Answer != "" {
 		outcome = map[string]any{"outcome": "selected", "optionId": in.Answer}
 	}
+
 	return s.conn.Conn.Respond(id, map[string]any{"outcome": outcome})
 }
 
@@ -234,21 +250,26 @@ func (s *session) Cancel() error {
 	s.canceled = true
 	cancel := s.cancelPrompt
 	s.mu.Unlock()
+
 	if cancel != nil {
 		cancel()
 	}
+
 	if sid := s.conn.sessionID(); sid != "" {
 		_ = s.conn.Conn.Notify("session/cancel", map[string]any{"sessionId": sid})
 	}
+
 	if s.kill != nil {
 		s.kill()
 	}
+
 	return nil
 }
 
 func (s *session) Canceled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return s.canceled
 }
 
@@ -260,25 +281,30 @@ func (s *session) startPrompt(ctx context.Context, sessionID, prompt string) {
 		"prompt":    []map[string]any{{"type": "text", "text": prompt}},
 	}
 	promptCtx, cancel := context.WithCancel(ctx)
+
 	s.mu.Lock()
 	s.cancelPrompt = cancel
 	s.mu.Unlock()
 
 	go func() {
 		defer cancel()
+
 		res, err := s.conn.Conn.Request(promptCtx, "session/prompt", params)
 		if err != nil {
 			if s.Canceled() || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
+
 			s.conn.emitEvent(agent.Event{Kind: agent.EventError, Err: err})
 			return
 		}
+
 		var pr promptResponse
 		_ = json.Unmarshal(res, &pr)
 		if u := pr.usage(); u != nil {
 			s.conn.emitEvent(agent.Event{Kind: agent.EventUsage, Usage: u})
 		}
+
 		if s.kill != nil {
 			s.kill()
 		}
@@ -290,6 +316,7 @@ func (s *session) onPermission(id json.RawMessage, p permissionParams) {
 	s.mu.Lock()
 	s.permIDs = append(s.permIDs, id)
 	s.mu.Unlock()
+
 	s.conn.emitEvent(agent.Event{
 		Kind:      agent.EventPermissionRequest,
 		Text:      permissionText(p),
@@ -322,10 +349,12 @@ func (d *dispatcher) Parse(rec []byte, out func(agent.Event)) error {
 	d.mu.Lock()
 	c := d.c
 	d.mu.Unlock()
+
 	if c != nil {
 		c.setEmit(out)
 		c.Handle(rec)
 	}
+
 	return nil
 }
 
@@ -358,6 +387,7 @@ func (c *conn) setSessionID(id string) {
 func (c *conn) sessionID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return c.sessID
 }
 
@@ -366,6 +396,7 @@ func (c *conn) emitEvent(ev agent.Event) {
 	c.mu.Lock()
 	emit := c.emit
 	c.mu.Unlock()
+
 	if emit != nil {
 		emit(ev)
 	}
@@ -376,25 +407,36 @@ func (c *conn) Notification(method string, params json.RawMessage) {
 	if method != "session/update" {
 		return
 	}
+
 	var p sessionUpdateParams
 	if json.Unmarshal(params, &p) != nil {
 		return
 	}
+
 	if kind, ok := chunkEvent[p.Update.SessionUpdate]; ok {
 		if t := p.Update.contentText(); t != "" {
 			c.emitEvent(agent.Event{Kind: kind, Text: t})
 		}
 		return
 	}
+
 	switch p.Update.SessionUpdate {
 	case "tool_call":
 		c.emitEvent(agent.Event{Kind: agent.EventToolCall,
-			Tool: agent.FirstNonEmpty(p.Update.Title, p.Update.Kind)})
+			Tool: agent.FirstNonEmpty(p.Update.Title, p.Update.Kind),
+			Text: p.Update.contentSummary(), ToolInput: p.Update.RawInput})
 	case "tool_call_update":
 		// Only a finished tool call is a result; in-progress updates would be
-		// misleading.
+		// misleading. The finished update's rawInput carries the modification
+		// payload (for a Write tool, the full file content and path), so it is
+		// forwarded alongside the content text.
 		if p.Update.Status == "completed" || p.Update.Status == "failed" {
-			c.emitEvent(agent.Event{Kind: agent.EventToolResult})
+			c.emitEvent(agent.Event{Kind: agent.EventToolResult,
+				Text: p.Update.contentSummary(), ToolInput: p.Update.RawInput})
+		}
+	case "plan":
+		if text := p.Update.planText(); text != "" {
+			c.emitEvent(agent.Event{Kind: agent.EventThinking, Text: text})
 		}
 	}
 }
@@ -408,6 +450,7 @@ func (c *conn) Request(id json.RawMessage, method string, params json.RawMessage
 			_ = c.Conn.RespondError(id, codeInvalidParams, "invalid params")
 			return
 		}
+
 		c.s.onPermission(id, p)
 	default:
 		// fs/* and terminal/* are not advertised, so the agent must not call
@@ -453,13 +496,56 @@ type sessionUpdateParams struct {
 }
 
 type sessionUpdate struct {
-	SessionUpdate string   `json:"sessionUpdate"`
-	Content       *content `json:"content"`
-	Title         string   `json:"title"`
-	Kind          string   `json:"kind"`
-	Status        string   `json:"status"`
+	SessionUpdate string         `json:"sessionUpdate"`
+	Content       *content       `json:"-"` // single block (streaming chunks)
+	Blocks        []content      `json:"-"` // block array (tool_call, tool_call_update)
+	Title         string         `json:"title"`
+	Kind          string         `json:"kind"`
+	Status        string         `json:"status"`
+	ToolCallID    string         `json:"toolCallId"`
+	RawInput      map[string]any `json:"rawInput"`
+	Entries       []planEntry    `json:"entries"` // plan updates
 }
 
+// UnmarshalJSON decodes the common fields and the content field, which is a
+// single object on streaming chunks but an array of blocks on tool calls.
+func (u *sessionUpdate) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		SessionUpdate string          `json:"sessionUpdate"`
+		Content       json.RawMessage `json:"content"`
+		Title         string          `json:"title"`
+		Kind          string          `json:"kind"`
+		Status        string          `json:"status"`
+		ToolCallID    string          `json:"toolCallId"`
+		RawInput      map[string]any  `json:"rawInput"`
+		Entries       []planEntry     `json:"entries"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	u.SessionUpdate = raw.SessionUpdate
+	u.Title = raw.Title
+	u.Kind = raw.Kind
+	u.Status = raw.Status
+	u.ToolCallID = raw.ToolCallID
+	u.RawInput = raw.RawInput
+	u.Entries = raw.Entries
+
+	if len(raw.Content) > 0 {
+		var one content
+		if json.Unmarshal(raw.Content, &one) == nil && one.Type != "" {
+			u.Content = &one
+		}
+		var many []content
+		if json.Unmarshal(raw.Content, &many) == nil && len(many) > 0 {
+			u.Blocks = many
+		}
+	}
+	return nil
+}
+
+// contentText returns the text of a single-block content field.
 func (u sessionUpdate) contentText() string {
 	if u.Content == nil || u.Content.Type != "text" {
 		return ""
@@ -467,9 +553,45 @@ func (u sessionUpdate) contentText() string {
 	return u.Content.Text
 }
 
+// contentSummary joins the text of all content blocks, which is where edit
+// tools surface the diff of what they changed.
+func (u sessionUpdate) contentSummary() string {
+	parts := make([]string, 0, len(u.Blocks)+1)
+	if t := u.contentText(); t != "" {
+		parts = append(parts, t)
+	}
+	for _, b := range u.Blocks {
+		if b.Text != "" {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// planText renders the agent's plan entries as one status line per entry.
+func (u sessionUpdate) planText() string {
+	if len(u.Entries) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(u.Entries))
+	for _, e := range u.Entries {
+		if e.Content != "" {
+			lines = append(lines, fmt.Sprintf("[%s] %s", e.Status, e.Content))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 type content struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+}
+
+// planEntry is one row of a plan update.
+type planEntry struct {
+	Content  string `json:"content"`
+	Priority string `json:"priority"`
+	Status   string `json:"status"`
 }
 
 type permissionParams struct {
@@ -492,16 +614,19 @@ type permissionOption struct {
 // client must echo back to answer.
 func permissionText(p permissionParams) string {
 	var b strings.Builder
+
 	b.WriteString("permission required")
 	if t := agent.FirstNonEmpty(p.ToolCall.Title, p.ToolCall.Kind); t != "" {
 		b.WriteString(": ")
 		b.WriteString(t)
 	}
+
 	if labels := optionLabels(p.Options); len(labels) > 0 {
 		b.WriteString(" (reply with one of: ")
 		b.WriteString(strings.Join(labels, ", "))
 		b.WriteString(")")
 	}
+
 	return b.String()
 }
 
@@ -521,6 +646,7 @@ func usableOptions(options []permissionOption) []permissionOption {
 			usable = append(usable, o)
 		}
 	}
+
 	return usable
 }
 
@@ -530,6 +656,7 @@ func permissionOptionIDs(options []permissionOption) []string {
 	for i, o := range usable {
 		ids[i] = o.OptionID
 	}
+
 	return ids
 }
 
@@ -543,5 +670,6 @@ func optionLabels(options []permissionOption) []string {
 			labels[i] = o.OptionID + " (" + o.Name + ")"
 		}
 	}
+
 	return labels
 }

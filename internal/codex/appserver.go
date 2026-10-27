@@ -97,6 +97,7 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 		conn:     c,
 		events:   make(chan agent.Event, 64),
 		deltas:   make(chan string, 128),
+		items:    make(chan agent.Event, 64),
 		done:     make(chan turnResult, 1),
 		stopped:  make(chan struct{}),
 	}
@@ -237,6 +238,48 @@ func (c *conn) Notification(method string, params json.RawMessage) {
 				s.deliverDone("failed", &turnError{Message: p.Error.Message})
 			}
 		}
+	case "item/completed":
+		// agentMessage items are skipped: their text already arrived through
+		// item/agentMessage/delta deltas.
+		var p struct {
+			ThreadID string          `json:"threadId"`
+			Item     json.RawMessage `json:"item"`
+		}
+		if json.Unmarshal(params, &p) != nil || len(p.Item) == 0 {
+			return
+		}
+		s := c.session(p.ThreadID)
+		if s == nil {
+			return
+		}
+		var item struct {
+			Type    string `json:"type"`
+			Text    string `json:"text"`
+			Content string `json:"content"`
+			Command string `json:"command"`
+		}
+		if json.Unmarshal(p.Item, &item) != nil {
+			return
+		}
+		switch item.Type {
+		case "reasoning":
+			text := item.Text
+			if text == "" {
+				text = item.Content
+			}
+			if text != "" {
+				s.deliverItem(agent.Event{Kind: agent.EventThinking, Text: text})
+			}
+		case "command_execution":
+			s.deliverItem(agent.Event{Kind: agent.EventToolCall, Tool: "shell",
+				ToolInput: map[string]any{"command": item.Command}})
+		case "file_change":
+			// The item carries codex's own change structure; forward it
+			// verbatim as the tool input.
+			input := map[string]any{}
+			_ = json.Unmarshal(p.Item, &input)
+			s.deliverItem(agent.Event{Kind: agent.EventToolCall, Tool: "file_change", ToolInput: input})
+		}
 	}
 }
 
@@ -292,6 +335,7 @@ type appSession struct {
 
 	events  chan agent.Event
 	deltas  chan string
+	items   chan agent.Event
 	done    chan turnResult
 	stopped chan struct{}
 
@@ -330,6 +374,27 @@ func (s *appSession) deliverDelta(delta string) {
 	select {
 	case s.deltas <- delta:
 	case <-s.stopped:
+	}
+}
+
+// deliverItem forwards a non-text turn item (tool call, reasoning), unless the
+// run has already ended.
+func (s *appSession) deliverItem(ev agent.Event) {
+	select {
+	case s.items <- ev:
+	case <-s.stopped:
+	}
+}
+
+// flushItems emits any buffered items, without blocking.
+func (s *appSession) flushItems() {
+	for {
+		select {
+		case ev := <-s.items:
+			s.events <- ev
+		default:
+			return
+		}
 	}
 }
 
@@ -374,10 +439,13 @@ func (s *appSession) run(ctx context.Context, c *conn, prompt string) {
 		select {
 		case delta := <-s.deltas:
 			s.events <- agent.Event{Kind: agent.EventTextDelta, Text: delta}
+		case ev := <-s.items:
+			s.events <- ev
 		case res := <-s.done:
 			// The connection enqueues every delta before the terminal, so drain
 			// the buffer first: a random select could otherwise drop text.
 			s.flushDeltas()
+			s.flushItems()
 			if res.status == "failed" || res.err != "" {
 				msg := agent.FirstNonEmpty(res.err, "codex turn failed")
 				s.events <- agent.Event{Kind: agent.EventError, Err: errors.New(msg)}
