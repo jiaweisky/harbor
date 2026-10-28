@@ -559,13 +559,13 @@ func TestCardInteractionMode(t *testing.T) {
 	script := scriptPath(t, "fake-codebuddy.sh")
 
 	nonInteractive := bridge.BuildCard(launcherWithInteraction(t, script, "non-interactive"),
-		agent.Info{Name: "cb"}, "http://example/agents/cb/", false)
+		core.AgentSpec{}, "http://example/agents/cb/", false)
 	if hasExtension(nonInteractive, bridge.InteractionExtensionURI) {
 		t.Fatalf("non-interactive card should omit the interaction extension")
 	}
 
 	interactive := bridge.BuildCard(launcherWithInteraction(t, script, "interactive"),
-		agent.Info{Name: "cb"}, "http://example/agents/cb/", false)
+		core.AgentSpec{}, "http://example/agents/cb/", false)
 	if !hasExtension(interactive, bridge.InteractionExtensionURI) {
 		t.Fatalf("interactive card should declare the interaction extension")
 	}
@@ -685,11 +685,11 @@ func TestStreamJSONDataBlocks(t *testing.T) {
 func TestExecStructuredOutput(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "args.log")
-		ac := config.AgentConfig{
-			ID: "mc", Binary: fakeclitest.Path(t, "fake-arg-log"),
-			Env:              map[string]string{"HARBOR_ARG_LOG": logPath, "FAKE_OUTPUT": `{"city":"Paris"}`},
-			OutputSchemaArgs: []string{"--output-schema", "{{.SchemaFile}}"},
-		}
+	ac := config.AgentConfig{
+		ID: "mc", Binary: fakeclitest.Path(t, "fake-arg-log"),
+		Env:              map[string]string{"HARBOR_ARG_LOG": logPath, "FAKE_OUTPUT": `{"city":"Paris"}`},
+		OutputSchemaArgs: []string{"--output-schema", "{{.SchemaFile}}"},
+	}
 	ln := newExecLauncher(t, ac, integration.Options{InheritEnv: true})
 	h := newHandler(t, ln)
 
@@ -715,11 +715,11 @@ func TestExecStructuredOutput(t *testing.T) {
 func TestExecFileAttachment(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "args.log")
-		ac := config.AgentConfig{
-			ID: "mc", Binary: fakeclitest.Path(t, "fake-arg-log"),
-			Env:      map[string]string{"HARBOR_ARG_LOG": logPath, "FAKE_OUTPUT": "ok"},
-			FileArgs: []string{"-f", "{{.File}}"},
-		}
+	ac := config.AgentConfig{
+		ID: "mc", Binary: fakeclitest.Path(t, "fake-arg-log"),
+		Env:      map[string]string{"HARBOR_ARG_LOG": logPath, "FAKE_OUTPUT": "ok"},
+		FileArgs: []string{"-f", "{{.File}}"},
+	}
 	ln := newExecLauncher(t, ac, integration.Options{InheritEnv: true})
 	h := newHandler(t, ln)
 
@@ -1152,8 +1152,7 @@ func newExecLauncher(t *testing.T, ac config.AgentConfig, opts integration.Optio
 
 func TestCardVersion(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
-	info := ln.Probe(context.Background())
-	card := bridge.BuildCard(ln, info, "http://example/agents/x/", false)
+	card := bridge.BuildCard(ln, core.AgentSpec{}, "http://example/agents/x/", false)
 	if len(card.SupportedInterfaces) != 2 {
 		t.Fatalf("interfaces = %d, want JSON-RPC and HTTP+JSON", len(card.SupportedInterfaces))
 	}
@@ -1170,14 +1169,14 @@ func TestCardVersion(t *testing.T) {
 // card.
 func TestCardOverride(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
-	info := agent.Info{
-		Name: "cb", DisplayName: "CodeBuddy", Description: "My CodeBuddy",
-		Skills: []agent.Skill{{
+	spec := core.AgentSpec{Card: core.CardSpec{
+		Name: "CodeBuddy", Description: "My CodeBuddy",
+		Skills: []core.Skill{{
 			ID: "code-review", Name: "Code review", Description: "Review a diff for issues",
 			Tags: []string{"review", "quality"}, Examples: []string{"review this diff"},
 		}},
-	}
-	card := bridge.BuildCard(ln, info, "http://example/agents/cb/", false)
+	}}
+	card := bridge.BuildCard(ln, spec, "http://example/agents/cb/", false)
 	if card.Description != "My CodeBuddy" {
 		t.Fatalf("description = %q", card.Description)
 	}
@@ -1189,11 +1188,66 @@ func TestCardOverride(t *testing.T) {
 	}
 }
 
+func TestCardStaticMetadataAndExtensions(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-pwd.sh"), "exec", nil, nil)
+	spec := core.AgentSpec{Card: core.CardSpec{
+		Name: "CodeBuddy", Description: "My CodeBuddy",
+		IconURL:          "https://example.test/icon.png",
+		DocumentationURL: "https://example.test/docs",
+		Provider:         &core.Provider{Organization: "Example Org", URL: "https://example.test"},
+		Extensions: []core.Extension{{
+			URI: "https://example.test/ext/v1", Description: "Example extension",
+			Required: true, Params: map[string]any{"key": "value"},
+		}},
+	}}
+	card := bridge.BuildCard(ln, spec, "http://example/agents/cb/", false)
+
+	if card.IconURL != spec.Card.IconURL || card.DocumentationURL != spec.Card.DocumentationURL {
+		t.Fatalf("card links = %+v", card)
+	}
+	if card.Provider == nil || card.Provider.Org != spec.Card.Provider.Organization ||
+		card.Provider.URL != spec.Card.Provider.URL {
+		t.Fatalf("provider = %+v", card.Provider)
+	}
+	if len(card.Capabilities.Extensions) != 1 {
+		t.Fatalf("extensions = %+v", card.Capabilities.Extensions)
+	}
+	ext := card.Capabilities.Extensions[0]
+	if ext.URI != spec.Card.Extensions[0].URI || !ext.Required || ext.Params["key"] != "value" {
+		t.Fatalf("extension = %+v", ext)
+	}
+}
+
+func TestConfiguredExtensionOverridesInteraction(t *testing.T) {
+	ln := newLauncher(t, scriptPath(t, "fake-acp.sh"), "acp", nil, nil)
+	spec := core.AgentSpec{Card: core.CardSpec{
+		Extensions: []core.Extension{{
+			URI:         bridge.InteractionExtensionURI,
+			Description: "overridden",
+			Required:    true,
+		}},
+	}}
+	card := bridge.BuildCard(ln, spec, "http://example/agents/cb/", false)
+
+	var count int
+	for _, ext := range card.Capabilities.Extensions {
+		if ext.URI == bridge.InteractionExtensionURI {
+			count++
+			if !ext.Required || ext.Description != "overridden" {
+				t.Fatalf("extension = %+v", ext)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("interaction extension count = %d, want 1", count)
+	}
+}
+
 // TestCardNoSkills verifies no skills are advertised when none are configured,
 // while the field itself stays present (non-nil, empty).
 func TestCardNoSkills(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
-	card := bridge.BuildCard(ln, agent.Info{Name: "cb", DisplayName: "CodeBuddy"}, "http://example/agents/cb/", false)
+	card := bridge.BuildCard(ln, core.AgentSpec{Card: core.CardSpec{Name: "CodeBuddy"}}, "http://example/agents/cb/", false)
 	if card.Skills == nil || len(card.Skills) != 0 {
 		t.Fatalf("skills = %+v, want an empty (non-nil) slice", card.Skills)
 	}
@@ -1201,13 +1255,13 @@ func TestCardNoSkills(t *testing.T) {
 
 func TestCardDeclaresInteractionExtension(t *testing.T) {
 	acpLn := newLauncher(t, scriptPath(t, "fake-acp.sh"), "acp", nil, nil)
-	acpCard := bridge.BuildCard(acpLn, acpLn.Probe(context.Background()), "http://example/agents/a/", false)
+	acpCard := bridge.BuildCard(acpLn, core.AgentSpec{}, "http://example/agents/a/", false)
 	if !hasExtension(acpCard, bridge.InteractionExtensionURI) {
 		t.Fatalf("interactive card missing interaction extension: %+v", acpCard.Capabilities.Extensions)
 	}
 
 	execLn := newLauncher(t, scriptPath(t, "fake-pwd.sh"), "exec", nil, nil)
-	execCard := bridge.BuildCard(execLn, execLn.Probe(context.Background()), "http://example/agents/e/", false)
+	execCard := bridge.BuildCard(execLn, core.AgentSpec{}, "http://example/agents/e/", false)
 	if hasExtension(execCard, bridge.InteractionExtensionURI) {
 		t.Fatalf("non-interactive card should not declare the interaction extension")
 	}
@@ -1615,9 +1669,7 @@ func TestWorkdirApplied(t *testing.T) {
 
 func TestCardUsesDisplayName(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
-	info := ln.Probe(context.Background())
-	info.DisplayName = "CodeBuddy Pro"
-	card := bridge.BuildCard(ln, info, "http://example/agents/cb/", false)
+	card := bridge.BuildCard(ln, core.AgentSpec{Card: core.CardSpec{Name: "CodeBuddy Pro"}}, "http://example/agents/cb/", false)
 	if card.Name != "CodeBuddy Pro" {
 		t.Fatalf("card name = %q", card.Name)
 	}
@@ -1625,7 +1677,7 @@ func TestCardUsesDisplayName(t *testing.T) {
 
 func TestDiscoveryAggregate(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
-	card := bridge.BuildCard(ln, ln.Probe(context.Background()), "http://example/agents/x/", false)
+	card := bridge.BuildCard(ln, core.AgentSpec{}, "http://example/agents/x/", false)
 
 	mux := http.NewServeMux()
 	mux.Handle("/.well-known/agents.json", server.NewCardsHandler([]*a2a.AgentCard{card}))
@@ -1651,7 +1703,7 @@ func TestDiscoveryAggregate(t *testing.T) {
 
 func TestAuthScope(t *testing.T) {
 	ln := newLauncher(t, scriptPath(t, "fake-codebuddy.sh"), "stream-json", nil, nil)
-	card := bridge.BuildCard(ln, ln.Probe(context.Background()), "http://example/agents/x/", true)
+	card := bridge.BuildCard(ln, core.AgentSpec{}, "http://example/agents/x/", true)
 
 	exec := bridge.NewCLIExecutor(ln, session.New(), agent.NewLiveSessions(), nil, core.Limits{})
 	h := a2asrv.NewHandler(exec)

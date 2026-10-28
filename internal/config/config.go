@@ -135,7 +135,6 @@ func (s SandboxConfig) InheritEnvEnabled() bool {
 // AgentConfig configures one exposed coding-agent CLI.
 type AgentConfig struct {
 	ID             string              `yaml:"id"`
-	DisplayName    string              `yaml:"display_name"`
 	Binary         string              `yaml:"binary"`
 	Integration    core.Integration    `yaml:"integration"`
 	Parser         core.ParserKind     `yaml:"parser"`          // exec framing: text | codex | regex; default text
@@ -168,12 +167,10 @@ type AgentConfig struct {
 	// CLI profile's list. They are sent as native content blocks when the
 	// integration supports structured input, otherwise via ImageArgs.
 	InputImage []string `yaml:"input_image"`
-	// Description is the agent card's description text.
-	Description string `yaml:"description"`
-	// Skills lists the skills advertised on the agent card. When empty, no
-	// skills are advertised (the A2A "skills" field is still present).
-	Skills  []SkillConfig `yaml:"skills"`
-	Version string        `yaml:"version"` // optional card version override; skips probing
+	// CLIVersion overrides CLI version probing; it is not the A2A card version.
+	CLIVersion string `yaml:"cli_version"`
+	// Card configures the advertised A2A AgentCard.
+	Card CardConfig `yaml:"card"`
 	// Interaction controls whether the CLI's permission/plan/question prompts are
 	// surfaced as A2A input-required. auto (default) derives it from the
 	// integration; interactive forces it on; non-interactive turns it off.
@@ -185,6 +182,41 @@ type AgentConfig struct {
 // RegexConfig configures the regex parser.
 type RegexConfig struct {
 	Text string `yaml:"text"`
+}
+
+// CardConfig is the operator-controlled part of the A2A AgentCard.
+type CardConfig struct {
+	Name             string             `yaml:"name"`
+	Description      string             `yaml:"description"`
+	Version          string             `yaml:"version"`
+	IconURL          string             `yaml:"icon_url"`
+	DocumentationURL string             `yaml:"documentation_url"`
+	Provider         *ProviderConfig    `yaml:"provider"`
+	Skills           []SkillConfig      `yaml:"skills"`
+	Extensions       []ExtensionConfig  `yaml:"extensions"`
+	Signing          *CardSigningConfig `yaml:"signing"`
+}
+
+// ProviderConfig is the agent card's service-provider section.
+type ProviderConfig struct {
+	Organization string `yaml:"organization"`
+	URL          string `yaml:"url"`
+}
+
+// ExtensionConfig is one protocol extension declared on the agent card.
+type ExtensionConfig struct {
+	URI         string         `yaml:"uri"`
+	Description string         `yaml:"description"`
+	Params      map[string]any `yaml:"params"`
+	Required    bool           `yaml:"required"`
+}
+
+// CardSigningConfig configures JWS signing of the agent card.
+type CardSigningConfig struct {
+	KeyFile   string `yaml:"key_file"`  // PEM private key: PKCS#8, EC, or PKCS#1
+	KeyID     string `yaml:"key_id"`    // JWS kid
+	Algorithm string `yaml:"algorithm"` // JWS alg; inferred from the key when empty
+	JWKSURL   string `yaml:"jwks_url"`  // optional JWS jku
 }
 
 // SkillConfig is one AgentSkill advertised on an agent's card. id, name, and
@@ -229,26 +261,45 @@ type BreakerConfig struct {
 // Spec maps the YAML agent configuration to its runtime form.
 func (a AgentConfig) Spec() core.AgentSpec {
 	spec := core.AgentSpec{
-		ID: a.ID, DisplayName: a.DisplayName, Description: a.Description, Binary: a.Binary,
+		ID: a.ID, Binary: a.Binary,
+		Card: core.CardSpec{
+			Name: a.Card.Name, Description: a.Card.Description, Version: a.Card.Version,
+			IconURL: a.Card.IconURL, DocumentationURL: a.Card.DocumentationURL,
+		},
 		Integration: a.Integration, Parser: a.Parser,
 		ServerURL: a.ServerURL, ServerProtocol: a.ServerProtocol,
 		Args: a.Args, Env: a.Env, AllowDangerous: a.AllowDangerous, SDKCaps: a.SDKCaps,
 		OutputSchemaArgs: a.OutputSchemaArgs, FileArgs: a.FileArgs,
 		ImageArgs: a.ImageArgs, InputImage: a.InputImage,
-		Interaction: a.Interaction, Limits: a.Limits.Core(), Version: a.Version,
+		Interaction: a.Interaction, Limits: a.Limits.Core(), CLIVersion: a.CLIVersion,
 		Session: core.Session{
 			IDFlag: a.Session.IDFlag, ResumeFlag: a.Session.ResumeFlag,
 			ContinueFlag: a.Session.ContinueFlag, ForkFlag: a.Session.ForkFlag,
 		},
 	}
+
 	if a.Regex != nil {
 		spec.Regex = &core.Regex{Text: a.Regex.Text}
 	}
-	for _, s := range a.Skills {
-		spec.Skills = append(spec.Skills, core.Skill{
+
+	if a.Card.Provider != nil {
+		spec.Card.Provider = &core.Provider{
+			Organization: a.Card.Provider.Organization, URL: a.Card.Provider.URL,
+		}
+	}
+
+	for _, e := range a.Card.Extensions {
+		spec.Card.Extensions = append(spec.Card.Extensions, core.Extension{
+			URI: e.URI, Description: e.Description, Params: e.Params, Required: e.Required,
+		})
+	}
+
+	for _, s := range a.Card.Skills {
+		spec.Card.Skills = append(spec.Card.Skills, core.Skill{
 			ID: s.ID, Name: s.Name, Description: s.Description,
 			Tags: s.Tags, Examples: s.Examples, InputModes: s.InputModes, OutputModes: s.OutputModes,
 		})
 	}
+
 	return spec
 }

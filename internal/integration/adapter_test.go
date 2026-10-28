@@ -16,7 +16,7 @@ type stubLauncher struct{ name string }
 
 func (s stubLauncher) Name() string                   { return s.name }
 func (stubLauncher) Capabilities() agent.Capabilities { return agent.Capabilities{InputText: true} }
-func (stubLauncher) Probe(context.Context) agent.Info { return agent.Info{Name: "stub"} }
+func (stubLauncher) Probe(context.Context) agent.Info { return agent.Info{AgentID: "stub"} }
 func (stubLauncher) Auth() agent.Authenticator        { return nil }
 func (stubLauncher) AuthReady(context.Context) bool   { return true }
 func (stubLauncher) Start(context.Context, *agent.Request) (agent.Session, error) {

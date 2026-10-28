@@ -37,14 +37,14 @@ func buildOpencode(ac core.AgentSpec, opts cli.Options) (agent.Launcher, error) 
 			Name: ac.ID, Binary: ac.Binary, Args: ac.Args, Env: envSlice(ac.Env),
 			Auth: authenticator(ac), MaxConcurrent: ac.Limits.MaxConcurrent,
 			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container, Runtime: opts.Runtime,
-			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.Version,
+			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.CLIVersion,
 		}), nil
 	case core.IntegrationServer:
 		return opencode.NewServerLauncher(opts.Ctx, opencode.Config{
 			Name: ac.ID, Binary: ac.Binary, BaseURL: ac.ServerURL,
 			Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			Container: opts.Container, Runtime: opts.Runtime, Auth: authenticator(ac),
-			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.Version,
+			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.CLIVersion,
 		}), nil
 	default:
 		return nil, cli.ErrUnhandled
@@ -61,7 +61,7 @@ func buildCodebuddy(ac core.AgentSpec, opts cli.Options) (agent.Launcher, error)
 			Name: ac.ID, Binary: ac.Binary, Args: ac.Args, Env: envSlice(ac.Env),
 			Auth: authenticator(ac), MaxConcurrent: ac.Limits.MaxConcurrent,
 			InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container, Runtime: opts.Runtime,
-			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.Version,
+			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.CLIVersion,
 		}), nil
 	case core.IntegrationServer:
 		if ac.ServerProtocol == core.ServerProtocolACP ||
@@ -79,14 +79,14 @@ func buildCodebuddy(ac core.AgentSpec, opts cli.Options) (agent.Launcher, error)
 				Headers: http.Header{"X-CodeBuddy-Request": {"1"}},
 				Auth:    authenticator(ac), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 				Container: opts.Container, Runtime: opts.Runtime, VersionArgs: profileVersionArgs(ac),
-				VersionOverride: ac.Version, Lifecycle: opts.Ctx,
+				VersionOverride: ac.CLIVersion, Lifecycle: opts.Ctx,
 			}), nil
 		}
 		return codebuddy.NewServerLauncher(opts.Ctx, codebuddy.Config{
 			Name: ac.ID, Binary: ac.Binary, BaseURL: ac.ServerURL,
 			Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 			Container: opts.Container, Runtime: opts.Runtime, Auth: authenticator(ac),
-			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.Version,
+			VersionArgs: profileVersionArgs(ac), VersionOverride: ac.CLIVersion,
 		}), nil
 	default:
 		return nil, cli.ErrUnhandled
@@ -103,7 +103,7 @@ func buildCodex(ac core.AgentSpec, opts cli.Options) (agent.Launcher, error) {
 		Name: ac.ID, Binary: ac.Binary,
 		Env: envSlice(ac.Env), InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome,
 		Container: opts.Container, Runtime: opts.Runtime, Auth: authenticator(ac),
-		VersionArgs: profileVersionArgs(ac), VersionOverride: ac.Version,
+		VersionArgs: profileVersionArgs(ac), VersionOverride: ac.CLIVersion,
 	}), nil
 }
 

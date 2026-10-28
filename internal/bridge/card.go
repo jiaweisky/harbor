@@ -4,6 +4,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 
 	"github.com/jiaweisky/harbor/internal/agent"
+	"github.com/jiaweisky/harbor/internal/core"
 )
 
 // RESTMount is the HTTP+JSON (A2A REST) binding path segment under an agent's
@@ -21,27 +22,32 @@ const InteractionExtensionURI = "https://github.com/jiaweisky/harbor/extensions/
 
 // BuildCard builds an AgentCard for one launcher at the given endpoint URL.
 func BuildCard(
-	ln agent.Launcher, info agent.Info, endpoint string, bearer bool,
+	ln agent.Launcher, spec core.AgentSpec, endpoint string, bearer bool,
 ) *a2a.AgentCard {
 	caps := ln.Capabilities()
 
-	version := info.Version
+	version := spec.Card.Version
 	if version == "" {
 		version = "0.1.0"
 	}
+
 	in := caps.InputModes()
 	if len(in) == 0 {
 		in = []string{"text/plain"}
 	}
+
 	out := caps.OutputModes()
 	if len(out) == 0 {
 		out = []string{"text/plain"}
 	}
 
 	card := &a2a.AgentCard{
-		Name:        info.DisplayName,
-		Description: info.Description,
-		Version:     version,
+		Name:             spec.Card.Name,
+		Description:      spec.Card.Description,
+		Version:          version,
+		IconURL:          spec.Card.IconURL,
+		DocumentationURL: spec.Card.DocumentationURL,
+		Provider:         cardProvider(spec.Card.Provider),
 		SupportedInterfaces: []*a2a.AgentInterface{
 			{
 				URL:             endpoint,
@@ -57,11 +63,11 @@ func BuildCard(
 		Capabilities: a2a.AgentCapabilities{
 			Streaming:         caps.Streaming != agent.StreamNone,
 			PushNotifications: true,
-			Extensions:        interactionExtensions(caps),
+			Extensions:        cardExtensions(caps, spec.Card.Extensions),
 		},
 		DefaultInputModes:  in,
 		DefaultOutputModes: out,
-		Skills:             cardSkills(info.Skills),
+		Skills:             cardSkills(spec.Card.Skills),
 	}
 
 	if bearer {
@@ -73,12 +79,14 @@ func BuildCard(
 			{name: a2a.SecuritySchemeScopes{}},
 		}
 	}
+
 	return card
 }
 
 // cardSkills maps the operator-configured skills onto card skills.
-func cardSkills(skills []agent.Skill) []a2a.AgentSkill {
+func cardSkills(skills []core.Skill) []a2a.AgentSkill {
 	out := make([]a2a.AgentSkill, 0, len(skills))
+
 	for _, s := range skills {
 		out = append(out, a2a.AgentSkill{
 			ID:          s.ID,
@@ -90,6 +98,38 @@ func cardSkills(skills []agent.Skill) []a2a.AgentSkill {
 			OutputModes: s.OutputModes,
 		})
 	}
+
+	return out
+}
+
+// cardProvider maps the configured provider onto its card type.
+func cardProvider(p *core.Provider) *a2a.AgentProvider {
+	if p == nil {
+		return nil
+	}
+
+	return &a2a.AgentProvider{Org: p.Organization, URL: p.URL}
+}
+
+// cardExtensions merges operator-configured extensions with the interaction
+// extension. A configured extension with the same URI takes precedence.
+func cardExtensions(caps agent.Capabilities, configured []core.Extension) []a2a.AgentExtension {
+	out := make([]a2a.AgentExtension, 0, len(configured)+1)
+	seen := make(map[string]bool, len(configured)+1)
+
+	for _, e := range configured {
+		out = append(out, a2a.AgentExtension{
+			URI: e.URI, Description: e.Description, Params: e.Params, Required: e.Required,
+		})
+		seen[e.URI] = true
+	}
+
+	for _, e := range interactionExtensions(caps) {
+		if !seen[e.URI] {
+			out = append(out, e)
+		}
+	}
+
 	return out
 }
 
@@ -100,6 +140,7 @@ func interactionExtensions(caps agent.Capabilities) []a2a.AgentExtension {
 	if caps.Permission != agent.PermInteractive && !caps.AskQuestion && !caps.PlanApproval {
 		return nil
 	}
+
 	return []a2a.AgentExtension{{
 		URI:         InteractionExtensionURI,
 		Description: "Structured permission/question/plan-approval requests over input-required",

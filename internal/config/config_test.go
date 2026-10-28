@@ -62,8 +62,6 @@ func TestLoadExpandsEnvironment(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "${HARBOR_TEST_DESCRIPTION}"
     binary: codebuddy
     integration: stream-json
     env:
@@ -77,14 +75,17 @@ agents:
       POSITIONAL: "$1"
       BRACED_DIGIT: "${1}"
       NESTED: "${HARBOR_TEST_NESTED}"
+    card:
+      name: "cb"
+      description: "${HARBOR_TEST_DESCRIPTION}"
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	agent := cfg.Agents[0]
-	if agent.Description != "from env" {
-		t.Errorf("description = %q, want %q", agent.Description, "from env")
+	if agent.Card.Description != "from env" {
+		t.Errorf("description = %q, want %q", agent.Card.Description, "from env")
 	}
 	want := map[string]string{
 		"TOKEN":        "s3cret",
@@ -110,12 +111,13 @@ func TestLoadRejectsMalformedEnvironmentReference(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent."
     binary: codebuddy
     integration: stream-json
     env:
       TOKEN: "${HARBOR_TEST_UNSET_9F3C"
+    card:
+      name: "cb"
+      description: "Test agent."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "config: closing brace") {
@@ -128,12 +130,13 @@ func TestLoadRejectsUnsetEnvironmentReference(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent."
     binary: codebuddy
     integration: stream-json
     env:
       TOKEN: "${HARBOR_TEST_UNSET_9F3C}"
+    card:
+      name: "cb"
+      description: "Test agent."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "not set") {
@@ -160,16 +163,17 @@ func TestLoadQuotedEnvironmentValues(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: `+tc.ref+`
     binary: codebuddy
     integration: stream-json
+    card:
+      name: "cb"
+      description: `+tc.ref+`
 `)
 			cfg, err := loadConfig(t, path)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got := cfg.Agents[0].Description; got != tc.want {
+			if got := cfg.Agents[0].Card.Description; got != tc.want {
 				t.Errorf("description = %q, want %q", got, tc.want)
 			}
 		})
@@ -182,10 +186,11 @@ func TestLoadUnquotedEnvironmentValueNeedsQuoting(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: ${HARBOR_QUOTE_VALUE}
     binary: codebuddy
     integration: stream-json
+    card:
+      name: "cb"
+      description: ${HARBOR_QUOTE_VALUE}
 `)
 	if _, err := loadConfig(t, path); err == nil {
 		t.Fatal("expected a YAML error for an unquoted value containing \"a: b\"")
@@ -205,11 +210,12 @@ sandbox:
   state_dir: "/tmp/harbor-test-state"
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "listen") {
@@ -224,11 +230,12 @@ server:
   listen: "127.0.0.1:8080"
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "state_dir") {
@@ -243,11 +250,12 @@ agents:
   - id: cb
     binary: codebuddy
     integration: stream-json
-    description: "Test agent."
+    card:
+      description: "Test agent."
 `)
 	_, err := loadConfig(t, displayName)
-	if err == nil || !strings.Contains(err.Error(), "display_name is required") {
-		t.Fatalf("expected a display_name error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "card.name is required") {
+		t.Fatalf("expected a card.name error, got %v", err)
 	}
 
 	description := writeConfig(t, `
@@ -256,10 +264,11 @@ agents:
   - id: cb
     binary: codebuddy
     integration: stream-json
-    display_name: "CodeBuddy"
+    card:
+      name: "CodeBuddy"
 `)
 	_, err = loadConfig(t, description)
-	if err == nil || !strings.Contains(err.Error(), "description is required") {
+	if err == nil || !strings.Contains(err.Error(), "card.description is required") {
 		t.Fatalf("expected a description error, got %v", err)
 	}
 }
@@ -269,11 +278,12 @@ func TestExecRequiresPromptTemplate(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: exec
     args: ["-p", "--output-format", "stream-json"]
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "{{.Prompt}}") {
@@ -286,11 +296,12 @@ func TestExecWithPromptTemplateIsValid(t *testing.T) {
 version: 1
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	if _, err := loadConfig(t, path); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -302,11 +313,12 @@ func TestCodexProfileDefaultOutputSchemaArgs(t *testing.T) {
 version: 1
 agents:
   - id: cx
-    display_name: "cx"
-    description: "Test agent for the cx CLI."
     binary: codex
     integration: exec
     args: ["exec", "--json", "{{.Prompt}}"]
+    card:
+      name: "cx"
+      description: "Test agent for the cx CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -323,11 +335,12 @@ func TestOpencodeProfileDefaultFileArgs(t *testing.T) {
 version: 1
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -344,11 +357,12 @@ func TestServerProtocolValidation(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: server
     server_protocol: acp
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	if _, err := loadConfig(t, valid); err != nil {
 		t.Fatalf("unexpected error for acp protocol: %v", err)
@@ -358,11 +372,12 @@ agents:
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: server
     server_protocol: acp-streamable-http
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	if _, err := loadConfig(t, streamable); err != nil {
 		t.Fatalf("unexpected error for acp-streamable-http protocol: %v", err)
@@ -372,11 +387,12 @@ agents:
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: server
     server_protocol: grpc
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	if _, err := loadConfig(t, bad); err == nil || !strings.Contains(err.Error(), "server_protocol") {
 		t.Fatalf("expected a server_protocol error, got %v", err)
@@ -391,11 +407,12 @@ func TestInteractionValidation(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     interaction: `+string(mode)+`
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 		cfg, err := loadConfig(t, path)
 		if err != nil {
@@ -410,10 +427,11 @@ agents:
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	cfg, err := loadConfig(t, def)
 	if err != nil {
@@ -427,11 +445,12 @@ agents:
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     interaction: sometimes
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	if _, err := loadConfig(t, bad); err == nil || !strings.Contains(err.Error(), "interaction") {
 		t.Fatalf("expected an interaction error, got %v", err)
@@ -442,12 +461,13 @@ agents:
 version: 1
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     interaction: interactive
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	if _, err := loadConfig(t, badCombo); err == nil || !strings.Contains(err.Error(), "pausable") {
 		t.Fatalf("expected a pausable-integration error, got %v", err)
@@ -459,10 +479,11 @@ func TestACPProfileFillsDefaultArgs(t *testing.T) {
 version: 1
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: acp
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -478,10 +499,11 @@ func TestACPRequiresArgs(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: acp
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "ACP mode") {
@@ -494,10 +516,11 @@ func TestUnknownIntegrationIsRejected(t *testing.T) {
 version: 1
 agents:
   - id: x
-    display_name: "x"
-    description: "Test agent for the x CLI."
     binary: b
     integration: bogus
+    card:
+      name: "x"
+      description: "Test agent for the x CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "unknown integration") {
@@ -517,10 +540,11 @@ func TestProfileFillsDefaultIntegration(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: /usr/local/bin/codebuddy
     args: ["-p"]
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -536,11 +560,12 @@ func TestProfileRejectsUnsupportedIntegration(t *testing.T) {
 version: 1
 agents:
   - id: c
-    display_name: "c"
-    description: "Test agent for the c CLI."
     binary: claude
     integration: exec
     args: ["{{.Prompt}}"]
+    card:
+      name: "c"
+      description: "Test agent for the c CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "does not support integration") {
@@ -553,9 +578,10 @@ func TestUnknownBinaryRequiresIntegration(t *testing.T) {
 version: 1
 agents:
   - id: x
-    display_name: "x"
-    description: "Test agent for the x CLI."
     binary: my-bot
+    card:
+      name: "x"
+      description: "Test agent for the x CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "unknown binary") {
@@ -568,8 +594,6 @@ func TestLimitsParsed(t *testing.T) {
 version: 1
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
@@ -577,6 +601,9 @@ agents:
       max_concurrent: 2
       timeout: 30m
       idle_timeout: 5m
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -596,11 +623,12 @@ sandbox:
   isolation: worktree
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "isolation_root") {
@@ -622,12 +650,13 @@ sandbox:
   isolation_root: ` + strconv.Quote(root) + `
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
     workdir: ` + strconv.Quote(work) + `
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `
 	_, err := loadConfig(t, writeConfig(t, body))
 	if err == nil || !strings.Contains(err.Error(), "must not contain") {
@@ -658,12 +687,13 @@ sandbox:
   isolation_root: ` + strconv.Quote(root) + `
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
     workdir: ` + strconv.Quote(work) + `
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `
 	_, err := loadConfig(t, writeConfig(t, body))
 	if err == nil || !strings.Contains(err.Error(), "must not contain") {
@@ -685,12 +715,13 @@ sandbox:
   isolation_root: ` + strconv.Quote(filepath.Join(link, "a", "b")) + `
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
     workdir: ` + strconv.Quote(work) + `
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `
 	_, err := loadConfig(t, writeConfig(t, body))
 	if err == nil || !strings.Contains(err.Error(), "must not contain") {
@@ -721,11 +752,12 @@ sandbox:
   copy_strategy: `+tc.strategy+`
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 			cfg, err := loadConfig(t, path)
 			if tc.wantErr == "" {
@@ -756,11 +788,12 @@ sandbox:
     image: "img:latest"
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `
 	_, err := loadConfig(t, writeConfig(t, body))
 	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
@@ -782,12 +815,13 @@ sandbox:
   isolation_root: ` + strconv.Quote(root) + `
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
     workdir: ` + strconv.Quote(work) + `
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `
 	_, err := loadConfig(t, writeConfig(t, body))
 	if err == nil || !strings.Contains(err.Error(), "must not contain") {
@@ -803,11 +837,12 @@ sandbox:
   isolation: overlayfs
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `
 	_, err := loadConfig(t, writeConfig(t, body))
 	if err == nil || !strings.Contains(err.Error(), "isolation_root") {
@@ -843,11 +878,12 @@ server:
     mode: `+tc.mode+`
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 			_, err := loadConfig(t, path)
 			if (err != nil) != tc.wantErr {
@@ -866,11 +902,12 @@ sandbox:
   state_dir: "/tmp/harbor-test-state"
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "workdir is required") {
@@ -883,12 +920,13 @@ func TestWorkdirStoredAbsolute(t *testing.T) {
 version: 1
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
     workdir: "."
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -912,11 +950,12 @@ sandbox:
   cli_home: "relative/home"
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -948,11 +987,12 @@ server:
   store: bogus
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "store") {
@@ -968,11 +1008,12 @@ server:
   store: sqlite
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "store_path") {
@@ -988,11 +1029,12 @@ server:
   agent_inactivity_timeout: 30s
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -1008,12 +1050,13 @@ func TestAgentWorkdirMustExist(t *testing.T) {
 version: 1
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
     workdir: /no/such/harbor-dir-xyz
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "workdir") {
@@ -1026,11 +1069,12 @@ func TestInheritEnvDefaultsTrue(t *testing.T) {
 version: 1
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -1049,11 +1093,12 @@ sandbox:
   inherit_env: false
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -1073,11 +1118,12 @@ sandbox:
     image: harbor/claude:latest
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "sandbox.container.runtime is required") {
@@ -1105,11 +1151,12 @@ sandbox:
     runtime: `+tc.runtime+`
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 		cfg, err := loadConfig(t, path)
 		if (err != nil) != tc.wantErr {
@@ -1133,11 +1180,12 @@ sandbox:
     extra_args: ["--network=none", "--read-only", "--pids-limit=512"]
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -1162,11 +1210,12 @@ sandbox:
     runtime: docker
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "sandbox.container.image is required") {
@@ -1179,11 +1228,12 @@ func TestCodexProfileDefaultImageArgs(t *testing.T) {
 version: 1
 agents:
   - id: codex
-    display_name: "codex"
-    description: "Test agent for the codex CLI."
     binary: codex
     integration: exec
     args: ["exec", "{{.Prompt}}"]
+    card:
+      name: "codex"
+      description: "Test agent for the codex CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -1213,11 +1263,12 @@ sandbox:
   require_container_for_dangerous: true
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     allow_dangerous: true
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	if _, err := loadConfig(t, bad); err == nil || !strings.Contains(err.Error(), "require_container_for_dangerous") {
 		t.Fatalf("expected a container-required error, got %v", err)
@@ -1231,11 +1282,12 @@ sandbox:
   container: { image: "harbor/cb:latest", runtime: docker }
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     allow_dangerous: true
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	if _, err := loadConfig(t, good); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1247,11 +1299,12 @@ func TestForkFlagDefaultsFromProfile(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     args: ["-p"]
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -1267,28 +1320,29 @@ func TestCardOverrideConfig(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
     binary: codebuddy
     integration: stream-json
     args: ["-p"]
-    description: "My CodeBuddy"
-    skills:
-      - id: code-review
-        name: Code review
-        description: Review a diff for issues
-        tags: ["review", "quality"]
-        examples: ["review this diff"]
+    card:
+      name: "cb"
+      description: "My CodeBuddy"
+      skills:
+        - id: code-review
+          name: Code review
+          description: Review a diff for issues
+          tags: ["review", "quality"]
+          examples: ["review this diff"]
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	a := cfg.Agents[0]
-	if a.Description != "My CodeBuddy" {
-		t.Fatalf("description = %q", a.Description)
+	if a.Card.Description != "My CodeBuddy" {
+		t.Fatalf("description = %q", a.Card.Description)
 	}
-	if len(a.Skills) != 1 || a.Skills[0].ID != "code-review" || len(a.Skills[0].Tags) != 2 {
-		t.Fatalf("skills = %+v", a.Skills)
+	if len(a.Card.Skills) != 1 || a.Card.Skills[0].ID != "code-review" || len(a.Card.Skills[0].Tags) != 2 {
+		t.Fatalf("skills = %+v", a.Card.Skills)
 	}
 }
 
@@ -1297,17 +1351,128 @@ func TestSkillsRequireIDNameDescription(t *testing.T) {
 version: 1
 agents:
   - id: cb
-    display_name: "cb"
-    description: "Test agent for the cb CLI."
     binary: codebuddy
     integration: stream-json
     args: ["-p"]
-    skills:
-      - id: only-id
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
+      skills:
+        - id: only-id
 `)
 	_, err := loadConfig(t, path)
 	if err == nil || !strings.Contains(err.Error(), "requires id, name, and description") {
 		t.Fatalf("expected a skills validation error, got %v", err)
+	}
+}
+
+func TestAgentCardMetadata(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    args: ["-p"]
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
+      icon_url: "https://example.test/icon.png"
+      documentation_url: "https://example.test/docs"
+      provider:
+        organization: "Example Org"
+        url: "https://example.test"
+      extensions:
+        - uri: "https://example.test/ext/v1"
+          description: "Example extension"
+          required: true
+          params:
+            key: value
+`)
+	cfg, err := loadConfig(t, path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	a := cfg.Agents[0]
+	if a.Card.IconURL != "https://example.test/icon.png" ||
+		a.Card.DocumentationURL != "https://example.test/docs" {
+		t.Fatalf("card links = %+v", a)
+	}
+	if a.Card.Provider == nil || a.Card.Provider.Organization != "Example Org" ||
+		a.Card.Provider.URL != "https://example.test" {
+		t.Fatalf("provider = %+v", a.Card.Provider)
+	}
+	if len(a.Card.Extensions) != 1 || a.Card.Extensions[0].URI != "https://example.test/ext/v1" ||
+		!a.Card.Extensions[0].Required || a.Card.Extensions[0].Params["key"] != "value" {
+		t.Fatalf("extensions = %+v", a.Card.Extensions)
+	}
+
+	spec := a.Spec()
+	if spec.Card.IconURL != a.Card.IconURL || spec.Card.DocumentationURL != a.Card.DocumentationURL ||
+		spec.Card.Provider == nil || spec.Card.Provider.Organization != a.Card.Provider.Organization ||
+		len(spec.Card.Extensions) != 1 || spec.Card.Extensions[0].URI != a.Card.Extensions[0].URI {
+		t.Fatalf("spec = %+v", spec)
+	}
+}
+
+func TestProviderRequiresOrganizationAndURL(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    args: ["-p"]
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
+      provider:
+        organization: "Example Org"
+`)
+	_, err := loadConfig(t, path)
+	if err == nil || !strings.Contains(err.Error(), "provider.url is required") {
+		t.Fatalf("expected a provider validation error, got %v", err)
+	}
+}
+
+func TestCardSigningRequiresKeyFileAndID(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    args: ["-p"]
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
+      signing:
+        key_file: "/tmp/key.pem"
+`)
+	_, err := loadConfig(t, path)
+	if err == nil || !strings.Contains(err.Error(), "card.signing.key_id is required") {
+		t.Fatalf("expected a card.signing validation error, got %v", err)
+	}
+}
+
+func TestDuplicateExtensionRejected(t *testing.T) {
+	path := writeConfig(t, `
+version: 1
+agents:
+  - id: cb
+    binary: codebuddy
+    integration: stream-json
+    args: ["-p"]
+    card:
+      name: "cb"
+      description: "Test agent for the cb CLI."
+      extensions:
+        - uri: "https://example.test/ext/v1"
+        - uri: "https://example.test/ext/v1"
+`)
+	_, err := loadConfig(t, path)
+	if err == nil || !strings.Contains(err.Error(), "duplicate card extension uri") {
+		t.Fatalf("expected a duplicate extension error, got %v", err)
 	}
 }
 
@@ -1319,11 +1484,12 @@ telemetry:
   insecure: true
 agents:
   - id: oc
-    display_name: "oc"
-    description: "Test agent for the oc CLI."
     binary: opencode
     integration: exec
     args: ["run", "{{.Prompt}}"]
+    card:
+      name: "oc"
+      description: "Test agent for the oc CLI."
 `)
 	cfg, err := loadConfig(t, path)
 	if err != nil {
@@ -1339,7 +1505,21 @@ agents:
 
 func TestAgentSpecMapping(t *testing.T) {
 	ac := config.AgentConfig{
-		ID: "a", DisplayName: "A", Description: "d", Binary: "b",
+		ID: "a", Binary: "b", CLIVersion: "cli-1",
+		Card: config.CardConfig{
+			Name: "A", Description: "d", Version: "1",
+			IconURL: "https://example.test/icon.png", DocumentationURL: "https://example.test/docs",
+			Provider: &config.ProviderConfig{Organization: "Org", URL: "https://example.test"},
+			Skills: []config.SkillConfig{{
+				ID: "s", Name: "n", Description: "d",
+				Tags: []string{"t"}, Examples: []string{"e"},
+				InputModes: []string{"in"}, OutputModes: []string{"out"},
+			}},
+			Extensions: []config.ExtensionConfig{{
+				URI: "https://example.test/ext", Description: "ext", Required: true,
+				Params: map[string]any{"k": "v"},
+			}},
+		},
 		Integration: core.IntegrationExec, Parser: "codex",
 		Regex:     &config.RegexConfig{Text: "^x$"},
 		ServerURL: "http://x", ServerProtocol: core.ServerProtocolACP,
@@ -1355,15 +1535,23 @@ func TestAgentSpecMapping(t *testing.T) {
 				Cooldown: time.Second, MaxCooldown: time.Minute,
 			},
 		},
-		Skills: []config.SkillConfig{{
-			ID: "s", Name: "n", Description: "d",
-			Tags: []string{"t"}, Examples: []string{"e"},
-			InputModes: []string{"in"}, OutputModes: []string{"out"},
-		}},
-		Version: "1",
 	}
 	want := core.AgentSpec{
-		ID: "a", DisplayName: "A", Description: "d", Binary: "b",
+		ID: "a", Binary: "b", CLIVersion: "cli-1",
+		Card: core.CardSpec{
+			Name: "A", Description: "d", Version: "1",
+			IconURL: "https://example.test/icon.png", DocumentationURL: "https://example.test/docs",
+			Provider: &core.Provider{Organization: "Org", URL: "https://example.test"},
+			Skills: []core.Skill{{
+				ID: "s", Name: "n", Description: "d",
+				Tags: []string{"t"}, Examples: []string{"e"},
+				InputModes: []string{"in"}, OutputModes: []string{"out"},
+			}},
+			Extensions: []core.Extension{{
+				URI: "https://example.test/ext", Description: "ext", Required: true,
+				Params: map[string]any{"k": "v"},
+			}},
+		},
 		Integration: core.IntegrationExec, Parser: core.ParserCodex,
 		Regex:     &core.Regex{Text: "^x$"},
 		ServerURL: "http://x", ServerProtocol: core.ServerProtocolACP,
@@ -1379,12 +1567,6 @@ func TestAgentSpecMapping(t *testing.T) {
 				Cooldown: time.Second, MaxCooldown: time.Minute,
 			},
 		},
-		Skills: []core.Skill{{
-			ID: "s", Name: "n", Description: "d",
-			Tags: []string{"t"}, Examples: []string{"e"},
-			InputModes: []string{"in"}, OutputModes: []string{"out"},
-		}},
-		Version: "1",
 	}
 	if got := ac.Spec(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Spec() = %+v, want %+v", got, want)

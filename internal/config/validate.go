@@ -7,19 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
-
 	"github.com/jiaweisky/harbor/internal/core"
 )
-
-// hasParentSegment reports whether p contains a ".." path segment.
-func hasParentSegment(p string) bool {
-	for _, part := range strings.Split(p, "/") {
-		if part == ".." {
-			return true
-		}
-	}
-	return false
-}
 
 // pathContains reports whether target is root or lies under it.
 func pathContains(root, target string) (bool, error) {
@@ -27,16 +16,20 @@ func pathContains(root, target string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+
 	target, err = filepath.Abs(target)
 	if err != nil {
 		return false, err
 	}
+
 	root = resolveSymlinks(root)
 	target = resolveSymlinks(target)
+
 	rel, err := filepath.Rel(root, target)
 	if err != nil {
 		return false, err
 	}
+
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))), nil
 }
 
@@ -49,10 +42,12 @@ func resolveSymlinks(path string) string {
 		if resolved, err := filepath.EvalSymlinks(path); err == nil {
 			return filepath.Join(append([]string{resolved}, rest...)...)
 		}
+
 		parent := filepath.Dir(path)
 		if parent == path {
 			return path
 		}
+
 		rest = append([]string{filepath.Base(path)}, rest...)
 		path = parent
 	}
@@ -66,6 +61,7 @@ func (c *Config) validate() error {
 	if err := c.validateServer(); err != nil {
 		return err
 	}
+
 	if err := c.validateSandbox(); err != nil {
 		return err
 	}
@@ -75,6 +71,7 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -88,6 +85,7 @@ func (c *Config) validateServer() error {
 	default:
 		return fmt.Errorf("server.auth.mode must be one of none, bearer; got %q", c.Server.Auth.Mode)
 	}
+
 	if c.Server.Auth.Mode == AuthModeNone && !c.Server.AllowInsecure && !isLoopback(c.Server.Listen) {
 		return fmt.Errorf(
 			"refusing to bind %q with auth.mode=none; set server.auth.mode or server.allow_insecure",
@@ -100,9 +98,11 @@ func (c *Config) validateServer() error {
 	default:
 		return fmt.Errorf("server.store must be empty (in-memory) or sqlite; got %q", c.Server.Store)
 	}
+
 	if c.Server.Store == StoreSQLite && c.Server.StorePath == "" && c.Server.SessionStoreDir == "" {
 		return fmt.Errorf("server.store: sqlite requires store_path or session_store_dir")
 	}
+
 	return nil
 }
 
@@ -110,12 +110,15 @@ func (c *Config) validateSandbox() error {
 	if err := c.validateSandboxBasics(); err != nil {
 		return err
 	}
+
 	if err := c.validateIsolation(); err != nil {
 		return err
 	}
+
 	if err := c.validateContainer(); err != nil {
 		return err
 	}
+
 	return c.validateDangerousContainer()
 }
 
@@ -144,6 +147,7 @@ func (c *Config) validateIsolation() error {
 	if c.Sandbox.CopyStrategy != "" && c.Sandbox.Isolation != core.IsolationCopy {
 		return fmt.Errorf("sandbox.copy_strategy is only valid with isolation copy")
 	}
+
 	if c.Sandbox.Isolation == core.IsolationCopy && !c.Sandbox.CopyStrategy.Known() {
 		return fmt.Errorf(
 			"sandbox.copy_strategy must be one of full, cow; got %q",
@@ -161,6 +165,7 @@ func (c *Config) validateIsolation() error {
 	if c.Sandbox.Isolation == core.IsolationOverlayFS && c.Sandbox.Container != nil {
 		return fmt.Errorf("sandbox.container cannot be combined with isolation overlayfs")
 	}
+
 	return nil
 }
 
@@ -175,6 +180,7 @@ func (c *Config) validateIsolationRoots() error {
 		if err != nil {
 			return fmt.Errorf("sandbox.isolation_root: %w", err)
 		}
+
 		if contained {
 			return fmt.Errorf(
 				"sandbox.isolation_root must not contain agents[%d].workdir for %q: %q",
@@ -186,6 +192,7 @@ func (c *Config) validateIsolationRoots() error {
 		if err != nil {
 			return fmt.Errorf("agents[%d].workdir: %w", i, err)
 		}
+
 		if contained {
 			return fmt.Errorf(
 				"agents[%d].workdir must not contain sandbox.isolation_root for %q: %q",
@@ -193,6 +200,7 @@ func (c *Config) validateIsolationRoots() error {
 			)
 		}
 	}
+
 	return nil
 }
 
@@ -201,9 +209,11 @@ func (c *Config) validateContainer() error {
 	if ct == nil {
 		return nil
 	}
+
 	if ct.Image == "" {
 		return fmt.Errorf("sandbox.container.image is required")
 	}
+
 	if ct.Runtime == "" {
 		return fmt.Errorf("sandbox.container.runtime is required")
 	}
@@ -218,6 +228,7 @@ func (c *Config) validateContainer() error {
 			ct.Runtime,
 		)
 	}
+
 	return nil
 }
 
@@ -234,6 +245,7 @@ func (c *Config) validateDangerousContainer() error {
 			)
 		}
 	}
+
 	return nil
 }
 
@@ -241,19 +253,23 @@ func validateAgent(i int, a *AgentConfig) error {
 	if a.ID == "" {
 		return fmt.Errorf("agents[%d]: id is required", i)
 	}
+
 	if a.Binary == "" {
 		return fmt.Errorf("agent %q: binary is required", a.ID)
 	}
-	if a.DisplayName == "" {
-		return fmt.Errorf("agent %q: display_name is required", a.ID)
+
+	if a.Card.Name == "" {
+		return fmt.Errorf("agent %q: card.name is required", a.ID)
 	}
-	if a.Description == "" {
-		return fmt.Errorf("agent %q: description is required", a.ID)
+
+	if a.Card.Description == "" {
+		return fmt.Errorf("agent %q: card.description is required", a.ID)
 	}
 
 	if a.Workdir == "" {
 		return fmt.Errorf("agents[%d]: workdir is required", i)
 	}
+
 	info, err := os.Stat(a.Workdir)
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("agent %q: workdir %q is not a directory", a.ID, a.Workdir)
@@ -268,11 +284,43 @@ func validateAgent(i int, a *AgentConfig) error {
 		)
 	}
 
-	for j, s := range a.Skills {
-		if s.ID == "" || s.Name == "" || s.Description == "" {
-			return fmt.Errorf("agent %q: skills[%d] requires id, name, and description", a.ID, j)
+	if a.Card.Provider != nil {
+		if a.Card.Provider.Organization == "" {
+			return fmt.Errorf("agent %q: card.provider.organization is required", a.ID)
+		}
+		if a.Card.Provider.URL == "" {
+			return fmt.Errorf("agent %q: card.provider.url is required", a.ID)
 		}
 	}
+
+	if a.Card.Signing != nil {
+		if a.Card.Signing.KeyFile == "" {
+			return fmt.Errorf("agent %q: card.signing.key_file is required", a.ID)
+		}
+		if a.Card.Signing.KeyID == "" {
+			return fmt.Errorf("agent %q: card.signing.key_id is required", a.ID)
+		}
+	}
+
+	seenExtensions := make(map[string]bool, len(a.Card.Extensions))
+	for j, e := range a.Card.Extensions {
+		if e.URI == "" {
+			return fmt.Errorf("agent %q: card.extensions[%d].uri is required", a.ID, j)
+		}
+
+		if seenExtensions[e.URI] {
+			return fmt.Errorf("agent %q: duplicate card extension uri %q", a.ID, e.URI)
+		}
+
+		seenExtensions[e.URI] = true
+	}
+
+	for j, s := range a.Card.Skills {
+		if s.ID == "" || s.Name == "" || s.Description == "" {
+			return fmt.Errorf("agent %q: card.skills[%d] requires id, name, and description", a.ID, j)
+		}
+	}
+
 	return nil
 }
 
@@ -282,10 +330,13 @@ func isLoopback(listen string) bool {
 	if err != nil {
 		host = listen
 	}
+
 	if host == "localhost" {
 		return true
 	}
+
 	// An empty host (":8080") binds all interfaces; ParseIP returns nil for it.
 	ip := net.ParseIP(host)
+
 	return ip != nil && ip.IsLoopback()
 }

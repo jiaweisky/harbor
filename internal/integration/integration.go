@@ -35,17 +35,18 @@ func Build(ctx context.Context, src AgentSpecSource, opts Options) (agent.Launch
 
 	path, err := exec.LookPath(ac.Binary)
 	if err != nil {
-		return nil, agent.Info{Name: ac.ID, DisplayName: ac.DisplayName, Enabled: false, Err: err}, nil
+		return nil, agent.Info{AgentID: ac.ID, Available: false, ProbeErr: err}, nil
 	}
 
 	profile, known := cli.LookupProfile(ac.Binary)
-	ver := ac.Version // an explicit override is kept verbatim
+	ver := ac.CLIVersion // an explicit override is kept verbatim
 	if ver == "" && known {
 		ver = agent.DetectVersion(ctx, path, profile.VersionArgs)
 		if canonical, ok := versionutil.Parse(ver); ok {
 			ver = strings.TrimPrefix(canonical, "v") // "2.1.292 (Claude Code)" -> "2.1.292"
 		}
 	}
+
 	if known && profile.MinVersion != "" && ver != "" {
 		if older, ok := versionutil.Less(ver, profile.MinVersion); ok && older {
 			return nil, agent.Info{}, fmt.Errorf(
@@ -55,7 +56,7 @@ func Build(ctx context.Context, src AgentSpecSource, opts Options) (agent.Launch
 		}
 	}
 
-	ac.Version = ver // reuse the probed version; avoids re-probing in the launcher
+	ac.CLIVersion = ver // reuse the probed version; avoids re-probing in the launcher
 	opts.Ctx = ctx
 
 	ln, err := New(ac, opts)
@@ -65,10 +66,7 @@ func Build(ctx context.Context, src AgentSpecSource, opts Options) (agent.Launch
 
 	// Harbor does not gate on its own credential guess: the CLI decides whether
 	// it can run, so a CLI that starts standalone is served as-is.
-	return ln, agent.Info{
-		Name: ac.ID, DisplayName: ac.DisplayName, Description: ac.Description,
-		Skills: infoSkills(ac), Path: path, Enabled: true, Version: ver,
-	}, nil
+	return ln, agent.Info{AgentID: ac.ID, BinaryPath: path, Available: true, CLIVersion: ver}, nil
 }
 
 // interactionLauncher overrides an agent's advertised interaction capability
@@ -105,23 +103,6 @@ func applyInteractionMode(ln agent.Launcher, mode core.Interaction) (agent.Launc
 	}
 
 	return interactionLauncher{Launcher: ln, caps: caps}, nil
-}
-
-// infoSkills maps the configured card skills onto the agent package type.
-func infoSkills(ac core.AgentSpec) []agent.Skill {
-	if len(ac.Skills) == 0 {
-		return nil
-	}
-
-	out := make([]agent.Skill, 0, len(ac.Skills))
-	for _, s := range ac.Skills {
-		out = append(out, agent.Skill{
-			ID: s.ID, Name: s.Name, Description: s.Description,
-			Tags: s.Tags, Examples: s.Examples, InputModes: s.InputModes, OutputModes: s.OutputModes,
-		})
-	}
-
-	return out
 }
 
 // New constructs a Launcher for the given spec source and applies the
@@ -232,7 +213,7 @@ func headlessLauncher(
 		Parser: spec.parser, NewParser: spec.newParser, Invoke: spec.invoke,
 		Env: envSlice(ac.Env), Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
 		InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container, Runtime: opts.Runtime,
-		VersionArgs: versionArgs, VersionOverride: ac.Version,
+		VersionArgs: versionArgs, VersionOverride: ac.CLIVersion,
 	})
 }
 
@@ -245,6 +226,7 @@ func execCaps(ac core.AgentSpec, inputImage, outputImage []string) agent.Capabil
 	caps.InputImage = inputImage                   // images accepted (advertised)
 	caps.AttachImages = len(ac.ImageArgs) > 0      // images attached via CLI args
 	caps.SessionFork = ac.Session.ForkFlag != ""   // session fork flag configured
+
 	return caps
 }
 
@@ -256,7 +238,7 @@ func acpLauncher(
 		Name: ac.ID, Binary: ac.Binary, Args: ac.Args, Env: envSlice(ac.Env),
 		Auth: auth, MaxConcurrent: ac.Limits.MaxConcurrent,
 		InheritEnv: opts.InheritEnv, CLIHome: opts.CLIHome, Container: opts.Container, Runtime: opts.Runtime,
-		VersionArgs: versionArgs, VersionOverride: ac.Version,
+		VersionArgs: versionArgs, VersionOverride: ac.CLIVersion,
 	})
 }
 
@@ -264,7 +246,7 @@ func acpLauncher(
 // CLI, or an unverifiable one for a generic CLI. The probed version lets the
 // adapter branch on version-specific behavior.
 func authenticator(ac core.AgentSpec) agent.Authenticator {
-	return cli.AuthFor(ac.Binary, ac.Version)
+	return cli.AuthFor(ac.Binary, ac.CLIVersion)
 }
 
 // streamJSONCaps describes a CLI driven over its structured, duplex stream mode.

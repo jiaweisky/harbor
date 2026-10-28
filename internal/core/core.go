@@ -122,27 +122,49 @@ type Skill struct {
 	Tags, Examples, InputModes, OutputModes []string
 }
 
+// Provider identifies the agent's service provider on its card.
+type Provider struct {
+	Organization, URL string
+}
+
+// Extension is one protocol extension declared on the agent card.
+type Extension struct {
+	URI         string
+	Description string
+	Params      map[string]any
+	Required    bool
+}
+
+// CardSpec is the operator-controlled part of an agent's A2A card.
+type CardSpec struct {
+	Name, Description, Version string
+	IconURL, DocumentationURL  string
+	Provider                   *Provider
+	Extensions                 []Extension
+	Skills                     []Skill
+}
+
 // AgentSpec is an agent's runtime configuration, independent of the YAML schema.
 type AgentSpec struct {
-	ID, DisplayName, Description, Binary string
-	Integration                          Integration
-	Parser                               ParserKind
-	Regex                                *Regex
-	ServerURL                            string
-	ServerProtocol                       ServerProtocol
-	Args                                 []string
-	Env                                  map[string]string
-	AllowDangerous                       bool
-	SDKCaps                              bool
-	OutputSchemaArgs                     []string
-	FileArgs                             []string
-	ImageArgs                            []string
-	InputImage                           []string
-	Interaction                          Interaction
-	Session                              Session
-	Limits                               Limits
-	Skills                               []Skill
-	Version                              string
+	ID, Binary       string
+	Card             CardSpec
+	Integration      Integration
+	Parser           ParserKind
+	Regex            *Regex
+	ServerURL        string
+	ServerProtocol   ServerProtocol
+	Args             []string
+	Env              map[string]string
+	AllowDangerous   bool
+	SDKCaps          bool
+	OutputSchemaArgs []string
+	FileArgs         []string
+	ImageArgs        []string
+	InputImage       []string
+	Interaction      Interaction
+	Session          Session
+	Limits           Limits
+	CLIVersion       string
 }
 
 // Spec returns the receiver.

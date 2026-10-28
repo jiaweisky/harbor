@@ -14,7 +14,7 @@ type stub struct{}
 
 func (stub) Name() string                     { return "plugin-cli" }
 func (stub) Capabilities() agent.Capabilities { return agent.Capabilities{InputText: true} }
-func (stub) Probe(context.Context) agent.Info { return agent.Info{Name: "plugin-cli"} }
+func (stub) Probe(context.Context) agent.Info { return agent.Info{AgentID: "plugin-cli"} }
 func (stub) Auth() agent.Authenticator        { return nil }
 func (stub) AuthReady(context.Context) bool   { return true }
 func (stub) Start(context.Context, *agent.Request) (agent.Session, error) {

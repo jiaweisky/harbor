@@ -34,7 +34,7 @@ func TestBuildAcceptsSupportedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if ln == nil || !info.Enabled || info.Version != "9.9.9" {
+	if ln == nil || !info.Available || info.CLIVersion != "9.9.9" {
 		t.Fatalf("launcher=%v info=%+v", ln != nil, info)
 	}
 }

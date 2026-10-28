@@ -257,6 +257,7 @@ func handlerOptions(
 ) []a2asrv.RequestHandlerOption {
 	return []a2asrv.RequestHandlerOption{
 		a2asrv.WithLogger(slog.Default()),
+		a2asrv.WithCallInterceptors(versionInterceptor{}),
 		a2asrv.WithAgentInactivityTimeout(inactivity),
 		a2asrv.WithPushNotifications(pushStore, pushSender),
 		a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{Streaming: true, PushNotifications: true}),
@@ -312,8 +313,8 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 		return
 	}
 
-	if !info.Enabled {
-		slog.Warn("binary missing", "id", ac.ID, "err", info.Err)
+	if !info.Available {
+		slog.Warn("binary missing", "id", ac.ID, "err", info.ProbeErr)
 		return
 	}
 
@@ -328,7 +329,7 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	}
 
 	exec := bridge.NewCLIExecutor(ln, sessions, agent.NewLiveSessions(), resolver, ac.Limits.Core())
-					exec.SetTaskLookup(b.taskLookup)
+	exec.SetTaskLookup(b.taskLookup)
 
 	// Enable the keepalive only when the agent also has a Harbor-side bound, so
 	// that suppressing the server watchdog for a long silent step does not leave
@@ -340,12 +341,25 @@ func (b *agentBuilder) addAgent(ctx context.Context, ac config.AgentConfig) {
 	handler := a2asrv.NewHandler(exec, b.handlerOptions...)
 
 	path := AgentPath(ac.ID)
-	card := bridge.BuildCard(ln, info, EndpointURL(b.cfg.Server.BaseURL, ac.ID), b.bearer)
-	limit := b.cfg.Server.MaxRequestBytes
+	spec := ac.Spec()
+	if spec.Card.Version == "" {
+		spec.Card.Version = info.CLIVersion
+	}
 
-	b.mux.Handle(path, b.auth(b.rl.middleware(ac.ID, maxBytes(limit, a2asrv.NewJSONRPCHandler(handler)))))
+	card := bridge.BuildCard(ln, spec, EndpointURL(b.cfg.Server.BaseURL, ac.ID), b.bearer)
+	if ac.Card.Signing != nil {
+		if err := signCard(ctx, card, ac.Card.Signing); err != nil {
+			slog.Warn("agent disabled", "id", ac.ID, "err", err)
+			return
+		}
+	}
+
+	limit := b.cfg.Server.MaxRequestBytes
+	rpc := a2aVersionQuery(a2asrv.NewJSONRPCHandler(handler))
+	b.mux.Handle(path, b.auth(b.rl.middleware(ac.ID, maxBytes(limit, rpc))))
+
 	// The HTTP+JSON (A2A REST) binding, mounted under the agent's base path.
-	rest := http.StripPrefix(path+bridge.RESTMount, a2asrv.NewRESTHandler(handler))
+	rest := a2aVersionQuery(http.StripPrefix(path+bridge.RESTMount, a2asrv.NewRESTHandler(handler)))
 	b.mux.Handle(path+bridge.RESTPath, b.auth(b.rl.middleware(ac.ID, maxBytes(limit, rest))))
 	b.mux.Handle(path+".well-known/agent-card.json", a2asrv.NewStaticAgentCardHandler(card))
 

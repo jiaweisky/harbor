@@ -1,16 +1,26 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
+	"github.com/a2aproject/a2a-go/v2/a2acrypto"
 
 	"github.com/jiaweisky/harbor/internal/config"
 	"github.com/jiaweisky/harbor/internal/fakeclitest"
@@ -41,6 +51,186 @@ func TestRESTBinding(t *testing.T) {
 	if !ok || task.Status.State != a2a.TaskStateCompleted {
 		t.Fatalf("result = %+v, want a completed task", res)
 	}
+}
+
+// TestVersionMismatch verifies both bindings reject a request that does not
+// target A2A 1.0 before it reaches the executor.
+func TestVersionMismatch(t *testing.T) {
+	srv := newTestServer(t, testConfig(t))
+	defer srv.Close()
+
+	msg := &a2a.SendMessageRequest{
+		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi")),
+	}
+	restBody, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rpcBody, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "SendMessage",
+		"params":  msg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		path   string
+		body   []byte
+		verify func(*testing.T, *http.Response)
+	}{
+		{"jsonrpc", "/agents/cb/", rpcBody, verifyJSONRPCVersionError},
+		{"rest", "/agents/cb/rest/message:send", restBody, verifyRESTVersionError},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, srv.URL+tc.path, bytes.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(a2a.SvcParamVersion, "0.3")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			tc.verify(t, resp)
+		})
+	}
+}
+
+func verifyJSONRPCVersionError(t *testing.T, resp *http.Response) {
+	t.Helper()
+	var body struct {
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Error.Code != -32009 {
+		t.Fatalf("jsonrpc error code = %d, want -32009", body.Error.Code)
+	}
+}
+
+func verifyRESTVersionError(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "VERSION_NOT_SUPPORTED") {
+		t.Fatalf("body = %s, want VERSION_NOT_SUPPORTED", body)
+	}
+}
+
+// TestVersionQueryParameter verifies A2A-Version may be supplied as a query
+// parameter instead of a header.
+func TestVersionQueryParameter(t *testing.T) {
+	srv := newTestServer(t, testConfig(t))
+	defer srv.Close()
+
+	msg := &a2a.SendMessageRequest{
+		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi")),
+	}
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "SendMessage",
+		"params":  msg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(
+		srv.URL+"/agents/cb/?A2A-Version=1.0", "application/json", bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Error any `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Error != nil {
+		t.Fatalf("error = %v, want a successful response", out.Error)
+	}
+}
+
+// TestCardSigning verifies a configured signing key produces a verifiable JWS
+// signature on the served card.
+func TestCardSigning(t *testing.T) {
+	keyPath, pub := writeSigningKey(t)
+	cfg := testConfig(t)
+	cfg.Agents[0].Card.Signing = &config.CardSigningConfig{
+		KeyFile: keyPath, KeyID: "test-kid", Algorithm: "ES256",
+	}
+
+	srv := newTestServer(t, cfg)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/agents/cb/.well-known/agent-card.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var card a2a.AgentCard
+	if err := json.Unmarshal(raw, &card); err != nil {
+		t.Fatalf("decode card: %v", err)
+	}
+	if len(card.Signatures) != 1 {
+		t.Fatalf("signatures = %d, want 1", len(card.Signatures))
+	}
+
+	verifier := a2acrypto.NewVerifier(a2acrypto.VerifierConfig{
+		KeyResolver: a2acrypto.KeyResolverFunc(func(_ context.Context, kid string) (crypto.PublicKey, error) {
+			if kid != "test-kid" {
+				t.Fatalf("kid = %q, want test-kid", kid)
+			}
+			return pub, nil
+		}),
+	})
+	if err := verifier.Verify(context.Background(), raw, &card.Signatures[0]); err != nil {
+		t.Fatalf("verify signature: %v", err)
+	}
+}
+
+func writeSigningKey(t *testing.T) (string, *ecdsa.PublicKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "signing-key.pem")
+	raw := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path, &key.PublicKey
 }
 
 func testConfig(t *testing.T) *config.Config {
@@ -130,7 +320,7 @@ func TestReadyzReportsAgents(t *testing.T) {
 // starts and is served (the CLI decides if it can run). Authentication is
 // reported as information and does not affect readiness.
 func TestUnauthenticatedCLIStillServed(t *testing.T) {
-		bin := fakeclitest.Path(t, "codex")
+	bin := fakeclitest.Path(t, "codex")
 	cfg := &config.Config{
 		Version: 1,
 		Server:  config.ServerConfig{Listen: "127.0.0.1:0", BaseURL: "http://example.test"},

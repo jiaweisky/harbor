@@ -5,28 +5,14 @@ import (
 	"io"
 )
 
-// Info describes a probed CLI binary and the operator-supplied card overrides.
+// Info describes the result of probing a CLI binary. It carries no AgentCard
+// data.
 type Info struct {
-	Name        string
-	DisplayName string
-	Description string // card description text
-	Skills      []Skill
-	Version     string
-	Path        string
-	Enabled     bool
-	Err         error
-}
-
-// Skill is one capability advertised on the agent card. It is configured by the
-// operator; Harbor does not infer skills from the CLI.
-type Skill struct {
-	ID          string
-	Name        string
-	Description string
-	Tags        []string
-	Examples    []string
-	InputModes  []string
-	OutputModes []string
+	AgentID    string // configured agent ID
+	CLIVersion string // detected CLI version or configured override; empty when probing is skipped
+	BinaryPath string // resolved executable path; empty when the binary was not found
+	Available  bool   // whether the binary was found and the launcher can be served
+	ProbeErr   error  // why the probe failed; nil when Available is true
 }
 
 // Request is a normalized invocation request (A2A -> adapter).

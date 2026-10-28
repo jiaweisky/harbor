@@ -59,7 +59,6 @@ agents:
   # prompting, so it reads/searches but cannot edit files or run commands. Tool
   # names are the CLI's own (see `codebuddy -h`); the CLI enforces it.
   - id: codebuddy
-    display_name: "CodeBuddy"
     binary: codebuddy
     integration: stream-json
     # interaction: auto | interactive | non-interactive   # whether CLI permission/plan prompts
@@ -88,15 +87,72 @@ agents:
       - "ReadMcpResource"
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "-c" }
     limits: { max_concurrent: 3, timeout: 30m, breaker: { threshold: 3, cooldown: 30s, max_cooldown: 10m } }
-    description: "CodeBuddy (read-only) answers questions about the Harbor project without modifying it."
+    card:
+      name: "CodeBuddy"
+      description: "CodeBuddy (read-only) answers questions about the Harbor project without modifying it."
 
   # OpenCode with no tool restrictions: any tool its agent mode allows is usable.
   - id: opencode
-    display_name: "OpenCode"
     binary: opencode
     integration: exec
     workdir: "."
     args: ["run", "{{.Prompt}}", "-m", "{{.Model}}"]   # exec passes the prompt via {{.Prompt}}
     session: { id_flag: "--session", continue_flag: "--continue" }
     limits: { max_concurrent: 2 }
-    description: "OpenCode assists with the Harbor project: reading, searching, explaining, and editing its code."
+    card:
+      name: "OpenCode"
+      description: "OpenCode assists with the Harbor project: reading, searching, explaining, and editing its code."
+
+  # ---------------------------------------------------------------------------
+  # Complete AgentCard example (commented out).
+  #
+  # Card configuration lives under `card:` and is separate from how Harbor runs
+  # the CLI (binary/integration/args/workdir). The served card also contains
+  # fields Harbor computes: supportedInterfaces, capabilities, defaultInputModes,
+  # defaultOutputModes, and securitySchemes/securityRequirements (when
+  # server.auth.mode is bearer). A2A protocolVersion is always 1.0.
+  #
+  # - id: card-example
+  #   binary: codebuddy
+  #   integration: exec
+  #   args: ["-p", "{{.Prompt}}"]
+  #   workdir: "."
+  #   # cli_version: "2.1.292"   # optional CLI version override; skips probing
+  #
+  #   card:
+  #     name: "Example Agent"
+  #     description: "An example agent showing every configurable AgentCard field."
+  #     version: "1.0.0"             # card version, not the A2A protocol version
+  #     icon_url: "https://example.com/icon.png"
+  #     documentation_url: "https://example.com/docs"
+  #     provider:
+  #       organization: "Example Org"
+  #       url: "https://example.com"
+  #
+  #     # Skills are operator-authored; Harbor does not infer them from the CLI.
+  #     skills:
+  #       - id: code-review
+  #         name: "Code review"
+  #         description: "Review a code change for bugs, style, and quality issues."
+  #         tags: ["review", "quality"]
+  #         examples: ["Review the current diff."]
+  #         input_modes: ["text/plain"]
+  #         output_modes: ["text/plain", "application/json"]
+  #
+  #     # Additional protocol extensions declared on the card. A configured entry
+  #     # with Harbor's interaction extension URI replaces the built-in declaration.
+  #     extensions:
+  #       - uri: "https://example.com/extensions/audit/v1"
+  #         description: "Carries audit metadata on task messages."
+  #         required: false
+  #         params:
+  #           retention_days: 30
+  #
+  #     # Optional JWS signing of the final card. key_file must be a PEM private
+  #     # key (PKCS#8, EC, or PKCS#1); key_id is the JWS kid. algorithm is
+  #     # inferred from the key when omitted.
+  #     signing:
+  #       key_file: "/etc/harbor/card-signing.pem"
+  #       key_id: "harbor-2026-01"
+  #       algorithm: "ES256"
+  #       jwks_url: "https://example.com/.well-known/jwks.json"

@@ -94,10 +94,10 @@ func (l *HeadlessLauncher) AuthReady(ctx context.Context) bool {
 
 // ProbeBinary checks that a CLI binary is present/executable and best-effort
 // reads its version. Version probing is skipped when versionArgs is empty.
-func ProbeBinary(ctx context.Context, name, binary string, versionArgs []string, versionOverride string) Info {
+func ProbeBinary(ctx context.Context, agentID, binary string, versionArgs []string, versionOverride string) Info {
 	path, err := exec.LookPath(binary)
 	if err != nil {
-		return Info{Name: name, Enabled: false, Err: err}
+		return Info{AgentID: agentID, Available: false, ProbeErr: err}
 	}
 
 	version := versionOverride
@@ -105,7 +105,7 @@ func ProbeBinary(ctx context.Context, name, binary string, versionArgs []string,
 		version = DetectVersion(ctx, path, versionArgs)
 	}
 
-	return Info{Name: name, Path: path, Enabled: true, Version: version}
+	return Info{AgentID: agentID, BinaryPath: path, Available: true, CLIVersion: version}
 }
 
 func (l *HeadlessLauncher) Probe(ctx context.Context) Info {
