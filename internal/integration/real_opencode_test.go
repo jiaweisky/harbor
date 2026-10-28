@@ -18,7 +18,7 @@ import (
 // launch the interactive `opencode auth login`.
 func TestBuildOpencodeDoesNotLogin(t *testing.T) {
 	if _, err := exec.LookPath("opencode"); err != nil {
-		t.Skip("opencode not installed")
+		t.Fatalf("opencode not installed: %v", err)
 	}
 	ac := config.AgentConfig{
 		ID: "oc", Binary: "opencode", Integration: core.IntegrationExec,
@@ -32,7 +32,7 @@ func TestBuildOpencodeDoesNotLogin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if ln == nil || !info.Enabled {
+	if ln == nil || !info.Available {
 		t.Fatalf("info = %+v", info)
 	}
 	if el := time.Since(start); el > 15*time.Second {

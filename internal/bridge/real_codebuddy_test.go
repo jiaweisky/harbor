@@ -44,7 +44,7 @@ func codebuddyHandler(t *testing.T, ac config.AgentConfig) a2asrv.RequestHandler
 func requireCodebuddy(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("codebuddy"); err != nil {
-		t.Skip("codebuddy not installed")
+		t.Fatalf("codebuddy not installed: %v", err)
 	}
 }
 

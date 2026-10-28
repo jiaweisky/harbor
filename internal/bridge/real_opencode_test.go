@@ -45,7 +45,7 @@ func opencodeHandlerWith(
 func requireOpencode(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("opencode"); err != nil {
-		t.Skip("opencode not installed")
+		t.Fatalf("opencode not installed: %v", err)
 	}
 }
 

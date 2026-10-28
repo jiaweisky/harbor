@@ -15,7 +15,12 @@ import (
 // registers the adapter it exports.
 func TestLoadRegistersAdapter(t *testing.T) {
 	so := filepath.Join(t.TempDir(), "register.so")
-	cmd := exec.Command("go", "build", "-buildmode=plugin", "-o", so, "./testdata/register")
+	args := []string{"build", "-buildmode=plugin", "-o", so}
+	if raceEnabled {
+		args = append(args, "-race")
+	}
+	args = append(args, "./testdata/register")
+	cmd := exec.Command("go", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build plugin: %v\n%s", err, out)
 	}
