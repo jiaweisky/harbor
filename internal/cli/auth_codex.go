@@ -14,7 +14,9 @@ func (codex) LoggedIn(home string, env map[string]string) bool {
 	if anySet(env, "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN") {
 		return true
 	}
+
 	dir := configDir(home, env["CODEX_HOME"], ".codex")
+
 	return fileExists(filepath.Join(dir, "auth.json"))
 }
 

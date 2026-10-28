@@ -33,11 +33,14 @@ type codexItem struct {
 func (i *codexItem) UnmarshalJSON(data []byte) error {
 	type alias codexItem
 	var a alias
+
 	if err := json.Unmarshal(data, &a); err != nil {
 		return err
 	}
+
 	*i = codexItem(a)
 	i.Raw = append(i.Raw, data...)
+
 	return nil
 }
 
@@ -48,9 +51,9 @@ type codexUsage struct {
 }
 
 type codexEvent struct {
-	Type     string     `json:"type"`
-	ThreadID string     `json:"thread_id"`
-	Item     *codexItem `json:"item"`
+	Type     string      `json:"type"`
+	ThreadID string      `json:"thread_id"`
+	Item     *codexItem  `json:"item"`
 	Usage    *codexUsage `json:"usage"`
 	Error    *struct {
 		Message string `json:"message"`
@@ -81,6 +84,7 @@ func (p *Codex) Parse(rec []byte, out func(agent.Event)) error {
 	case "item.completed":
 		emitCodexItem(env.Item, rec, out)
 	}
+
 	return nil
 }
 
@@ -91,6 +95,7 @@ func emitCodexItem(item *codexItem, rec []byte, out func(agent.Event)) {
 	if item == nil {
 		return
 	}
+
 	switch item.Type {
 	case "agent_message":
 		if text := firstNonEmpty(item.Text, item.Content); text != "" {
@@ -128,5 +133,6 @@ func firstNonEmpty(values ...string) string {
 			return v
 		}
 	}
+
 	return ""
 }

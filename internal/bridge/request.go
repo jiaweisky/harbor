@@ -16,20 +16,25 @@ import (
 // and request-level metadata (request-level wins).
 func (e *CLIExecutor) toRequest(ctx context.Context, ec *a2asrv.ExecutorContext) (*agent.Request, error) {
 	meta := mergeMetadata(ec)
+
 	dir, err := e.workspace.Resolve(contextKey(ec))
 	if err != nil {
 		return nil, err
 	}
+
 	attach := filepath.Join(dir, ".a2a", "attachments", turnDir(ec))
 	in, err := e.promptFromParts(ec.Message, attach)
 	if err != nil {
 		return nil, err
 	}
+
 	blocks, images, files := in.Blocks, in.Images, in.Files
 	if len(blocks) == 0 && len(images) == 0 && len(files) == 0 && len(in.ImageFiles) == 0 {
 		return nil, errNoText
 	}
+
 	sid, _ := e.sessions.Get(contextKey(ec))
+
 	return &agent.Request{
 		Prompt:       strings.Join(blocks, "\n"),
 		Blocks:       blocks,
@@ -67,6 +72,7 @@ func turnDir(ec *a2asrv.ExecutorContext) string {
 	if id == "" || id == "." || id == ".." || id == string(filepath.Separator) {
 		return "turn"
 	}
+
 	return id
 }
 
@@ -84,10 +90,12 @@ func (e *CLIExecutor) answerWithoutRunning(
 		e.replayDuplicate(ec, orig, yield)
 		return true
 	}
+
 	if ec.StoredTask != nil && isTerminalState(ec.StoredTask.Status.State) {
 		yield(ec.StoredTask, nil)
 		return true
 	}
+
 	return false
 }
 
@@ -97,6 +105,7 @@ func isTerminalState(s a2a.TaskState) bool {
 	case a2a.TaskStateCompleted, a2a.TaskStateFailed, a2a.TaskStateCanceled, a2a.TaskStateRejected:
 		return true
 	}
+
 	return false
 }
 
@@ -125,8 +134,10 @@ func mergeMetadata(ec *a2asrv.ExecutorContext) map[string]any {
 			meta[k] = v
 		}
 	}
+
 	for k, v := range ec.Metadata {
 		meta[k] = v
 	}
+
 	return meta
 }

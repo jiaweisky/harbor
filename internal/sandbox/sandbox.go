@@ -84,6 +84,7 @@ func CheckRuntime(ctx context.Context, rt core.ContainerRuntime) error {
 	if err := checkPlatform(runtime.GOOS, rt); err != nil {
 		return err
 	}
+
 	path, err := exec.LookPath(string(rt))
 	if err != nil {
 		return fmt.Errorf("runtime %q not found: %w", rt, err)
@@ -96,15 +97,19 @@ func CheckRuntime(ctx context.Context, rt core.ContainerRuntime) error {
 	if err == nil {
 		return nil
 	}
+
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("runtime %q info probe: %w", rt, ctxErr)
 	}
+
 	if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("runtime %q did not answer info within %s", rt, infoTimeout)
 	}
+
 	if msg := lastOutputLine(out); msg != "" {
 		return fmt.Errorf("runtime %q is not reachable: %w: %s", rt, err, msg)
 	}
+
 	return fmt.Errorf("runtime %q is not reachable: %w", rt, err)
 }
 
@@ -141,5 +146,6 @@ func lastOutputLine(out []byte) string {
 			return line
 		}
 	}
+
 	return ""
 }

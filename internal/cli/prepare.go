@@ -17,12 +17,15 @@ func Load(path string) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if err := plugins.Load(cfg.Plugins); err != nil {
 		return nil, fmt.Errorf("plugins: %w", err)
 	}
+
 	if err := Prepare(cfg); err != nil {
 		return nil, err
 	}
+
 	return cfg, nil
 }
 
@@ -36,6 +39,7 @@ func Prepare(cfg *config.Config) error {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -44,18 +48,23 @@ func applyDefaults(a *config.AgentConfig) {
 	if !ok {
 		return
 	}
+
 	if a.Integration == "" {
 		a.Integration = p.Integration
 	}
+
 	if a.Parser == "" {
 		a.Parser = p.Parser
 	}
+
 	if a.Integration == core.IntegrationACP && len(a.Args) == 0 {
 		a.Args = append([]string(nil), p.ACPArgs...)
 	}
+
 	if a.Session.ForkFlag == "" {
 		a.Session.ForkFlag = p.ForkFlag
 	}
+
 	defaultStrings(&a.OutputSchemaArgs, p.OutputSchemaArgs)
 	defaultStrings(&a.FileArgs, p.FileArgs)
 	defaultStrings(&a.ImageArgs, p.ImageArgs)
@@ -77,12 +86,14 @@ func validateAgent(a *config.AgentConfig) error {
 			a.ID, a.Binary, core.IntegrationList(),
 		)
 	}
+
 	if !a.Integration.Known() {
 		return fmt.Errorf(
 			"agent %q: unknown integration %q (known values: %s)",
 			a.ID, a.Integration, core.IntegrationList(),
 		)
 	}
+
 	if a.Integration == core.IntegrationExec && !hasPromptTemplate(a.Args) {
 		return fmt.Errorf(
 			"agent %q: integration %q passes the prompt through args but none contains {{.Prompt}}; "+
@@ -90,6 +101,7 @@ func validateAgent(a *config.AgentConfig) error {
 			a.ID, core.IntegrationExec, core.IntegrationStreamJSON,
 		)
 	}
+
 	if a.Integration == core.IntegrationACP && len(a.Args) == 0 {
 		return fmt.Errorf(
 			"agent %q: integration %q requires args selecting the CLI's ACP mode "+
@@ -97,6 +109,7 @@ func validateAgent(a *config.AgentConfig) error {
 			a.ID, core.IntegrationACP,
 		)
 	}
+
 	switch a.Interaction {
 	case core.InteractionAuto, core.InteractionInteractive, core.InteractionNonInteractive:
 	default:
@@ -105,6 +118,7 @@ func validateAgent(a *config.AgentConfig) error {
 			a.ID, a.Interaction,
 		)
 	}
+
 	if a.Interaction == core.InteractionInteractive &&
 		a.Integration != core.IntegrationStreamJSON && a.Integration != core.IntegrationACP {
 		return fmt.Errorf(
@@ -112,6 +126,7 @@ func validateAgent(a *config.AgentConfig) error {
 			a.ID, core.IntegrationStreamJSON, core.IntegrationACP, a.Integration,
 		)
 	}
+
 	return nil
 }
 
@@ -127,5 +142,6 @@ func hasPromptTemplate(args []string) bool {
 			return true
 		}
 	}
+
 	return false
 }

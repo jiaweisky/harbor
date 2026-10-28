@@ -90,6 +90,7 @@ func (c *Conn) Request(ctx context.Context, method string, params any) (json.Raw
 		c.forget(id)
 		return nil, err
 	}
+
 	select {
 	case m := <-ch:
 		if m.Error != nil {
@@ -128,13 +129,18 @@ func (c *Conn) write(v any) error {
 	if err != nil {
 		return err
 	}
+
 	b = append(b, '\n')
+
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+
 	if c.stdin == nil {
 		return errors.New("jsonrpc: connection closed")
 	}
+
 	_, err = c.stdin.Write(b)
+
 	return err
 }
 
@@ -144,9 +150,11 @@ func (c *Conn) Handle(line []byte) {
 	if json.Unmarshal(line, &m) != nil {
 		return
 	}
+
 	c.mu.Lock()
 	h := c.h
 	c.mu.Unlock()
+
 	switch {
 	case m.Method != "" && len(m.ID) == 0:
 		if h != nil {
@@ -167,10 +175,12 @@ func (c *Conn) resolve(m message) {
 	if err != nil {
 		return
 	}
+
 	c.mu.Lock()
 	ch := c.pending[id]
 	delete(c.pending, id)
 	c.mu.Unlock()
+
 	if ch != nil {
 		ch <- m
 	}

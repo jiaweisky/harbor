@@ -35,9 +35,11 @@ func newTextSink(ec *a2asrv.ExecutorContext, emit func(a2a.Event) bool) *textSin
 func (s *textSink) Write(text string) bool {
 	s.buf.WriteString(text)
 	s.all.WriteString(text)
+
 	if s.buf.Len() < flushBytes {
 		return true
 	}
+
 	return s.Flush()
 }
 
@@ -49,8 +51,10 @@ func (s *textSink) Flush() bool {
 	if s.buf.Len() == 0 {
 		return true
 	}
+
 	text := s.buf.String()
 	s.buf.Reset()
+
 	return s.emit(s.event(text))
 }
 
@@ -62,7 +66,9 @@ func (s *textSink) event(text string) a2a.Event {
 		if evt.Artifact != nil {
 			s.artifactID = evt.Artifact.ID
 		}
+
 		return evt
 	}
+
 	return a2a.NewArtifactUpdateEvent(s.ec, s.artifactID, a2a.NewTextPart(text))
 }

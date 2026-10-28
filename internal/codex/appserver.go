@@ -47,6 +47,7 @@ func NewServerLauncher(lifecycle context.Context, cfg Config) *Launcher {
 	if lifecycle == nil {
 		lifecycle = context.Background()
 	}
+
 	return &Launcher{
 		cfg:       cfg,
 		runner:    agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container, cfg.Runtime),
@@ -88,10 +89,12 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	if err != nil {
 		return nil, err
 	}
+
 	threadID, err := c.thread(ctx, req.SessionID, req.WorkDir)
 	if err != nil {
 		return nil, err
 	}
+
 	s := &appSession{
 		threadID: threadID,
 		conn:     c,
@@ -101,8 +104,10 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 		done:     make(chan turnResult, 1),
 		stopped:  make(chan struct{}),
 	}
+
 	c.add(threadID, s)
 	go s.run(ctx, c, req.Prompt)
+
 	return s, nil
 }
 
@@ -110,28 +115,34 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 func (l *Launcher) ensureServer(ctx context.Context) (*conn, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	if l.conn != nil {
 		return l.conn, nil
 	}
+
 	taskID := l.cfg.Name + ":app-server"
 	d := &dispatcher{}
 	inv := &agent.Invocation{
 		Bin: l.cfg.Binary, Args: []string{"app-server"}, Env: l.cfg.Env,
 		KeepStdinOpen: true, // JSON-RPC requests are written to the server's stdin
 	}
+
 	// The dispatcher routes each stdout record to the connection, so the
 	// runner's event channel is unused.
 	if _, err := l.runner.Start(l.lifecycle, taskID, inv, d); err != nil {
 		return nil, err
 	}
+
 	c := &conn{Conn: jsonrpc.New(l.runner.Stdin(taskID)), sessions: map[string]*appSession{}}
 	c.SetHandler(c)
 	d.setConn(c)
+
 	if err := c.initialize(ctx); err != nil {
 		l.runner.Kill(taskID)
 		return nil, err
 	}
 	l.conn = c
+
 	return c, nil
 }
 
@@ -169,6 +180,7 @@ func (c *conn) initialize(ctx context.Context) error {
 	if _, err := c.Conn.Request(ctx, "initialize", params); err != nil {
 		return fmt.Errorf("codex initialize: %w", err)
 	}
+
 	return nil
 }
 
@@ -183,19 +195,24 @@ func (c *conn) thread(ctx context.Context, resumeID, cwd string) (string, error)
 		if cwd != "" {
 			params["cwd"] = cwd
 		}
+
 		res, err = c.Conn.Request(ctx, "thread/start", params)
 	}
+
 	if err != nil {
 		return "", fmt.Errorf("codex thread: %w", err)
 	}
+
 	var r struct {
 		Thread struct {
 			ID string `json:"id"`
 		} `json:"thread"`
 	}
+
 	if err := json.Unmarshal(res, &r); err != nil || r.Thread.ID == "" {
 		return "", errors.New("codex thread: missing thread id")
 	}
+
 	return r.Thread.ID, nil
 }
 
@@ -207,6 +224,7 @@ func (c *conn) Notification(method string, params json.RawMessage) {
 			ThreadID string `json:"threadId"`
 			Delta    string `json:"delta"`
 		}
+
 		if json.Unmarshal(params, &p) == nil && p.Delta != "" {
 			if s := c.session(p.ThreadID); s != nil {
 				s.deliverDelta(p.Delta)
@@ -220,6 +238,7 @@ func (c *conn) Notification(method string, params json.RawMessage) {
 				Error  *turnError `json:"error"`
 			} `json:"turn"`
 		}
+
 		if json.Unmarshal(params, &p) == nil {
 			if s := c.session(p.ThreadID); s != nil {
 				s.deliverDone(p.Turn.Status, p.Turn.Error)
@@ -233,6 +252,7 @@ func (c *conn) Notification(method string, params json.RawMessage) {
 				Message string `json:"message"`
 			} `json:"error"`
 		}
+
 		if json.Unmarshal(params, &p) == nil && !p.WillRetry {
 			if s := c.session(p.ThreadID); s != nil {
 				s.deliverDone("failed", &turnError{Message: p.Error.Message})
@@ -245,28 +265,34 @@ func (c *conn) Notification(method string, params json.RawMessage) {
 			ThreadID string          `json:"threadId"`
 			Item     json.RawMessage `json:"item"`
 		}
+
 		if json.Unmarshal(params, &p) != nil || len(p.Item) == 0 {
 			return
 		}
+
 		s := c.session(p.ThreadID)
 		if s == nil {
 			return
 		}
+
 		var item struct {
 			Type    string `json:"type"`
 			Text    string `json:"text"`
 			Content string `json:"content"`
 			Command string `json:"command"`
 		}
+
 		if json.Unmarshal(p.Item, &item) != nil {
 			return
 		}
+
 		switch item.Type {
 		case "reasoning":
 			text := item.Text
 			if text == "" {
 				text = item.Content
 			}
+
 			if text != "" {
 				s.deliverItem(agent.Event{Kind: agent.EventThinking, Text: text})
 			}
@@ -306,9 +332,11 @@ func (d *dispatcher) Parse(rec []byte, _ func(agent.Event)) error {
 	d.mu.Lock()
 	c := d.c
 	d.mu.Unlock()
+
 	if c != nil {
 		c.Handle(rec)
 	}
+
 	return nil
 }
 
@@ -354,18 +382,22 @@ func (s *appSession) Canceled() bool { return s.closed.Load() }
 // Cancel interrupts the running turn and stops streaming.
 func (s *appSession) Cancel() error {
 	s.closed.Store(true)
+
 	s.turnMu.Lock()
 	turnID := s.turnID
 	cancel := s.cancel
 	s.turnMu.Unlock()
+
 	if turnID != "" {
 		ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
 		defer done()
 		_, _ = s.conn.Conn.Request(ctx, "turn/interrupt", map[string]any{"threadId": s.threadID, "turnId": turnID})
 	}
+
 	if cancel != nil {
 		cancel()
 	}
+
 	return nil
 }
 
@@ -404,6 +436,7 @@ func (s *appSession) deliverDone(status string, turnErr *turnError) {
 	if turnErr != nil {
 		res.err = turnErr.Message
 	}
+
 	select {
 	case s.done <- res:
 	case <-s.stopped:
@@ -414,9 +447,11 @@ func (s *appSession) deliverDone(status string, turnErr *turnError) {
 // channel's lifetime.
 func (s *appSession) run(ctx context.Context, c *conn, prompt string) {
 	ctx, cancel := context.WithCancel(ctx)
+
 	s.turnMu.Lock()
 	s.cancel = cancel
 	s.turnMu.Unlock()
+
 	defer cancel()
 	defer close(s.events)
 	defer close(s.stopped)
@@ -431,6 +466,7 @@ func (s *appSession) run(ctx context.Context, c *conn, prompt string) {
 		}
 		return
 	}
+
 	s.turnMu.Lock()
 	s.turnID = turnID
 	s.turnMu.Unlock()
@@ -446,11 +482,13 @@ func (s *appSession) run(ctx context.Context, c *conn, prompt string) {
 			// the buffer first: a random select could otherwise drop text.
 			s.flushDeltas()
 			s.flushItems()
+
 			if res.status == "failed" || res.err != "" {
 				msg := agent.FirstNonEmpty(res.err, "codex turn failed")
 				s.events <- agent.Event{Kind: agent.EventError, Err: errors.New(msg)}
 				return
 			}
+
 			s.events <- agent.Event{Kind: agent.EventDone}
 			return
 		case <-ctx.Done():
@@ -477,17 +515,21 @@ func (c *conn) startTurn(ctx context.Context, threadID, prompt string) (string, 
 		"threadId": threadID,
 		"input":    []map[string]any{{"type": "text", "text": prompt}},
 	}
+
 	res, err := c.Conn.Request(ctx, "turn/start", params)
 	if err != nil {
 		return "", err
 	}
+
 	var r struct {
 		Turn struct {
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
+
 	if err := json.Unmarshal(res, &r); err != nil || r.Turn.ID == "" {
 		return "", errors.New("codex turn/start: missing turn id")
 	}
+
 	return r.Turn.ID, nil
 }

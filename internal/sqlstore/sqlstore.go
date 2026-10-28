@@ -20,6 +20,7 @@ func Open(path string) (*sql.DB, error) {
 			return nil, err
 		}
 	}
+
 	// Pre-create the database owner-only; SQLite creates the -wal/-shm side
 	// files with the database file's mode, and task rows/session ids may be
 	// sensitive.
@@ -27,17 +28,21 @@ func Open(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
+
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
+
 	// Cap the pool at one connection: SQLite has a single writer, and the
 	// PRAGMAs below bind to that connection (a larger pool could leave other
 	// connections without them).
 	db.SetMaxOpenConns(1)
+
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA busy_timeout=5000",
@@ -48,5 +53,6 @@ func Open(path string) (*sql.DB, error) {
 			return nil, err
 		}
 	}
+
 	return db, nil
 }

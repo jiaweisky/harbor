@@ -120,11 +120,13 @@ func appendLog(env, line string) {
 	if path == "" {
 		return
 	}
+
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
+
 	fmt.Fprintln(f, line)
 }
 
@@ -136,9 +138,11 @@ func acpMain() {
 		var f struct {
 			ID json.RawMessage `json:"id"`
 		}
+
 		if json.Unmarshal([]byte(line), &f) != nil {
 			return "null"
 		}
+
 		return string(f.ID)
 	}
 
@@ -166,8 +170,10 @@ func acpMain() {
 func codebuddyMain() {
 	appendLog("HARBOR_ARG_LOG", strings.Join(os.Args[1:], " "))
 	emit(`{"type":"system","subtype":"init","session_id":"sess-123"}`)
+
 	time.Sleep(50 * time.Millisecond)
 	emit(`{"type":"assistant","message":{"content":[{"type":"text","text":"Hello "}]},"session_id":"sess-123"}`)
+
 	time.Sleep(50 * time.Millisecond)
 	emit(`{"type":"assistant","message":{"content":[{"type":"text","text":"world"}]},"session_id":"sess-123"}`)
 	emit(`{"type":"result","subtype":"success","result":"Hello world","session_id":"sess-123","is_error":false}`)
@@ -176,6 +182,7 @@ func codebuddyMain() {
 // fake-codex emits codex exec --json style JSONL events.
 func codexMain() {
 	appendLog("HARBOR_ARG_LOG", strings.Join(os.Args[1:], " "))
+
 	emit(`{"type":"thread.started","thread_id":"t-1"}`)
 	emit(`{"type":"turn.started"}`)
 	emit(`{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"Hello from codex"}}`)
@@ -189,6 +196,7 @@ func dockerMain() {
 	image := os.Getenv("FAKE_DOCKER_IMAGE")
 	rest := []string{}
 	found := false
+
 	for _, a := range os.Args[1:] {
 		if found {
 			rest = append(rest, a)
@@ -198,6 +206,7 @@ func dockerMain() {
 			found = true
 		}
 	}
+
 	if !found {
 		fmt.Fprintf(os.Stderr, "fake-docker: image %s not found\n", image)
 		os.Exit(1)
@@ -209,6 +218,7 @@ func dockerMain() {
 	if ee, ok := err.(*exec.ExitError); ok {
 		os.Exit(ee.ExitCode())
 	}
+
 	if err != nil {
 		os.Exit(1)
 	}
@@ -220,6 +230,7 @@ func formMain() {
 	readLine()
 	emit(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserForStructuredInput","input":{"message":"Pick a color"}}]}}`)
 	emit(`{"type":"control_request","request_id":"el_1","request":{"subtype":"elicitation_create","mode":"form","message":"Pick a color","requestedSchema":{"type":"object","properties":{"color":{"type":"string","enum":["red","blue"]}},"required":["color"]}}}`)
+
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
 		line := sc.Text()
@@ -228,6 +239,7 @@ func formMain() {
 			break
 		}
 	}
+
 	emit(`{"type":"assistant","message":{"content":[{"type":"text","text":"chose blue"}]}}`)
 	emit(`{"type":"result","result":"chose blue","is_error":false}`)
 }
@@ -239,6 +251,7 @@ func mutateMain() {
 		fmt.Fprintf(os.Stderr, "append: %v\n", err)
 		os.Exit(1)
 	}
+
 	fmt.Fprintln(f, "appended line")
 	f.Close()
 	out("done")
@@ -250,12 +263,14 @@ func permissionMain() {
 	readLine()
 	emit(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo hi"}}]}}`)
 	emit(`{"type":"control_request","request_id":"perm_test_1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo hi"},"tool_use_id":"toolu_1"}}`)
+
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
 		if strings.Contains(sc.Text(), "control_response") {
 			break
 		}
 	}
+
 	emit(`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"hi","is_error":false}]}}`)
 	emit(`{"type":"assistant","message":{"content":[{"type":"text","text":"allowed"}]}}`)
 	emit(`{"type":"result","result":"allowed","is_error":false}`)
@@ -265,6 +280,7 @@ func permissionMain() {
 // control_response, then emits the terminal result.
 func planMain() {
 	emit(`{"type":"control_request","request_id":"plan_1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"Create README.md"}}}`)
+
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
 		line := sc.Text()
@@ -273,6 +289,7 @@ func planMain() {
 			break
 		}
 	}
+
 	emit(`{"type":"assistant","message":{"content":[{"type":"text","text":"approved"}]}}`)
 	emit(`{"type":"result","result":"approved","is_error":false}`)
 }
@@ -283,12 +300,14 @@ func questionMain() {
 	readLine()
 	emit(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Favorite color?","header":"Color","multiSelect":false,"options":[{"label":"Red","description":""},{"label":"Blue","description":""}]}]}}]}}`)
 	emit(`{"type":"control_request","request_id":"perm_q1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Favorite color?","header":"Color","multiSelect":false,"options":[{"label":"Red","description":""},{"label":"Blue","description":""}]}]},"tool_use_id":"t1"}}`)
+
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
 		if strings.Contains(sc.Text(), "control_response") {
 			break
 		}
 	}
+
 	emit(`{"type":"assistant","message":{"content":[{"type":"text","text":"chose Blue"}]}}`)
 	emit(`{"type":"result","result":"chose Blue","is_error":false}`)
 }
@@ -298,6 +317,7 @@ func questionMain() {
 func questionMultiMain() {
 	readLine()
 	emit(`{"type":"control_request","request_id":"perm_qm","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Favorite color?","header":"Color","options":[{"label":"Red"},{"label":"Blue"}]},{"question":"Favorite animal?","header":"Animal","options":[{"label":"Cat"},{"label":"Dog"}]}]},"tool_use_id":"t1"}}`)
+
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
 		line := sc.Text()
@@ -306,6 +326,7 @@ func questionMultiMain() {
 			break
 		}
 	}
+
 	emit(`{"type":"assistant","message":{"content":[{"type":"text","text":"answered"}]}}`)
 	emit(`{"type":"result","result":"answered","is_error":false}`)
 }
@@ -320,6 +341,7 @@ func resumeMain() {
 		emit(`{"type":"result","result":"resumed","is_error":false}`)
 		return
 	}
+
 	readLine()
 	emit(`{"type":"system","subtype":"init","session_id":"sess-xyz"}`)
 	emit(`{"type":"control_request","request_id":"perm_1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo hi"}}}`)
@@ -329,6 +351,7 @@ func resumeMain() {
 func slowMain() {
 	emit(`{"type":"system","subtype":"init","session_id":"slow-1"}`)
 	emit(`{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]},"session_id":"slow-1"}`)
+
 	time.Sleep(30 * time.Second)
 	emit(`{"type":"result","subtype":"success","result":"done","session_id":"slow-1","is_error":false}`)
 }
@@ -415,6 +438,7 @@ func stdinEchoMain() {
 // tests that assert on the command line the launcher built.
 func argLogMain() {
 	appendLog("HARBOR_ARG_LOG", strings.Join(os.Args[1:], " "))
+
 	if v := os.Getenv("FAKE_OUTPUT"); v != "" {
 		fmt.Print(v)
 	}

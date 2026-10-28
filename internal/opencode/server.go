@@ -50,6 +50,7 @@ func NewServerLauncher(lifecycle context.Context, cfg Config) *Launcher {
 	if lifecycle == nil {
 		lifecycle = context.Background()
 	}
+
 	return &Launcher{
 		cfg:       cfg,
 		runner:    agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container, cfg.Runtime),
@@ -92,9 +93,11 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	if err != nil {
 		return nil, err
 	}
+
 	runCtx, cancel := context.WithCancel(ctx)
 	s := &serverSession{ServerSession: agent.NewServerSession(8, cancel)}
 	go s.run(runCtx, l, base, req)
+
 	return s, nil
 }
 
@@ -105,6 +108,7 @@ func (l *Launcher) spawn(ctx context.Context) (string, error) {
 		Args: []string{"serve", "--hostname", "127.0.0.1", "--port", "0"},
 		Env:  l.cfg.Env,
 	}
+
 	return agent.SpawnServer(ctx, l.lifecycle, l.runner, l.cfg.Name+":server", inv, serverStartTimeout)
 }
 
@@ -130,25 +134,30 @@ func (l *Launcher) createSession(ctx context.Context, base string) (string, erro
 	if err := l.post(ctx, base+"/session", map[string]any{}, &s); err != nil {
 		return "", err
 	}
+
 	if s.ID == "" {
 		return "", errors.New("opencode server: session create returned no id")
 	}
+
 	return s.ID, nil
 }
 
 // sendPrompt sends a text prompt and returns the assistant's text parts.
 func (l *Launcher) sendPrompt(ctx context.Context, base, sid, prompt string) (string, error) {
 	body := map[string]any{"parts": []map[string]any{{"type": "text", "text": prompt}}}
+
 	var resp messageResponse
 	if err := l.post(ctx, base+"/session/"+sid+"/message", body, &resp); err != nil {
 		return "", err
 	}
+
 	var b strings.Builder
 	for _, p := range resp.Parts {
 		if p.Type == "text" {
 			b.WriteString(p.Text)
 		}
 	}
+
 	return b.String(), nil
 }
 
@@ -183,6 +192,7 @@ func (s *serverSession) run(ctx context.Context, l *Launcher, base string, req *
 			s.EmitError(ctx, err)
 			return
 		}
+
 		sid = id
 		s.Emit(agent.Event{Kind: agent.EventSession, SessionID: sid})
 	}
@@ -199,6 +209,7 @@ func (s *serverSession) run(ctx context.Context, l *Launcher, base string, req *
 		text string
 		err  error
 	}
+
 	reply := make(chan replyResult, 1)
 	go func() {
 		text, err := l.sendPrompt(ctx, base, sid, req.Prompt)
@@ -213,21 +224,25 @@ func (s *serverSession) run(ctx context.Context, l *Launcher, base string, req *
 				events = nil
 				continue
 			}
+
 			if ev.Kind == agent.EventTextDelta {
 				streamed = true
 			}
+
 			s.Emit(ev)
 		case r := <-reply:
 			if r.err != nil {
 				s.EmitError(ctx, r.err)
 				return
 			}
+
 			// The stream may have buffered events the select has not read yet;
 			// flush them before finishing so no event is dropped.
 			s.drainEvents(events)
 			if !streamed && r.text != "" {
 				s.Emit(agent.Event{Kind: agent.EventTextDelta, Text: r.text})
 			}
+
 			s.Emit(agent.Event{Kind: agent.EventDone})
 			return
 		case <-ctx.Done():
@@ -256,19 +271,23 @@ func (s *serverSession) drainEvents(events <-chan agent.Event) {
 // results. It closes out when the stream ends or the context is canceled.
 func (l *Launcher) streamEvents(ctx context.Context, base, sid string, s *serverSession, out chan<- agent.Event) {
 	defer close(out)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/event", nil)
 	if err != nil {
 		return
 	}
+
 	req.Header.Set("accept", "text/event-stream")
 	resp, err := l.client.Do(req)
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return
 	}
+
 	toolCalled := map[string]string{}
 	reasoningSeen := map[string]string{}
 	_ = agent.ReadSSE(resp.Body, func(_, data string) bool {
@@ -276,20 +295,25 @@ func (l *Launcher) streamEvents(ctx context.Context, base, sid string, s *server
 		if json.Unmarshal([]byte(data), &ev) != nil {
 			return true
 		}
+
 		if ev.Properties.SessionID != sid {
 			return true
 		}
+
 		if ev.Type == "message.part.delta" {
 			var kind agent.EventKind
+
 			switch ev.Properties.Field {
 			case "text":
 				kind = agent.EventTextDelta
 			case "reasoning":
 				kind = agent.EventThinking
 			}
+
 			if kind == 0 || ev.Properties.Delta == "" {
 				return true
 			}
+
 			select {
 			case out <- agent.Event{Kind: kind, Text: ev.Properties.Delta}:
 				return true
@@ -297,6 +321,7 @@ func (l *Launcher) streamEvents(ctx context.Context, base, sid string, s *server
 				return false
 			}
 		}
+
 		if ev.Type != "message.part.updated" {
 			return true
 		}
@@ -305,15 +330,18 @@ func (l *Launcher) streamEvents(ctx context.Context, base, sid string, s *server
 		if json.Unmarshal(ev.Properties.Part, &part) != nil {
 			return true
 		}
+
 		// Reasoning parts arrive as whole-part updates (no deltas), so forward
 		// each changed text as a thinking event.
 		if part.Type == "reasoning" && part.Text != "" && reasoningSeen[part.ID] != part.Text {
 			reasoningSeen[part.ID] = part.Text
 			return s.emitTo(ctx, out, agent.Event{Kind: agent.EventThinking, Text: part.Text})
 		}
+
 		if part.Type != "tool" {
 			return true
 		}
+
 		switch part.State.Status {
 		case "pending", "running":
 			// The server re-sends the part on every state tick. The pending
@@ -322,7 +350,9 @@ func (l *Launcher) streamEvents(ctx context.Context, base, sid string, s *server
 			if toolCalled[part.ID] != "" || len(part.State.Input) == 0 {
 				return true
 			}
+
 			toolCalled[part.ID] = "call"
+
 			return s.emitTo(ctx, out, agent.Event{
 				Kind: agent.EventToolCall, Tool: part.Tool, ToolInput: part.State.Input,
 			})
@@ -331,18 +361,23 @@ func (l *Launcher) streamEvents(ctx context.Context, base, sid string, s *server
 			// an input, then deliver the result once.
 			if toolCalled[part.ID] == "" {
 				toolCalled[part.ID] = "call"
+
 				return s.emitTo(ctx, out, agent.Event{
 					Kind: agent.EventToolCall, Tool: part.Tool, ToolInput: part.State.Input,
 				})
 			}
+
 			if toolCalled[part.ID] != "done" {
 				toolCalled[part.ID] = "done"
+
 				return s.emitTo(ctx, out, agent.Event{
 					Kind: agent.EventToolResult, Text: outputText(part.State.Output),
 				})
 			}
+
 			return true
 		}
+
 		return true
 	})
 }

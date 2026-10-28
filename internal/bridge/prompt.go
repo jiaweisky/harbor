@@ -30,12 +30,14 @@ func (e *CLIExecutor) promptFromParts(m *a2a.Message, dir string) (promptInput, 
 	if m == nil {
 		return in, errNoText
 	}
+
 	caps := e.launcher.Capabilities()
 	n := 0
 	for _, p := range m.Parts {
 		if p == nil {
 			continue
 		}
+
 		switch {
 		case p.Text() != "":
 			in.Blocks = appendBlock(in.Blocks, p.Text())
@@ -48,6 +50,7 @@ func (e *CLIExecutor) promptFromParts(m *a2a.Message, dir string) (promptInput, 
 			}
 		}
 	}
+
 	return in, nil
 }
 
@@ -60,6 +63,7 @@ func (e *CLIExecutor) addFilePart(
 		addURLPart(in, p, string(u), n)
 		return nil
 	}
+
 	return e.addRawPart(in, p, dir, n, caps)
 }
 
@@ -79,14 +83,17 @@ func (e *CLIExecutor) addRawPart(
 	if err != nil {
 		return err
 	}
+
 	if img != nil {
 		in.Images = append(in.Images, *img)
 		return nil
 	}
+
 	ref, path, err := e.materializeFile(p, dir, n, caps)
 	if err != nil {
 		return err
 	}
+
 	switch {
 	case path != "" && isImage(p) && caps.AttachImages:
 		in.ImageFiles = append(in.ImageFiles, path)
@@ -95,6 +102,7 @@ func (e *CLIExecutor) addRawPart(
 	default:
 		in.Blocks = appendBlock(in.Blocks, ref)
 	}
+
 	return nil
 }
 
@@ -118,12 +126,15 @@ func imageInput(p *a2a.Part, caps agent.Capabilities) (*agent.Image, error) {
 	if p.Raw() == nil || !isImage(p) {
 		return nil, nil
 	}
+
 	if err := checkRawMedia(caps, p); err != nil {
 		return nil, err
 	}
+
 	if !caps.InlineImages {
 		return nil, nil // materialized and attached via image_args
 	}
+
 	return &agent.Image{MediaType: p.MediaType, Data: p.Raw()}, nil
 }
 
@@ -141,6 +152,7 @@ func appendDataBlock(blocks []string, v any) []string {
 	if err != nil {
 		return blocks
 	}
+
 	return appendBlock(blocks, string(buf))
 }
 
@@ -153,15 +165,19 @@ func (e *CLIExecutor) materializeFile(
 	if err := checkRawMedia(caps, p); err != nil {
 		return "", "", err
 	}
+
 	name := safeFilename(p.Filename, n)
 	if ext := imageExt[strings.ToLower(p.MediaType)]; ext != "" && filepath.Ext(name) == "" {
 		name += ext
 	}
+
 	text := fileLabel(name)
+
 	pth, err := writeUpload(dir, fmt.Sprintf("%d-%s", n, name), p.Raw())
 	if err != nil {
 		return "", "", fmt.Errorf("materialize %s: %w", name, err)
 	}
+
 	return text + " saved to " + pth, pth, nil
 }
 
@@ -172,12 +188,14 @@ func fileURLBlock(p *a2a.Part, u string, n int) string {
 	if p.MediaType != "" {
 		text += " (" + p.MediaType + ")"
 	}
+
 	text += " " + u
 	if len(p.Metadata) > 0 {
 		if b, err := json.Marshal(p.Metadata); err == nil {
 			text += " metadata=" + string(b)
 		}
 	}
+
 	return text
 }
 
@@ -194,6 +212,7 @@ func checkRawMedia(caps agent.Capabilities, p *a2a.Part) error {
 	} else if !caps.InputFile {
 		return fmt.Errorf("%w: file %s", errUnsupportedContent, p.MediaType)
 	}
+
 	return nil
 }
 
@@ -211,9 +230,11 @@ func writeUpload(dir, name string, data []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return "", err
 	}
+
 	return path, nil
 }
 
@@ -223,9 +244,11 @@ func uploadPath(dir, name string) (string, error) {
 	if dir == "" {
 		dir = os.TempDir()
 	}
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
+
 	return filepath.Join(dir, name), nil
 }
 
@@ -236,6 +259,7 @@ func safeFilename(name string, n int) string {
 	if base == "" || base == "." || base == string(filepath.Separator) {
 		return fmt.Sprintf("upload-%d", n)
 	}
+
 	return base
 }
 
@@ -246,5 +270,6 @@ func supportsMIME(supported []string, mime string) bool {
 			return true
 		}
 	}
+
 	return false
 }

@@ -28,26 +28,32 @@ func ensureCopy(src, dst string, copyRegular fileCopier) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+
 	parent := filepath.Dir(dst)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
 	}
+
 	tmp, err := os.MkdirTemp(parent, ".tmp-"+filepath.Base(dst)+"-")
 	if err != nil {
 		return err
 	}
+
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		_ = os.RemoveAll(tmp)
 		return err
 	}
+
 	if err := copyTree(src, tmp, copyRegular); err != nil {
 		_ = os.RemoveAll(tmp)
 		return err
 	}
+
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.RemoveAll(tmp)
 		return err
 	}
+
 	return nil
 }
 
@@ -56,10 +62,12 @@ func copyTree(src, dst string, copyRegular fileCopier) error {
 		if err != nil {
 			return err
 		}
+
 		rel, err := filepath.Rel(src, path)
 		if err != nil {
 			return err
 		}
+
 		target := filepath.Join(dst, rel)
 		switch {
 		case d.IsDir():
@@ -81,9 +89,11 @@ func copySymlink(src, dst string) error {
 	if err != nil {
 		return err
 	}
+
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
+
 	return os.Symlink(link, dst)
 }
 
@@ -93,24 +103,30 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
+
 	info, err := in.Stat()
 	if err != nil {
 		return err
 	}
+
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
+
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
+
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
 		return err
 	}
+
 	if err := out.Close(); err != nil {
 		return err
 	}
+
 	return os.Chmod(dst, info.Mode().Perm())
 }
 
@@ -120,21 +136,26 @@ func cleanupCopyTemps(isolationRoot string) error {
 	if isolationRoot == "" {
 		return nil
 	}
+
 	entries, err := os.ReadDir(isolationRoot)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+
 	if err != nil {
 		return err
 	}
+
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".tmp-ctx-") {
 			continue
 		}
+
 		if err := os.RemoveAll(filepath.Join(isolationRoot, entry.Name())); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -145,20 +166,25 @@ func probeClone(isolationRoot string) error {
 	if isolationRoot == "" {
 		return fmt.Errorf("sandbox.isolation_root is required for copy strategy %q", CopyCow)
 	}
+
 	if err := os.MkdirAll(isolationRoot, 0o755); err != nil {
 		return err
 	}
+
 	dir, err := os.MkdirTemp(isolationRoot, ".harbor-cow-probe-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
+
 	src := filepath.Join(dir, "src")
 	if err := os.WriteFile(src, []byte("harbor"), 0o600); err != nil {
 		return err
 	}
+
 	if err := cloneFile(src, filepath.Join(dir, "dst")); err != nil {
 		return fmt.Errorf("copy_strategy %q is not available at %s: %w", CopyCow, isolationRoot, err)
 	}
+
 	return nil
 }

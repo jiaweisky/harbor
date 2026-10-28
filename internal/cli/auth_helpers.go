@@ -18,6 +18,7 @@ func anySet(env map[string]string, keys ...string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 

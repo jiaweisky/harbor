@@ -44,10 +44,12 @@ func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) 
 	if cfg.Endpoint == "" {
 		return func(context.Context) error { return nil }, nil
 	}
+
 	name := cfg.ServiceName
 	if name == "" {
 		name = "harbor"
 	}
+
 	res, err := resource.New(ctx, resource.WithAttributes(attribute.String("service.name", name)))
 	if err != nil {
 		return nil, fmt.Errorf("otel resource: %w", err)
@@ -59,10 +61,12 @@ func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) 
 		traceOpts = append(traceOpts, otlptracegrpc.WithInsecure())
 		metricOpts = append(metricOpts, otlpmetricgrpc.WithInsecure())
 	}
+
 	texp, err := otlptracegrpc.New(ctx, traceOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("otlp trace exporter: %w", err)
 	}
+
 	mexp, err := otlpmetricgrpc.New(ctx, metricOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("otlp metric exporter: %w", err)
@@ -116,6 +120,7 @@ func load() *instruments {
 			cost:      instrument(m.Float64Counter("harbor.task.cost", metric.WithUnit("USD"))),
 		}
 	})
+
 	return inst
 }
 
@@ -159,9 +164,11 @@ func TaskUsage(agentID string, inputTokens, outputTokens int, costUSD float64) {
 	if inputTokens != 0 {
 		load().tokens.Add(context.Background(), int64(inputTokens), agent(agentID, attribute.String("direction", "input")))
 	}
+
 	if outputTokens != 0 {
 		load().tokens.Add(context.Background(), int64(outputTokens), agent(agentID, attribute.String("direction", "output")))
 	}
+
 	if costUSD > 0 {
 		load().cost.Add(context.Background(), costUSD, agent(agentID))
 	}

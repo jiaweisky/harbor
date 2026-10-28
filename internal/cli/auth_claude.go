@@ -16,7 +16,9 @@ func (claude) LoggedIn(home string, env map[string]string) bool {
 	if anySet(env, "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN") {
 		return true
 	}
+
 	dir := configDir(home, env["CLAUDE_CONFIG_DIR"], ".claude")
+
 	return fileExists(filepath.Join(dir, ".credentials.json"))
 }
 
@@ -29,9 +31,11 @@ func (claude) LoggedInStatus(output string, runErr error) bool {
 		var s struct {
 			LoggedIn bool `json:"loggedIn"`
 		}
+
 		if json.Unmarshal([]byte(output[i:j+1]), &s) == nil {
 			return s.LoggedIn
 		}
 	}
+
 	return runErr == nil
 }

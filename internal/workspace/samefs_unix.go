@@ -10,8 +10,10 @@ func sameFilesystem(left, right string) (bool, error) {
 	if err := syscall.Stat(left, &leftStat); err != nil {
 		return false, err
 	}
+
 	if err := syscall.Stat(right, &rightStat); err != nil {
 		return false, err
 	}
+
 	return leftStat.Dev == rightStat.Dev, nil
 }

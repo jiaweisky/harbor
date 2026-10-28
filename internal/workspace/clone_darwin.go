@@ -17,15 +17,19 @@ func cloneFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
+
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
+
 	if err := unix.Clonefile(src, dst, 0); err != nil {
 		return fmt.Errorf("clonefile: %w", err)
 	}
+
 	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
 		_ = os.Remove(dst)
 		return err
 	}
+
 	return nil
 }

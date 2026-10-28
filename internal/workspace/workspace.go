@@ -63,9 +63,11 @@ func CheckIsolation(isolation Isolation, strategy CopyStrategy, isolationRoot st
 		if strategy == "" {
 			strategy = CopyFull
 		}
+
 		if !strategy.Known() {
 			return fmt.Errorf("sandbox.copy_strategy must be one of full, cow; got %q", strategy)
 		}
+
 		if strategy == CopyCow {
 			return probeClone(isolationRoot)
 		}
@@ -88,21 +90,26 @@ func CheckCopySource(workdir, isolationRoot string) error {
 		if err != nil {
 			return err
 		}
+
 		workdir = wd
 	}
+
 	if isolationRoot == "" {
 		return fmt.Errorf("sandbox.isolation_root is required for copy strategy %q", CopyCow)
 	}
+
 	same, err := sameFilesystem(workdir, isolationRoot)
 	if err != nil {
 		return err
 	}
+
 	if !same {
 		return fmt.Errorf(
 			"copy strategy %q requires agents[].workdir and sandbox.isolation_root on the same filesystem",
 			CopyCow,
 		)
 	}
+
 	return nil
 }
 
@@ -147,10 +154,12 @@ func selectStrategy(isolation Isolation, copyStrategy CopyStrategy) (isolationSt
 		if copyStrategy == "" {
 			copyStrategy = CopyFull
 		}
+
 		cp, ok := copyStrategies[copyStrategy]
 		if !ok {
 			return isolationStrategy{}, false
 		}
+
 		return isolationStrategy{
 			ensure: func(src, dst string) error {
 				if err := ensureCopy(src, dst, cp); err != nil {
@@ -217,20 +226,24 @@ func NewResolverWithScope(
 	if isolation == "" {
 		isolation = IsolationShared
 	}
+
 	if isolation == IsolationCopy && copyStrategy == "" {
 		copyStrategy = CopyFull
 	}
+
 	if workdir != "" && isolation != IsolationShared {
 		if resolved, err := filepath.EvalSymlinks(workdir); err == nil {
 			workdir = resolved
 		}
 	}
+
 	st, ok := selectStrategy(isolation, copyStrategy)
 	if !ok {
 		// Config validation rejects unknown modes; keep the source mounted and
 		// fail on Resolve for direct callers.
 		st.needsSource = true
 	}
+
 	return &Resolver{
 		scope:        scope,
 		workdir:      workdir,
@@ -259,15 +272,19 @@ func (r *Resolver) Close() error {
 	if r == nil || r.release == nil {
 		return nil
 	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	var errs []error
 	for dir := range r.active {
 		if err := r.release(dir); err != nil {
 			errs = append(errs, fmt.Errorf("release %s: %w", dir, err))
 		}
+
 		delete(r.active, dir)
 	}
+
 	return errors.Join(errs...)
 }
 
@@ -278,6 +295,7 @@ func (r *Resolver) Resolve(contextID string) (string, error) {
 	if r == nil || r.workdir == "" {
 		return "", nil
 	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -286,6 +304,7 @@ func (r *Resolver) Resolve(contextID string) (string, error) {
 			return dir, nil
 		}
 	}
+
 	dir := r.workdir
 	if r.isolation != IsolationShared {
 		d, err := r.isolate(contextID)
@@ -294,9 +313,11 @@ func (r *Resolver) Resolve(contextID string) (string, error) {
 		}
 		dir = d
 	}
+
 	if contextID != "" {
 		r.bound[contextID] = dir
 	}
+
 	return dir, nil
 }
 
@@ -310,9 +331,11 @@ func (r *Resolver) isolate(contextID string) (string, error) {
 		}
 		return "", fmt.Errorf("isolation %q is not implemented", r.isolation)
 	}
+
 	if r.isoRoot == "" {
 		return "", fmt.Errorf("isolation_root is required for %q", r.isolation)
 	}
+
 	if r.isolation == IsolationCopy || r.isolation == IsolationOverlayFS {
 		if containsPath(r.isoRoot, r.workdir) || containsPath(r.workdir, r.isoRoot) {
 			return "", fmt.Errorf(
@@ -320,19 +343,24 @@ func (r *Resolver) isolate(contextID string) (string, error) {
 			)
 		}
 	}
+
 	if err := os.MkdirAll(r.isoRoot, 0o755); err != nil {
 		return "", err
 	}
+
 	root := filepath.Join(r.isoRoot, r.contextName(contextID))
 	if err := r.ensure(r.workdir, root); err != nil {
 		return "", fmt.Errorf("%s: %w", r.isolation, err)
 	}
+
 	if r.release != nil {
 		r.active[root] = true
 	}
+
 	if r.view != nil {
 		return r.view(root), nil
 	}
+
 	return root, nil
 }
 
@@ -343,6 +371,7 @@ func (r *Resolver) contextName(contextID string) string {
 	key := r.scope + "\x00" + string(r.isolation) + "\x00" + string(r.copyStrategy) + "\x00" +
 		r.workdir + "\x00" + contextID
 	sum := sha256.Sum256([]byte(key))
+
 	return "ctx-" + hex.EncodeToString(sum[:])
 }
 
@@ -358,10 +387,12 @@ func (r *Resolver) Lock(dir string) func() {
 func containsPath(root, target string) bool {
 	root = canonicalPath(root)
 	target = canonicalPath(target)
+
 	rel, err := filepath.Rel(root, target)
 	if err != nil {
 		return false
 	}
+
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
@@ -369,6 +400,7 @@ func canonicalPath(path string) string {
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
+
 	rest := []string(nil)
 	for {
 		if resolved, err := filepath.EvalSymlinks(path); err == nil {

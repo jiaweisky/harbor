@@ -65,19 +65,19 @@ func (nopWorkspace) Lock(string) func()             { return func() {} }
 
 // CLIExecutor turns a coding-agent CLI session into A2A task events.
 type CLIExecutor struct {
-	launcher               agent.Launcher
-	sessions               SessionStore
-	live                   *agent.LiveSessions
-	workspace              Workspace
-	timeout                time.Duration // total task timeout; 0 disables
-	idleTimeout            time.Duration // fail a task with no output for this long; 0 disables
-	keepalive              time.Duration // emit a keepalive when quiet for this long; 0 disables
-	breaker                *breaker      // nil disables
-	tasks                  sync.Map      // taskID -> *taskState (all per-task transient state)
-	maxTurns               int
-	taskLookup             func(context.Context, a2a.TaskID) (*a2a.Task, bool)
-	idem                   *idemCache // messageId -> taskID (duplicate-send guard)
-	metrics                *agentMetrics
+	launcher    agent.Launcher
+	sessions    SessionStore
+	live        *agent.LiveSessions
+	workspace   Workspace
+	timeout     time.Duration // total task timeout; 0 disables
+	idleTimeout time.Duration // fail a task with no output for this long; 0 disables
+	keepalive   time.Duration // emit a keepalive when quiet for this long; 0 disables
+	breaker     *breaker      // nil disables
+	tasks       sync.Map      // taskID -> *taskState (all per-task transient state)
+	maxTurns    int
+	taskLookup  func(context.Context, a2a.TaskID) (*a2a.Task, bool)
+	idem        *idemCache // messageId -> taskID (duplicate-send guard)
+	metrics     *agentMetrics
 }
 
 // NewCLIExecutor creates an executor over the given launcher. limits bounds the
@@ -89,6 +89,7 @@ func NewCLIExecutor(
 	if ws == nil {
 		ws = nopWorkspace{}
 	}
+
 	return &CLIExecutor{
 		launcher:    ln,
 		sessions:    sessions,
@@ -141,10 +142,12 @@ func (e *CLIExecutor) Snapshot() MetricsSnapshot {
 		TokensOut:          e.metrics.tokensOut.Load(),
 		CostUSD:            float64(e.metrics.costMicro.Load()) / 1e6,
 	}
+
 	snap.DurationBuckets = make([]int64, len(durationBucketBounds))
 	for i := range durationBucketBounds {
 		snap.DurationBuckets[i] = e.metrics.durBuckets[i].Load()
 	}
+
 	return snap
 }
 
@@ -156,10 +159,12 @@ func (e *CLIExecutor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) i
 		if e.answerWithoutRunning(ctx, ec, yield) {
 			return
 		}
+
 		username := ""
 		if ec.User != nil {
 			username = ec.User.Name
 		}
+
 		// One span per request; a paused (input-required) task's span ends when
 		// the request returns, and its subprocess span (see Runner) ends when the
 		// process does. The context carries the span into the CLI child span.
@@ -168,18 +173,22 @@ func (e *CLIExecutor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) i
 			attribute.String("harbor.task_id", taskID),
 			attribute.String("harbor.user", username))
 		defer span.End()
+
 		emit := e.instrument(taskID, username, span, yield)
 		if !e.breaker.Allow() {
 			if ec.StoredTask == nil && !emit(a2a.NewSubmittedTask(ec, ec.Message), nil) {
 				return
 			}
+
 			emit(rejectedStatus(ec, "agent is temporarily unavailable after repeated failures"), nil)
 			return
 		}
+
 		if isWaitingForInput(ec) {
 			e.resume(ctx, ec, taskID, emit)
 			return
 		}
+
 		e.start(ctx, ec, taskID, emit)
 	}
 }
@@ -195,27 +204,34 @@ func (e *CLIExecutor) instrument(
 	name := e.Name()
 	start := time.Now()
 	submitted, finished := false, false
+
 	return func(ev a2a.Event, err error) bool {
 		if !submitted {
 			if tk, ok := ev.(*a2a.Task); ok && tk.Status.State == a2a.TaskStateSubmitted {
 				submitted = true
 				e.metrics.submitted.Add(1)
 				telemetry.TaskSubmitted(name)
+
 				slog.Info("task submitted", "agent", name, "task", taskID, "user", username)
 			}
 		}
+
 		if !finished {
 			if outcome, ok := terminalOutcome(ev); ok {
 				finished = true
 				e.metrics.record(outcome)
 				span.SetAttributes(attribute.String("harbor.outcome", outcome))
+
 				if st := e.loadState(taskID); st != nil {
 					start = st.started // measure from submission, across a resume
 				}
+
 				dur := time.Since(start)
 				e.metrics.observeDuration(dur)
+
 				telemetry.TaskFinished(name, outcome)
 				telemetry.TaskDuration(name, dur)
+
 				slog.Info("task finished", "agent", name, "task", taskID, "outcome", outcome, "user", username)
 			}
 		}
@@ -234,12 +250,14 @@ func (e *CLIExecutor) start(
 		yield(failedStatus(ec, codeMaxTurns, "max turns exceeded"), nil)
 		return
 	}
+
 	if ec.StoredTask == nil {
 		if !yield(a2a.NewSubmittedTask(ec, ec.Message), nil) {
 			e.cleanup(taskID, false)
 			return
 		}
 	}
+
 	if !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
 		e.cleanup(taskID, false)
 		return
@@ -251,11 +269,13 @@ func (e *CLIExecutor) start(
 		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
 		return
 	}
+
 	if req.OutputSchema != nil {
 		st.setStructured(&structuredState{})
 	}
-		st.setLock(e.workspace.Lock(req.WorkDir))
-		e.launchAndPump(ctx, st, ec, taskID, req, false, yield)
+
+	st.setLock(e.workspace.Lock(req.WorkDir))
+	e.launchAndPump(ctx, st, ec, taskID, req, false, yield)
 }
 
 // launchAndPump starts the CLI for a prepared task and pumps its events. A
@@ -271,12 +291,15 @@ func (e *CLIExecutor) launchAndPump(
 		yield(failedStatus(ec, codeForStartError(err), err.Error()), nil)
 		return
 	}
+
 	e.live.Put(taskID, sess)
 	e.watchExecution(parent, taskID)
+
 	if emitWorking && !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
 		e.teardown(taskID, sess)
 		return
 	}
+
 	e.pump(st, ec, taskID, sess, yield)
 }
 
@@ -286,13 +309,17 @@ func (e *CLIExecutor) launchAndPump(
 func (e *CLIExecutor) startTask(parent context.Context, taskID string) *taskState {
 	base := context.WithoutCancel(parent)
 	runCtx, cancel := context.WithCancel(base)
+
 	if e.timeout > 0 {
 		runCtx, cancel = context.WithTimeout(base, e.timeout)
 	}
+
 	st := &taskState{ctx: runCtx, cancel: cancel, started: time.Now()}
 	e.tasks.Store(taskID, st)
+
 	e.metrics.active.Add(1)
 	telemetry.TaskActive(1)
+
 	return st
 }
 
@@ -321,10 +348,12 @@ func (e *CLIExecutor) pump(
 		if yield(ev, nil) {
 			return true
 		}
+
 		// The consumer went away: tear the CLI down so no process leaks.
 		e.teardown(taskID, sess)
 		return false
 	}
+
 	sink := newTextSink(ec, emit)
 
 	ticker := time.NewTicker(flushInterval)
@@ -352,13 +381,16 @@ func (e *CLIExecutor) pump(
 		select {
 		case ev, ok := <-ch:
 			lastActivity = time.Now()
+
 			if idle != nil {
 				idle.Reset(e.idleTimeout)
 			}
+
 			if !ok {
 				e.finish(st, ec, taskID, sess, sink, emit)
 				return
 			}
+
 			if !e.handleEvent(st, ec, taskID, sess, sink, emit, ev) {
 				// A pause keeps the process and workdir lock alive for the client's
 				// answer; reap them if the answer never arrives. Skip a state torn
@@ -415,10 +447,12 @@ func (e *CLIExecutor) handleEvent(
 		return false
 	case agent.EventError:
 		sink.Flush()
+
 		if sess.Canceled() {
 			e.forget(taskID)
 			return false
 		}
+
 		e.fail(ec, taskID, emit, codeInternal, eventErrorText(ev))
 		return false
 	case agent.EventDone:
@@ -428,10 +462,12 @@ func (e *CLIExecutor) handleEvent(
 		if !sink.Flush() {
 			return false
 		}
+
 		if sess.Canceled() {
 			e.forget(taskID)
 			return false
 		}
+
 		e.emitStructuredFallback(st, ec, sink, emit)
 		e.complete(ec, taskID, emit)
 		return false
@@ -439,14 +475,17 @@ func (e *CLIExecutor) handleEvent(
 		if !sink.Flush() {
 			return false
 		}
+
 		if ev.Kind == agent.EventUsage {
 			e.metrics.addUsage(ev.Usage)
 			if ev.Usage != nil {
 				telemetry.TaskUsage(e.Name(), ev.Usage.InputTokens, ev.Usage.OutputTokens, ev.Usage.CostUSD)
 			}
 		}
+
 		return emitTrace(ec, emit, ev)
 	}
+
 	return true
 }
 
@@ -460,8 +499,10 @@ func (e *CLIExecutor) handlePermissionRequest(
 			"non-interactive agent received a permission request; configure the CLI to bypass permissions")
 		return
 	}
+
 	itx := interactionFromEvent(ev)
 	st.setInteraction(itx)
+
 	// Keep the session alive for the client's answer; record its id so a restart
 	// can resume the CLI session and inject the answer.
 	sid, _ := e.sessions.Get(contextKey(ec))
@@ -473,10 +514,12 @@ func emitStructured(ec *a2asrv.ExecutorContext, emit func(a2a.Event) bool, data 
 	if data == nil {
 		return true
 	}
+
 	evt := a2a.NewArtifactEvent(ec, a2a.NewDataPart(data))
 	if evt.Artifact != nil {
 		evt.Artifact.Name = "result"
 	}
+
 	return emit(evt)
 }
 
@@ -502,6 +545,7 @@ func (e *CLIExecutor) emitStructuredFallback(
 	if ss == nil || ss.emitted {
 		return
 	}
+
 	if data := jsonObject(sink.Text()); data != nil {
 		ss.emitted = true
 		emitStructured(ec, emit, data)
@@ -514,10 +558,12 @@ func jsonObject(text string) map[string]any {
 	if !strings.HasPrefix(text, "{") {
 		return nil
 	}
+
 	var m map[string]any
 	if json.Unmarshal([]byte(text), &m) != nil {
 		return nil
 	}
+
 	return m
 }
 
@@ -539,17 +585,20 @@ func emitTrace(ec *a2asrv.ExecutorContext, emit func(a2a.Event) bool, ev agent.E
 	case agent.EventUsage:
 		return emit(traceStatus(ec, "usage", "usage", usageMeta(ev.Usage)))
 	}
+
 	return true
 }
 
 // traceStatus builds a working status update tagged with a harbor.kind.
 func traceStatus(ec *a2asrv.ExecutorContext, kind, text string, extra map[string]any) *a2a.TaskStatusUpdateEvent {
 	m := a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(text))
+
 	meta := map[string]any{metaKeyKind: kind}
 	for k, v := range extra {
 		meta[k] = v
 	}
 	m.Metadata = meta
+
 	return a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, m)
 }
 
@@ -557,6 +606,7 @@ func usageMeta(u *agent.Usage) map[string]any {
 	if u == nil {
 		return nil
 	}
+
 	return map[string]any{
 		"input_tokens":  u.InputTokens,
 		"output_tokens": u.OutputTokens,
@@ -581,6 +631,7 @@ func codedStatus(ec *a2asrv.ExecutorContext, state a2a.TaskState, code, msg stri
 		m.Metadata = map[string]any{}
 	}
 	m.Metadata[metaKeyErrorCode] = code
+
 	return a2a.NewStatusUpdateEvent(ec, state, m)
 }
 
@@ -599,16 +650,20 @@ func (e *CLIExecutor) finish(
 	sink *textSink, emit func(a2a.Event) bool,
 ) {
 	defer e.forget(taskID)
+
 	if !sink.Flush() {
 		return
 	}
+
 	if sess.Canceled() {
 		return // Cancel already emitted the canceled state.
 	}
+
 	if errors.Is(st.ctx.Err(), context.DeadlineExceeded) {
 		e.fail(ec, taskID, emit, codeTimeout, "task timed out")
 		return
 	}
+
 	e.emitStructuredFallback(st, ec, sink, emit)
 	e.breaker.Success()
 	emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil))
@@ -629,9 +684,11 @@ func (e *CLIExecutor) idleTimeoutFail(
 	sink *textSink, emit func(a2a.Event) bool,
 ) {
 	sink.Flush()
+
 	if sess.Canceled() {
 		return // Cancel already ended the task.
 	}
+
 	e.fail(ec, taskID, emit, codeTimeout, "task idle timeout")
 }
 
@@ -653,15 +710,18 @@ func (e *CLIExecutor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) it
 		if ec.User != nil {
 			username = ec.User.Name
 		}
+
 		_, span := telemetry.Start(ctx, "harbor.cancel",
 			attribute.String("harbor.agent", e.Name()),
 			attribute.String("harbor.task_id", taskID),
 			attribute.String("harbor.user", username))
 		defer span.End()
+
 		emit := e.instrument(taskID, username, span, yield)
 		if sess, ok := e.live.Get(taskID); ok {
 			_ = sess.Cancel()
 		}
+
 		e.breaker.Resolve()
 		emit(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCanceled, nil), nil)
 		e.forget(taskID)

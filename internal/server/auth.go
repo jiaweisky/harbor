@@ -15,6 +15,7 @@ func BearerMiddleware(tokens []string, next http.Handler) http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+
 		next.ServeHTTP(w, r)
 	})
 }
@@ -24,10 +25,12 @@ func CORSMiddleware(origins []string, next http.Handler) http.Handler {
 	if len(origins) == 0 {
 		return next
 	}
+
 	allowed := map[string]bool{}
 	for _, o := range origins {
 		allowed[o] = true
 	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" && allowed[origin] {
@@ -35,10 +38,12 @@ func CORSMiddleware(origins []string, next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		}
+
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+
 		next.ServeHTTP(w, r)
 	})
 }
@@ -49,6 +54,7 @@ func matchToken(got string, tokens []string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -59,9 +65,11 @@ func BearerToken(header string) (string, bool) {
 	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
 		return "", false
 	}
+
 	token := strings.TrimSpace(header[len(prefix):])
 	if token == "" {
 		return "", false
 	}
+
 	return token, true
 }

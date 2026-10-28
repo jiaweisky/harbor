@@ -58,6 +58,7 @@ func NewServerLauncher(lifecycle context.Context, cfg Config) *Launcher {
 	if lifecycle == nil {
 		lifecycle = context.Background()
 	}
+
 	return &Launcher{
 		cfg:       cfg,
 		runner:    agent.NewRunner(1, cfg.InheritEnv, cfg.CLIHome, cfg.Container, cfg.Runtime),
@@ -102,9 +103,11 @@ func (l *Launcher) Start(ctx context.Context, req *agent.Request) (agent.Session
 	if err != nil {
 		return nil, err
 	}
+
 	runCtx, cancel := context.WithCancel(ctx)
 	s := &serverSession{ServerSession: agent.NewServerSession(8, cancel)}
 	go s.run(runCtx, l, base, req)
+
 	return s, nil
 }
 
@@ -117,6 +120,7 @@ func (l *Launcher) spawn(ctx context.Context) (string, error) {
 		Args: []string{"--serve", "--host", "127.0.0.1", "--auth", "none"},
 		Env:  l.cfg.Env,
 	}
+
 	return agent.SpawnServer(ctx, l.lifecycle, l.runner, l.cfg.Name+":server", inv, serverStartTimeout)
 }
 
@@ -132,17 +136,21 @@ func (l *Launcher) startRun(ctx context.Context, base, conversationID, prompt st
 		},
 		"payload": map[string]any{"text": prompt},
 	}
+
 	var out struct {
 		Data struct {
 			RunID string `json:"runId"`
 		} `json:"data"`
 	}
+
 	if err := l.post(ctx, base+"/api/v1/runs", body, &out); err != nil {
 		return "", err
 	}
+
 	if out.Data.RunID == "" {
 		return "", errors.New("codebuddy server: run create returned no id")
 	}
+
 	return out.Data.RunID, nil
 }
 
@@ -197,6 +205,7 @@ func (s *serverSession) run(ctx context.Context, l *Launcher, base string, req *
 		s.EmitError(ctx, err)
 		return
 	}
+
 	s.SetAbort(func() { l.cancelRun(base, runID) })
 
 	sawMessage, err := s.stream(ctx, l, base, runID)
@@ -204,10 +213,12 @@ func (s *serverSession) run(ctx context.Context, l *Launcher, base string, req *
 		s.EmitError(ctx, err)
 		return
 	}
+
 	if !sawMessage {
 		s.EmitError(ctx, errors.New("codebuddy server: run stream ended without a result"))
 		return
 	}
+
 	s.Emit(agent.Event{Kind: agent.EventDone})
 }
 
@@ -218,17 +229,21 @@ func (s *serverSession) stream(ctx context.Context, l *Launcher, base, runID str
 	if err != nil {
 		return false, err
 	}
+
 	req.Header.Set(csrfHeader, "1")
 	req.Header.Set("accept", "text/event-stream")
+
 	resp, err := l.client.Do(req)
 	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return false, fmt.Errorf("codebuddy server: stream %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
+
 	return s.consume(resp.Body)
 }
 
@@ -236,6 +251,7 @@ func (s *serverSession) stream(ctx context.Context, l *Launcher, base, runID str
 // the terminal `done` event.
 func (s *serverSession) consume(r io.Reader) (bool, error) {
 	sawMessage := false
+
 	var handlerErr error
 	readErr := agent.ReadSSE(r, func(event, data string) bool {
 		sawText, done, err := s.handleEvent(event, data)
@@ -246,9 +262,11 @@ func (s *serverSession) consume(r io.Reader) (bool, error) {
 		}
 		return !done
 	})
+
 	if handlerErr != nil {
 		return sawMessage, handlerErr
 	}
+
 	return sawMessage, readErr
 }
 
@@ -263,9 +281,11 @@ func (s *serverSession) handleEvent(event, data string) (sawText, done bool, err
 		if json.Unmarshal([]byte(data), &m) != nil {
 			return false, false, nil
 		}
+
 		if m.Status == "failed" || m.Status == "error" {
 			return false, false, errors.New("codebuddy server: run failed")
 		}
+
 		// Streaming chunks carry the reply incrementally; once they were seen,
 		// the final full text would duplicate them and is skipped.
 		if m.Content.Chunk != "" {
@@ -273,10 +293,13 @@ func (s *serverSession) handleEvent(event, data string) (sawText, done bool, err
 			s.Emit(agent.Event{Kind: agent.EventTextDelta, Text: m.Content.Chunk})
 			return true, false, nil
 		}
+
 		if s.streamed.Load() || m.Content.Markdown == "" {
 			return s.streamed.Load(), false, nil
 		}
+
 		s.Emit(agent.Event{Kind: agent.EventTextDelta, Text: m.Content.Markdown})
+
 		// The completed message summarizes the run's tool calls; forward each
 		// entry verbatim so the client sees what the agent did even though this
 		// API streams no per-tool events.
@@ -285,13 +308,17 @@ func (s *serverSession) handleEvent(event, data string) (sawText, done bool, err
 			if name == "" {
 				name, _ = tc["type"].(string)
 			}
+
 			if name == "" {
 				name = "tool"
 			}
+
 			s.Emit(agent.Event{Kind: agent.EventToolCall, Tool: name, ToolInput: tc})
 		}
+
 		return true, false, nil
 	}
+
 	return false, false, nil
 }
 
@@ -301,5 +328,6 @@ func newID() string {
 	if _, err := rand.Read(b[:]); err != nil {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
+
 	return hex.EncodeToString(b[:])
 }

@@ -50,6 +50,7 @@ func (m *agentMetrics) observeDuration(d time.Duration) {
 	m.durSumMS.Add(d.Milliseconds())
 	m.durCount.Add(1)
 	sec := d.Seconds()
+
 	for i, bound := range durationBucketBounds {
 		if sec <= bound {
 			m.durBuckets[i].Add(1)
@@ -63,8 +64,10 @@ func (m *agentMetrics) addUsage(u *agent.Usage) {
 	if u == nil {
 		return
 	}
+
 	m.tokensIn.Add(int64(u.InputTokens))
 	m.tokensOut.Add(int64(u.OutputTokens))
+
 	if u.CostUSD > 0 {
 		m.costMicro.Add(int64(u.CostUSD * 1e6))
 	}
@@ -114,6 +117,7 @@ func terminalOutcome(ev a2a.Event) (string, bool) {
 	if !ok {
 		return "", false
 	}
+
 	switch su.Status.State {
 	case a2a.TaskStateCompleted:
 		return outcomeCompleted, true
@@ -124,6 +128,7 @@ func terminalOutcome(ev a2a.Event) (string, bool) {
 	case a2a.TaskStateRejected:
 		return outcomeRejected, true
 	}
+
 	return "", false
 }
 
@@ -134,6 +139,7 @@ func WritePrometheus(w io.Writer, snaps []MetricsSnapshot) {
 
 	writeGauge := func(name, help string, value func(MetricsSnapshot) int64) {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n", name, help, name)
+
 		for _, s := range sorted {
 			fmt.Fprintf(w, "%s{agent=%s} %d\n", name, promLabel(s.Name), value(s))
 		}
@@ -155,6 +161,7 @@ func WritePrometheus(w io.Writer, snaps []MetricsSnapshot) {
 			{outcomeCanceled, s.Canceled},
 			{outcomeRejected, s.Rejected},
 		}
+
 		for _, o := range outcomes {
 			fmt.Fprintf(w, "harbor_tasks_total{agent=%s,outcome=%s} %d\n", promLabel(s.Name), promLabel(o.name), o.count)
 		}
@@ -174,6 +181,7 @@ func WritePrometheus(w io.Writer, snaps []MetricsSnapshot) {
 func writeDurationHistogram(w io.Writer, snaps []MetricsSnapshot) {
 	fmt.Fprintf(w, "# HELP harbor_task_duration_seconds Task duration from submission to terminal.\n"+
 		"# TYPE harbor_task_duration_seconds histogram\n")
+
 	for _, s := range snaps {
 		var cumulative int64
 		for i, bound := range durationBucketBounds {
@@ -181,6 +189,7 @@ func writeDurationHistogram(w io.Writer, snaps []MetricsSnapshot) {
 			fmt.Fprintf(w, "harbor_task_duration_seconds_bucket{agent=%s,le=%s} %d\n",
 				promLabel(s.Name), promLabel(strconv.FormatFloat(bound, 'g', -1, 64)), cumulative)
 		}
+
 		fmt.Fprintf(w, "harbor_task_duration_seconds_bucket{agent=%s,le=\"+Inf\"} %d\n", promLabel(s.Name), s.DurationCount)
 		fmt.Fprintf(w, "harbor_task_duration_seconds_sum{agent=%s} %g\n", promLabel(s.Name), s.DurationSumSeconds)
 		fmt.Fprintf(w, "harbor_task_duration_seconds_count{agent=%s} %d\n", promLabel(s.Name), s.DurationCount)
@@ -191,6 +200,7 @@ func writeDurationHistogram(w io.Writer, snaps []MetricsSnapshot) {
 func writeUsageCounters(w io.Writer, snaps []MetricsSnapshot) {
 	fmt.Fprintf(w, "# HELP harbor_task_tokens_total Tokens reported by the CLI, by direction.\n"+
 		"# TYPE harbor_task_tokens_total counter\n")
+
 	for _, s := range snaps {
 		fmt.Fprintf(w, "harbor_task_tokens_total{agent=%s,direction=\"input\"} %d\n", promLabel(s.Name), s.TokensIn)
 		fmt.Fprintf(w, "harbor_task_tokens_total{agent=%s,direction=\"output\"} %d\n", promLabel(s.Name), s.TokensOut)
@@ -198,6 +208,7 @@ func writeUsageCounters(w io.Writer, snaps []MetricsSnapshot) {
 
 	fmt.Fprintf(w, "# HELP harbor_task_cost_usd_total Reported task cost in USD.\n"+
 		"# TYPE harbor_task_cost_usd_total counter\n")
+
 	for _, s := range snaps {
 		fmt.Fprintf(w, "harbor_task_cost_usd_total{agent=%s} %g\n", promLabel(s.Name), s.CostUSD)
 	}

@@ -16,6 +16,7 @@ func NewCardsHandler(cards []*a2a.AgentCard) http.Handler {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(cards)
 	})

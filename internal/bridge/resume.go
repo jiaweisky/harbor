@@ -26,6 +26,7 @@ func (e *CLIExecutor) resume(
 			yield(failedStatus(ec, codeMaxTurns, "max turns exceeded"), nil)
 			return
 		}
+
 		if err := st.ctx.Err(); err != nil {
 			// The process already ended (typically the task timed out while paused).
 			e.cleanup(taskID, true)
@@ -33,6 +34,7 @@ func (e *CLIExecutor) resume(
 			return
 		}
 	}
+
 	sess, ok := e.live.Get(taskID)
 	if st == nil || !ok {
 		// No live process (for example after a restart): drop any stale state
@@ -41,6 +43,7 @@ func (e *CLIExecutor) resume(
 		e.resumeFresh(ctx, ec, taskID, yield)
 		return
 	}
+
 	in, err := e.answerFromMessage(ec, taskID, ec.Message)
 	if err != nil {
 		// A bad client reply is not an agent failure; tear the process down
@@ -49,16 +52,19 @@ func (e *CLIExecutor) resume(
 		yield(failedStatus(ec, codeInternal, err.Error()), nil)
 		return
 	}
+
 	st.takeInteraction()
 	if err := sess.Send(st.ctx, in); err != nil {
 		e.cleanup(taskID, true)
 		yield(failedStatus(ec, codeInternal, err.Error()), nil)
 		return
 	}
+
 	if !yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateWorking, nil), nil) {
 		e.teardown(taskID, sess)
 		return
 	}
+
 	e.watchExecution(ctx, taskID)
 	e.pump(st, ec, taskID, sess, yield)
 }
@@ -70,6 +76,7 @@ func (e *CLIExecutor) stopPausedTask(taskID string) {
 		e.teardown(taskID, sess)
 		return
 	}
+
 	e.cleanup(taskID, false)
 }
 
@@ -87,18 +94,21 @@ func (e *CLIExecutor) resumeFresh(
 		yield(failedStatus(ec, codeInternal, "session lost"), nil)
 		return
 	}
+
 	in, err := e.answerFromMessage(ec, taskID, ec.Message)
 	if err != nil || strings.TrimSpace(in.Answer) == "" {
 		e.forget(taskID)
 		yield(failedStatus(ec, codeInternal, "session lost"), nil)
 		return
 	}
+
 	dir, err := e.workspace.Resolve(contextKey(ec))
 	if err != nil {
 		e.forget(taskID)
 		yield(failedStatus(ec, codeForRequestError(err), err.Error()), nil)
 		return
 	}
+
 	st := e.startTask(ctx, taskID)
 	e.launchAndPump(ctx, st, ec, taskID,
 		&agent.Request{Prompt: in.Answer, SessionID: sid, WorkDir: dir}, true, yield)
@@ -109,6 +119,7 @@ func (e *CLIExecutor) sessionFromTask(ec *a2asrv.ExecutorContext) string {
 	if ec.StoredTask == nil || ec.StoredTask.Status.Message == nil {
 		return ""
 	}
+
 	return metaString(ec.StoredTask.Status.Message.Metadata, metaKeySessionID)
 }
 
@@ -127,6 +138,7 @@ func (e *CLIExecutor) watchExecution(parent context.Context, taskID string) {
 	if parent.Done() == nil {
 		return
 	}
+
 	go func() {
 		<-parent.Done()
 		if !errors.Is(context.Cause(parent), a2asrv.ErrAgentInactivityTimeout) {
@@ -146,14 +158,18 @@ func (e *CLIExecutor) forget(taskID string) {
 	if !ok {
 		return
 	}
+
 	st := v.(*taskState)
 	st.cancel()
+
 	if c := st.takeReap(); c != nil {
 		c()
 	}
+
 	if f := st.takeLock(); f != nil {
 		f()
 	}
+
 	e.live.Del(taskID)
 	e.metrics.active.Add(-1)
 	telemetry.TaskActive(-1)
@@ -165,20 +181,24 @@ func (e *CLIExecutor) forget(taskID string) {
 func (e *CLIExecutor) armPauseReaper(st *taskState, taskID string, sess agent.Session) {
 	ctx, cancel := context.WithCancel(context.Background())
 	st.setReap(cancel)
+
 	go func() {
 		defer cancel()
+
 		var timeoutC <-chan time.Time
 		if e.idleTimeout > 0 {
 			t := time.NewTimer(e.idleTimeout)
 			defer t.Stop()
 			timeoutC = t.C
 		}
+
 		select {
 		case <-st.ctx.Done():
 		case <-timeoutC:
 		case <-ctx.Done():
 			return
 		}
+
 		e.teardown(taskID, sess)
 	}()
 }
@@ -204,6 +224,7 @@ func (e *CLIExecutor) takeTurn(st *taskState) bool {
 // penalized; otherwise it is resolved.
 func (e *CLIExecutor) cleanup(taskID string, fail bool) {
 	e.forget(taskID)
+
 	if fail {
 		e.breaker.Failure()
 	} else {

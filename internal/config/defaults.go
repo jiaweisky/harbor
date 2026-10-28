@@ -22,6 +22,7 @@ func (b *BreakerConfig) Core() *core.Breaker {
 	if b == nil {
 		return nil
 	}
+
 	return &core.Breaker{
 		Threshold:         b.Threshold,
 		FailureRatio:      b.FailureRatio,
@@ -35,6 +36,7 @@ func (c *Config) applyDefaults() {
 	c.applyAuthDefaults()
 	c.applyTelemetryDefaults()
 	c.applySandboxDefaults()
+
 	for i := range c.Agents {
 		applyAgentDefaults(&c.Agents[i])
 	}
@@ -55,9 +57,11 @@ func (c *Config) applyTelemetryDefaults() {
 func (c *Config) applySandboxDefaults() {
 	c.Sandbox.IsolationRoot = absolutePath(c.Sandbox.IsolationRoot)
 	c.Sandbox.CLIHome = absolutePath(c.Sandbox.CLIHome)
+
 	if c.Sandbox.Isolation == "" {
 		c.Sandbox.Isolation = core.IsolationShared
 	}
+
 	if c.Sandbox.Isolation == core.IsolationCopy && c.Sandbox.CopyStrategy == "" {
 		c.Sandbox.CopyStrategy = core.CopyFull
 	}
@@ -76,9 +80,11 @@ func absolutePath(path string) string {
 	if path == "" {
 		return ""
 	}
+
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return path
 	}
+
 	return abs
 }

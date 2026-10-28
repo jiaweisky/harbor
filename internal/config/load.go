@@ -17,6 +17,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	// Expand environment references before decoding: $NAME, ${NAME},
 	// ${NAME:-default} and ${NAME:=default}; "$$" escapes a literal dollar.
 	// A reference must name a set variable unless it carries a non-empty
@@ -26,16 +27,19 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
+
 	var cfg Config
 	dec := yaml.NewDecoder(bytes.NewReader(expanded))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
 	}
+
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+
 	return &cfg, nil
 }
 
@@ -45,5 +49,6 @@ func MustLoad(path string) *Config {
 	if err != nil {
 		panic(err)
 	}
+
 	return cfg
 }

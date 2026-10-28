@@ -27,10 +27,12 @@ func tlsConfigFor(cfg config.TLSConfig) (*tls.Config, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
 			return nil, fmt.Errorf("no certificates in %s", cfg.CAFile)
 		}
+
 		tlsCfg.ClientCAs = pool
 	}
 

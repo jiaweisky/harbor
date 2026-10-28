@@ -14,10 +14,12 @@ func ensureWorktree(repo, dst string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+
 	if err := gitWorktree(repo, dst); err != nil {
 		_ = os.RemoveAll(dst)
 		return err
 	}
+
 	return nil
 }
 
@@ -26,5 +28,6 @@ func gitWorktree(repo, dst string) error {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git worktree add: %v: %s", err, strings.TrimSpace(string(out)))
 	}
+
 	return nil
 }

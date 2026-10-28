@@ -55,6 +55,7 @@ func (s *taskState) setLock(release func()) {
 	if release == nil {
 		return
 	}
+
 	s.mu.Lock()
 	s.lock = release
 	s.mu.Unlock()
@@ -63,8 +64,10 @@ func (s *taskState) setLock(release func()) {
 func (s *taskState) takeLock() func() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	f := s.lock
 	s.lock = nil
+
 	return f
 }
 
@@ -95,7 +98,9 @@ func (s *taskState) setReap(cancel context.CancelFunc) {
 func (s *taskState) takeReap() context.CancelFunc {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	c := s.reap
 	s.reap = nil
+
 	return c
 }

@@ -97,6 +97,7 @@ func baseName(binary string) string {
 			return strings.TrimSuffix(name, ext)
 		}
 	}
+
 	return name
 }
 

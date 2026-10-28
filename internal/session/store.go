@@ -16,7 +16,9 @@ func New() *Store { return &Store{m: map[string]string{}} }
 func (s *Store) Get(contextID string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
 	v, ok := s.m[contextID]
+
 	return v, ok
 }
 
@@ -25,7 +27,9 @@ func (s *Store) Bind(contextID, sessionID string) {
 	if contextID == "" || sessionID == "" {
 		return
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.m[contextID] = sessionID
 }

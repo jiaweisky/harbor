@@ -11,5 +11,6 @@ func Load(paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
+
 	return errors.New("Go plugins require cgo on linux, darwin, or freebsd")
 }

@@ -20,15 +20,19 @@ func Load(paths []string) error {
 		if err != nil {
 			return fmt.Errorf("open plugin %s: %w", filepath.Base(p), err)
 		}
+
 		sym, err := pl.Lookup("Register")
 		if err != nil {
 			return fmt.Errorf("plugin %s: missing Register symbol", filepath.Base(p))
 		}
+
 		register, ok := sym.(func())
 		if !ok {
 			return fmt.Errorf("plugin %s: Register has type %T, want func()", filepath.Base(p), sym)
 		}
+
 		register()
 	}
+
 	return nil
 }

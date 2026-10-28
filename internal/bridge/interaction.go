@@ -17,19 +17,24 @@ import (
 // from the event's tool fields, assigning a fresh id for cross-talk checks.
 func interactionFromEvent(ev agent.Event) *agent.Interaction {
 	itx := &agent.Interaction{Kind: agent.InteractionPermission, Resume: true}
+
 	if ev.Interaction != nil {
 		c := *ev.Interaction
 		itx = &c
 	}
+
 	if itx.Kind == "" {
 		itx.Kind = agent.InteractionPermission
 	}
+
 	if itx.ID == "" {
 		itx.ID = newInteractionID()
 	}
+
 	if itx.Action == "" {
 		itx.Action = ev.Tool
 	}
+
 	return itx
 }
 
@@ -42,10 +47,12 @@ func interactionMessage(prompt string, itx *agent.Interaction, sessionID string)
 		metaKeyKind:          string(itx.Kind),
 		metaKeyInteractionID: itx.ID,
 	}
+
 	// Record the CLI session so a paused task can be resumed after a restart.
 	if sessionID != "" {
 		m.Metadata[metaKeySessionID] = sessionID
 	}
+
 	return m
 }
 
@@ -59,6 +66,7 @@ func interactionPayload(itx *agent.Interaction) map[string]any {
 	if b, err := json.Marshal(itx); err == nil {
 		_ = json.Unmarshal(b, &m)
 	}
+
 	return m
 }
 
@@ -71,14 +79,17 @@ func (e *CLIExecutor) answerFromMessage(
 ) (agent.Input, error) {
 	id, answer, content := parseAnswer(m)
 	kind, action, target := "answer", "", ""
+
 	if cur, ok := e.answerableInteraction(ec, taskID); ok {
 		if id != "" && id != cur.ID {
 			return agent.Input{}, fmt.Errorf("interaction id mismatch: got %q, want %q", id, cur.ID)
 		}
+
 		// Use the interaction's own id, kind, action, and target so the session
 		// can build the right response even when the client answered with text.
 		id, kind, action, target = cur.ID, string(cur.Kind), cur.Action, cur.Target
 	}
+
 	return agent.Input{
 		Kind: kind, ID: id, Action: action, Target: target, Answer: answer, Content: content,
 	}, nil
@@ -91,22 +102,27 @@ func parseAnswer(m *a2a.Message) (id, answer string, content map[string]any) {
 	if m == nil {
 		return "", "", nil
 	}
+
 	for _, p := range m.Parts {
 		if p == nil || p.Data() == nil {
 			continue
 		}
+
 		b, err := json.Marshal(p.Data())
 		if err != nil {
 			continue
 		}
+
 		var a agent.Answer
 		if err := json.Unmarshal(b, &a); err != nil {
 			continue
 		}
+
 		if a.ID != "" || a.Answer != "" || a.Content != nil {
 			return a.ID, a.Answer, a.Content
 		}
 	}
+
 	return metaString(m.Metadata, metaKeyInteractionID), firstTextPart(m), nil
 }
 
@@ -120,11 +136,13 @@ func (e *CLIExecutor) answerableInteraction(ec *a2asrv.ExecutorContext, taskID s
 			return it, true
 		}
 	}
+
 	if ec.StoredTask != nil {
 		if itx, ok := interactionFromStatusMessage(ec.StoredTask.Status.Message); ok {
 			return itx, true
 		}
 	}
+
 	return nil, false
 }
 
@@ -134,19 +152,23 @@ func interactionFromStatusMessage(m *a2a.Message) (*agent.Interaction, bool) {
 	if m == nil {
 		return nil, false
 	}
+
 	for _, p := range m.Parts {
 		if p == nil || p.Data() == nil {
 			continue
 		}
+
 		b, err := json.Marshal(p.Data())
 		if err != nil {
 			continue
 		}
+
 		var itx agent.Interaction
 		if err := json.Unmarshal(b, &itx); err == nil && itx.ID != "" {
 			return &itx, true
 		}
 	}
+
 	return nil, false
 }
 
@@ -156,6 +178,7 @@ func newInteractionID() string {
 	if _, err := rand.Read(b[:]); err != nil {
 		return "itx_unknown"
 	}
+
 	return "itx_" + hex.EncodeToString(b[:])
 }
 
@@ -176,6 +199,7 @@ func metaInt(m map[string]any, key string) int {
 	case float64:
 		return int(v)
 	}
+
 	return 0
 }
 
@@ -189,6 +213,7 @@ func firstTextPart(m *a2a.Message) string {
 	if m == nil {
 		return ""
 	}
+
 	for _, p := range m.Parts {
 		if p != nil {
 			if t := p.Text(); t != "" {
@@ -196,5 +221,6 @@ func firstTextPart(m *a2a.Message) string {
 			}
 		}
 	}
+
 	return ""
 }

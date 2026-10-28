@@ -31,10 +31,12 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if err := initSchema(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+
 	return &SQLiteStore{
 		db:   db,
 		auth: func(context.Context) (string, error) { return "", nil },
@@ -59,11 +61,13 @@ func initSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS tasks_user_updated ON tasks(user, updated_at DESC, id DESC)`,
 	}
+
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -72,14 +76,17 @@ func (s *SQLiteStore) Create(ctx context.Context, task *a2a.Task) (taskstore.Tas
 	if err := validateTask(task); err != nil {
 		return taskstore.TaskVersionMissing, err
 	}
+
 	user, err := s.auth(ctx)
 	if err != nil {
 		return taskstore.TaskVersionMissing, fmt.Errorf("taskstore auth failed: %w", err)
 	}
+
 	data, err := json.Marshal(task)
 	if err != nil {
 		return taskstore.TaskVersionMissing, err
 	}
+
 	// ON CONFLICT keeps the check in one statement, so an existing id maps to
 	// ErrTaskAlreadyExists without driver-specific error inspection.
 	res, err := s.db.ExecContext(ctx, `INSERT INTO tasks
@@ -91,9 +98,11 @@ func (s *SQLiteStore) Create(ctx context.Context, task *a2a.Task) (taskstore.Tas
 	if err != nil {
 		return taskstore.TaskVersionMissing, err
 	}
+
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
 		return taskstore.TaskVersionMissing, taskstore.ErrTaskAlreadyExists
 	}
+
 	return taskstore.TaskVersion(1), nil
 }
 
@@ -102,10 +111,12 @@ func (s *SQLiteStore) Update(ctx context.Context, req *taskstore.UpdateRequest) 
 	if err := validateTask(req.Task); err != nil {
 		return taskstore.TaskVersionMissing, err
 	}
+
 	user, err := s.auth(ctx)
 	if err != nil {
 		return taskstore.TaskVersionMissing, fmt.Errorf("taskstore auth failed: %w", err)
 	}
+
 	data, err := json.Marshal(req.Task)
 	if err != nil {
 		return taskstore.TaskVersionMissing, err
@@ -124,12 +135,15 @@ func (s *SQLiteStore) Update(ctx context.Context, req *taskstore.UpdateRequest) 
 	if errors.Is(err, sql.ErrNoRows) {
 		return taskstore.TaskVersionMissing, a2a.ErrTaskNotFound
 	}
+
 	if err != nil {
 		return taskstore.TaskVersionMissing, err
 	}
+
 	if storedUser != user {
 		return taskstore.TaskVersionMissing, a2a.ErrTaskNotFound
 	}
+
 	if req.PrevVersion != taskstore.TaskVersionMissing && taskstore.TaskVersion(version) != req.PrevVersion {
 		return taskstore.TaskVersionMissing, taskstore.ErrConcurrentModification
 	}
@@ -142,9 +156,11 @@ func (s *SQLiteStore) Update(ctx context.Context, req *taskstore.UpdateRequest) 
 		s.now().UnixNano(), next, data, string(req.Task.ID)); err != nil {
 		return taskstore.TaskVersionMissing, err
 	}
+
 	if err := tx.Commit(); err != nil {
 		return taskstore.TaskVersionMissing, err
 	}
+
 	return taskstore.TaskVersion(next), nil
 }
 
@@ -154,25 +170,31 @@ func (s *SQLiteStore) Get(ctx context.Context, id a2a.TaskID) (*taskstore.Stored
 	if err != nil {
 		return nil, fmt.Errorf("taskstore auth failed: %w", err)
 	}
+
 	var storedUser string
 	var version int64
 	var data []byte
+
 	err = s.db.QueryRowContext(ctx, `SELECT user, version, data FROM tasks WHERE id = ?`, string(id)).
 		Scan(&storedUser, &version, &data)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, a2a.ErrTaskNotFound
 	}
+
 	if err != nil {
 		return nil, err
 	}
+
 	if storedUser != user {
 		// Mask an ownership mismatch as not-found, per the store contract.
 		return nil, a2a.ErrTaskNotFound
 	}
+
 	task, err := decodeTask(data)
 	if err != nil {
 		return nil, err
 	}
+
 	return &taskstore.StoredTask{Task: task, Version: taskstore.TaskVersion(version), User: storedUser}, nil
 }
 
@@ -182,9 +204,11 @@ func (s *SQLiteStore) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a
 	if err != nil {
 		return nil, fmt.Errorf("taskstore auth failed: %w", err)
 	}
+
 	if user == "" {
 		return nil, a2a.ErrUnauthenticated
 	}
+
 	pageSize := req.PageSize
 	switch {
 	case pageSize == 0:
@@ -208,9 +232,11 @@ func (s *SQLiteStore) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a
 		if err != nil {
 			return nil, err
 		}
+
 		pageWhere = append(pageWhere, "(updated_at < ? OR (updated_at = ? AND id < ?))")
 		pageArgs = append(pageArgs, cursorTime.UnixNano(), cursorTime.UnixNano(), string(cursorID))
 	}
+
 	// Fetch one extra row to know whether a further page exists.
 	pageArgs = append(pageArgs, pageSize+1)
 
@@ -230,6 +256,7 @@ func (s *SQLiteStore) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a
 		}
 		got = append(got, r)
 	}
+
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
@@ -245,6 +272,7 @@ func (s *SQLiteStore) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a
 	if err != nil {
 		return nil, err
 	}
+
 	return &a2a.ListTasksResponse{
 		Tasks:         tasks,
 		TotalSize:     total,
@@ -265,19 +293,23 @@ type taskRow struct {
 func listFilter(req *a2a.ListTasksRequest, user string) ([]string, []any) {
 	where := []string{"user = ?"}
 	args := []any{user}
+
 	if req.ContextID != "" {
 		where = append(where, "context_id = ?")
 		args = append(args, req.ContextID)
 	}
+
 	if req.Status != a2a.TaskStateUnspecified {
 		where = append(where, "status = ?")
 		args = append(args, string(req.Status))
 	}
+
 	if req.StatusTimestampAfter != nil {
 		// A task without a status timestamp is not filtered out.
 		where = append(where, "(status_ts IS NULL OR status_ts >= ?)")
 		args = append(args, req.StatusTimestampAfter.UnixNano())
 	}
+
 	return where, args
 }
 
@@ -288,22 +320,27 @@ func pageTasks(rows []taskRow, req *a2a.ListTasksRequest) ([]*a2a.Task, error) {
 	if req.HistoryLength != nil {
 		historyLength = *req.HistoryLength
 	}
+
 	out := make([]*a2a.Task, 0, len(rows))
 	for _, r := range rows {
 		task, err := decodeTask(r.data)
 		if err != nil {
 			return nil, err
 		}
+
 		if historyLength <= 0 {
 			task.History = []*a2a.Message{}
 		} else if len(task.History) > historyLength {
 			task.History = task.History[len(task.History)-historyLength:]
 		}
+
 		if !req.IncludeArtifacts {
 			task.Artifacts = nil
 		}
+
 		out = append(out, task)
 	}
+
 	return out, nil
 }
 
@@ -319,6 +356,7 @@ func decodeTask(data []byte) (*a2a.Task, error) {
 	if err := json.Unmarshal(data, &task); err != nil {
 		return nil, fmt.Errorf("task store: %w", err)
 	}
+
 	return &task, nil
 }
 
@@ -339,13 +377,16 @@ func decodePageToken(token string) (time.Time, a2a.TaskID, error) {
 	if err != nil {
 		return time.Time{}, "", a2a.ErrParseError
 	}
+
 	ts, id, ok := strings.Cut(string(decoded), "_")
 	if !ok {
 		return time.Time{}, "", a2a.ErrParseError
 	}
+
 	updated, err := time.Parse(time.RFC3339Nano, ts)
 	if err != nil {
 		return time.Time{}, "", a2a.ErrParseError
 	}
+
 	return updated, a2a.TaskID(id), nil
 }

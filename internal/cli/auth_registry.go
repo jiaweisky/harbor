@@ -22,6 +22,7 @@ func authFor(binary, version string) (agent.Authenticator, bool) {
 	if !ok {
 		return nil, false
 	}
+
 	return f(version), true
 }
 

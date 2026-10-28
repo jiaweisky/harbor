@@ -27,10 +27,13 @@ func newIdemCache(max int) *idemCache {
 func (c *idemCache) getOrPut(key string, id a2a.TaskID) (a2a.TaskID, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	if v, ok := c.m[key]; ok {
 		return v, true
 	}
+
 	c.storeLocked(key, id)
+
 	return id, false
 }
 
@@ -38,6 +41,7 @@ func (c *idemCache) getOrPut(key string, id a2a.TaskID) (a2a.TaskID, bool) {
 func (c *idemCache) set(key string, id a2a.TaskID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	c.storeLocked(key, id)
 }
 
@@ -49,8 +53,10 @@ func (c *idemCache) storeLocked(key string, id a2a.TaskID) {
 			delete(c.m, c.order[0])
 			c.order = c.order[1:]
 		}
+
 		c.order = append(c.order, key)
 	}
+
 	c.m[key] = id
 }
 
@@ -63,11 +69,13 @@ func (e *CLIExecutor) duplicateTask(ctx context.Context, ec *a2asrv.ExecutorCont
 	if e.taskLookup == nil || ec.StoredTask != nil || ec.Message == nil || ec.Message.ID == "" {
 		return nil, false
 	}
+
 	key := callerScope(ec) + "\x00" + ec.Message.ID
 	prev, existed := e.idem.getOrPut(key, ec.TaskID)
 	if !existed || prev == ec.TaskID {
 		return nil, false
 	}
+
 	task, ok := e.taskLookup(ctx, prev)
 	if !ok || task == nil || task.Status.State == a2a.TaskStateRejected {
 		// The earlier attempt was rejected (e.g. the breaker was open); do not
@@ -75,6 +83,7 @@ func (e *CLIExecutor) duplicateTask(ctx context.Context, ec *a2asrv.ExecutorCont
 		e.idem.set(key, ec.TaskID)
 		return nil, false
 	}
+
 	return task, true
 }
 
@@ -98,21 +107,26 @@ func (e *CLIExecutor) replayDuplicate(
 	if tk.Metadata == nil {
 		tk.Metadata = map[string]any{}
 	}
+
 	tk.Metadata["harbor.duplicateOf"] = string(orig.ID)
 	if !yield(tk, nil) {
 		return
 	}
+
 	for _, a := range orig.Artifacts {
 		evt := a2a.NewArtifactEvent(ec, a.Parts...)
 		evt.Artifact.Name = a.Name
 		evt.Artifact.Metadata = a.Metadata
+
 		if !yield(evt, nil) {
 			return
 		}
 	}
+
 	state := orig.Status.State
 	if state == "" || state == a2a.TaskStateSubmitted {
 		state = a2a.TaskStateCompleted
 	}
+
 	yield(a2a.NewStatusUpdateEvent(ec, state, orig.Status.Message), nil)
 }

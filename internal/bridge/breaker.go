@@ -56,6 +56,7 @@ func newBreaker(cfg *core.Breaker) *breaker {
 	if cfg == nil || cfg.Threshold <= 0 {
 		return nil
 	}
+
 	b := &breaker{
 		window:       cfg.Threshold,
 		failureRatio: cfg.FailureRatio,
@@ -63,24 +64,30 @@ func newBreaker(cfg *core.Breaker) *breaker {
 		cooldown:     cfg.Cooldown,
 		maxCooldown:  cfg.MaxCooldown,
 	}
+
 	switch {
 	case b.failureRatio <= 0:
 		b.failureRatio = 0.5
 	case b.failureRatio > 1:
 		b.failureRatio = 1
 	}
+
 	if b.halfOpenNeed <= 0 {
 		b.halfOpenNeed = 1
 	}
+
 	if b.cooldown <= 0 {
 		b.cooldown = 30 * time.Second
 	}
+
 	if b.maxCooldown <= 0 {
 		b.maxCooldown = 10 * time.Minute
 	}
+
 	if b.maxCooldown < b.cooldown {
 		b.maxCooldown = b.cooldown
 	}
+
 	return b
 }
 
@@ -90,11 +97,14 @@ func (b *breaker) Allow() bool {
 	if b == nil {
 		return true
 	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	now := time.Now()
 	b.expireProbeLocked(now)
 	b.promoteLocked(now)
+
 	switch b.state {
 	case stateOpen:
 		return false
@@ -115,8 +125,10 @@ func (b *breaker) State() string {
 	if b == nil {
 		return stateNameClosed
 	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	switch b.state {
 	case stateOpen:
 		return stateNameOpen
@@ -134,16 +146,21 @@ func (b *breaker) Success() {
 	if b == nil {
 		return
 	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	b.expireProbeLocked(time.Now())
+
 	switch b.state {
 	case stateHalfOpen:
 		if b.probeInFlight == 0 {
 			return // not the admitted probe; ignore a stale outcome
 		}
+
 		b.releaseProbeLocked()
 		b.probeSuccesses++
+
 		if b.probeSuccesses >= b.halfOpenNeed {
 			b.closeLocked()
 		}
@@ -158,14 +175,18 @@ func (b *breaker) Failure() {
 	if b == nil {
 		return
 	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	b.expireProbeLocked(time.Now())
+
 	switch b.state {
 	case stateHalfOpen:
 		if b.probeInFlight == 0 {
 			return // not the admitted probe; ignore a stale outcome
 		}
+
 		b.releaseProbeLocked()
 		b.openLocked(time.Now())
 	case stateClosed:
@@ -180,8 +201,10 @@ func (b *breaker) Resolve() {
 	if b == nil {
 		return
 	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	if b.state == stateHalfOpen {
 		b.releaseProbeLocked()
 	}
@@ -214,12 +237,15 @@ func (b *breaker) recordLocked(failure bool) {
 		if b.outcomes[b.next] {
 			b.failures--
 		}
+
 		b.outcomes[b.next] = failure
 		b.next = (b.next + 1) % b.window
 	}
+
 	if failure {
 		b.failures++
 	}
+
 	if len(b.outcomes) >= b.window && float64(b.failures)/float64(len(b.outcomes)) >= b.failureRatio {
 		b.openLocked(time.Now())
 	}
@@ -246,6 +272,7 @@ func (b *breaker) openLocked(now time.Time) {
 	b.failures = 0
 	b.releaseProbeLocked()
 	b.probeSuccesses = 0
+
 	switch {
 	case b.curCooldown == 0:
 		b.curCooldown = b.cooldown
