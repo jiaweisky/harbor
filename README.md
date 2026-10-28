@@ -291,9 +291,8 @@ binary or daemon/VM is unavailable.
 | `id` | string | **yes** | — | agent id (route/card/skill base) |
 | `binary` | string | **yes** | — | CLI executable (name or path) |
 | `integration` | string | for unknown binaries | profile default | `exec` \| `stream-json` \| `acp` \| `server` |
-| `display_name` | string | **yes** | — | card `name` text |
-| `description` | string | **yes** | — | card description text |
-| `version` | string | no | probed | card version (skips probing) |
+| `card` | object | **yes** | — | A2A AgentCard configuration; see `agents[].card` |
+| `cli_version` | string | no | probed | CLI version override; not the A2A card version |
 | `workdir` | string | **yes** | — | project dir the CLI is started in (its project root); must exist; `"."` means Harbor's working directory and is stored absolute |
 | `args` | string[] | exec/acp rules | — | launch args. `exec` must contain `{{.Prompt}}`; `acp` needs the ACP subcommand |
 | `env` | map | no | — | extra environment for the CLI |
@@ -332,7 +331,24 @@ binary or daemon/VM is unavailable.
 | `breaker.cooldown` | duration | open duration before a probe (also the probe deadline) |
 | `breaker.max_cooldown` | duration | backoff cap |
 
-### `agents[].skills[]`
+### `agents[].card`
+
+The AgentCard is configured separately from how the CLI is run.
+
+| key | type | required | meaning |
+|---|---|---|---|
+| `name` | string | **yes** | human-readable card name |
+| `description` | string | **yes** | card description |
+| `version` | string | no | card version; defaults to the probed CLI version |
+| `icon_url` | string | no | card icon URL |
+| `documentation_url` | string | no | card documentation URL |
+| `provider.organization` | string | with `provider` | service provider name |
+| `provider.url` | string | with `provider` | service provider URL |
+| `skills` | list | no | advertised skills; see `agents[].card.skills[]` |
+| `extensions` | list | no | protocol extensions; see `agents[].card.extensions[]` |
+| `signing` | object | no | JWS signing; see `agents[].card.signing` |
+
+### `agents[].card.skills[]`
 
 Optional; when omitted, the card advertises an empty skills list.
 
@@ -346,18 +362,44 @@ Optional; when omitted, the card advertises an empty skills list.
 | `input_modes` | string[] | no | per-skill input MIME override |
 | `output_modes` | string[] | no | per-skill output MIME override |
 
+### `agents[].card.extensions[]`
+
+Optional; additional protocol extensions declared on the card. A configured
+extension with Harbor's interaction extension URI replaces the built-in
+declaration.
+
+| key | type | required | meaning |
+|---|---|---|---|
+| `uri` | string | **yes** | unique extension URI |
+| `description` | string | no | human-readable description |
+| `params` | map | no | extension-specific configuration |
+| `required` | bool | no | whether clients must understand the extension |
+
+### `agents[].card.signing`
+
+Optional; signs the final AgentCard with JWS (RFC 7515). The key is read at
+startup; a signing failure disables that agent.
+
+| key | type | required | meaning |
+|---|---|---|---|
+| `key_file` | string | **yes** | PEM private key: PKCS#8, EC, or PKCS#1 |
+| `key_id` | string | **yes** | JWS `kid` |
+| `algorithm` | string | no | JWS `alg`; inferred from the key when empty |
+| `jwks_url` | string | no | optional JWS `jku` |
+
 ```yaml
 - id: codebuddy
   binary: codebuddy
   integration: stream-json
   args: ["-p"]
-  display_name: "CodeBuddy"
-  description: "CodeBuddy is a helpful software-development assistant."
-  skills:
-    - id: code-review
-      name: Code review
-      description: Review a code change for bugs, style, and quality issues
-      tags: ["review", "quality"]
+  card:
+    name: "CodeBuddy"
+    description: "CodeBuddy is a helpful software-development assistant."
+    skills:
+      - id: code-review
+        name: Code review
+        description: Review a code change for bugs, style, and quality issues
+        tags: ["review", "quality"]
 ```
 
 ### Restricting an agent's tools

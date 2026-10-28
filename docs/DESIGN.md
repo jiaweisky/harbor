@@ -189,7 +189,7 @@ type Request struct {
 type Adapter interface {
     // Name returns the agent id, e.g. "opencode".
     Name() string
-    // Probe checks the binary's presence/version, for health checks and the AgentCard.
+    // Probe checks the binary's presence and version for health checks.
     Probe(ctx context.Context) (Info, error)
     // Invocation builds one CLI invocation (command, args, env) from a request.
     Invocation(req *Request) (*Invocation, error)
@@ -454,12 +454,15 @@ Harbor drives the CLIs **only in non-interactive mode**: **credentials are alway
 Each agent generates a card; `stream-json`/`server` modes declare streaming capability.
 
 ```go
-func CardFor(a agent.Launcher, info agent.Info, endpoint string) *a2a.AgentCard {
+func CardFor(a agent.Launcher, spec core.AgentSpec, endpoint string) *a2a.AgentCard {
     caps := a.Capabilities() // effective capabilities, projected onto the card
     return &a2a.AgentCard{
-        Name:        info.DisplayName, // agents[].display_name, required
-        Description: info.Description, // agents[].description, required
-        Version:     info.Version,
+        Name:             spec.Card.Name,        // agents[].card.name, required
+        Description:      spec.Card.Description, // agents[].card.description, required
+        IconURL:          spec.Card.IconURL,          // agents[].card.icon_url
+        DocumentationURL: spec.Card.DocumentationURL, // agents[].card.documentation_url
+        Provider:         cardProvider(spec.Card.Provider), // agents[].card.provider
+        Version:          spec.Card.Version,     // agents[].card.version
         SupportedInterfaces: []*a2a.AgentInterface{
             {
                 URL:             endpoint, // e.g. https://host/agents/<id>/ (with a trailing slash)
@@ -470,6 +473,7 @@ func CardFor(a agent.Launcher, info agent.Info, endpoint string) *a2a.AgentCard 
         Capabilities: a2a.AgentCapabilities{
             Streaming:         caps.Streaming != agent.StreamNone, // projected from capabilities; false for exec
             PushNotifications: true,
+            Extensions:        cardExtensions(caps, spec.Card.Extensions), // built-in + agents[].card.extensions
         },
         DefaultInputModes:  caps.InputModes(),   // text/plain[, image/*, application/json...]
         DefaultOutputModes: caps.OutputModes(),
@@ -477,16 +481,24 @@ func CardFor(a agent.Launcher, info agent.Info, endpoint string) *a2a.AgentCard 
         SecuritySchemes:      cardSecuritySchemes(),      // nil when auth is none
         SecurityRequirements: cardSecurityRequirements(), // nil when auth is none
         // Skills advertise the agent's abilities to callers; they come from
-        // agents[].skills (operator-configured). When none are set the card
+        // agents[].card.skills (operator-configured). When none are set the card
         // advertises an empty skills list (the A2A field is still present).
-        Skills: cardSkills(info.Skills),
+        Skills: cardSkills(spec.Card.Skills),
     }
 }
 ```
 
-> Card override: `agents[].description` replaces the description text and
-> `agents[].skills` lists the advertised skills (`display_name`/`version`
-> likewise shape `name`/`version`). Each `AgentSkill` requires `id`, `name`, and
+> Card signing: when `agents[].card.signing` is set, the final card is signed with
+> `a2acrypto` after assembly; the JWS covers the canonical card JSON with the
+> `signatures` field excluded. A missing key or signing failure disables that
+> agent at startup. Capabilities, protocol interfaces, and security schemes
+> remain computed from the effective capabilities and server auth configuration.
+
+> Card override: `agents[].card` declares the operator-controlled card fields:
+> `name`, `description`, `version`, `icon_url`, `documentation_url`,
+> `provider`, `skills`, `extensions`, and `signing`. Runtime fields such as
+> `binary`, `integration`, `args`, and `workdir` stay outside the `card` block.
+> Each `AgentSkill` requires `id`, `name`, and
 > `description` (A2A 1.0 §4.4.5; `tags` is part of the spec, emitted as an empty
 > array when unset). Skills are operator-authored and describe what the agent can
 > do for a caller; Harbor does not infer them from the CLI (its tools/subagents
@@ -499,7 +511,7 @@ Exposure methods (a2a-go):
 - `a2asrv.NewStaticAgentCardHandler(card)` mounted at `/.well-known/agent-card.json`;
 - Multiple agents: `/agents/{id}/.well-known/agent-card.json` + `/agents/{id}/` (JSON-RPC handler, **with a trailing slash**, consistent with the card url);
 - **Transports**: JSON-RPC (default) and HTTP+JSON (A2A REST, `a2asrv.NewRESTHandler`, mounted at `<agent>/rest/`). Both bindings are declared in the AgentCard's `supportedInterfaces`.
-- **Protocol version fixed to A2A v1.0** (`ProtocolVersion: a2a.Version`): when `A2A-Version` does not match, `ErrVersionNotSupported` is returned.
+- **Protocol version fixed to A2A v1.0** (`ProtocolVersion: a2a.Version`): every RPC/REST request must carry `A2A-Version: 1.0` as a header or query parameter. An absent or empty value is treated as 0.3, and any other value returns `ErrVersionNotSupported` before execution.
 
 #### 6.1.1 Compatibility Discovery Endpoint (codebuddy)
 
@@ -916,7 +928,6 @@ Just add an entry in `agents.yaml`. Built-in parsers: `stream-json`, `text`, `re
 ```yaml
 agents:
   - id: my-coder
-    display_name: "My Coder CLI"
     binary: my-coder
     integration: exec          # stream-json | server | acp | exec
     parser: text               # stream-json | text | regex
@@ -931,6 +942,9 @@ agents:
       max_concurrent: 2
       timeout: 30m
       max_turns: 100
+    card:
+      name: "My Coder CLI"
+      description: "A custom coding-agent CLI exposed over A2A."
 ```
 
 ### Level 2: Custom Parser (a little Go code) — **already implemented**
@@ -1252,7 +1266,6 @@ sandbox:
 
 agents:
   - id: claude
-    display_name: "Claude Code"
     binary: claude
     integration: stream-json
     workdir: "/srv/projects/my-project"   # the CLI's project root (defaults to Harbor's cwd)
@@ -1264,6 +1277,9 @@ agents:
       - "--include-partial-messages"
       - "--verbose"
     session: { id_flag: "--session-id", resume_flag: "--resume", continue_flag: "--continue" }
+    card:
+      name: "Claude Code"
+      description: "Claude Code exposed over A2A."
     allow_dangerous: false
     env:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"   # credential/gateway variables
@@ -1506,11 +1522,11 @@ require github.com/a2aproject/a2a-go/v2 v2.6.0
 package agent
 
 type Info struct {
-    Name    string
-    Version string
-    Path    string
-    Enabled bool
-    Err     error
+    AgentID    string
+    CLIVersion string
+    BinaryPath string
+    Available  bool
+    ProbeErr   error
 }
 
 type Invocation struct {
@@ -1603,7 +1619,6 @@ type ContainerConfig struct {
 
 type AgentConfig struct {
     ID             string            `yaml:"id"`
-    DisplayName    string            `yaml:"display_name"`
     Binary         string            `yaml:"binary"`
     Integration    string            `yaml:"integration"` // exec | stream-json | acp | server
     Parser         string            `yaml:"parser"`      // exec modes: text | codex | regex
@@ -1617,10 +1632,22 @@ type AgentConfig struct {
     FileArgs         []string         `yaml:"file_args"`          // exec: file attachments ({{.File}})
     ImageArgs        []string         `yaml:"image_args"`         // exec: image attachments ({{.Image}}), e.g. codex ["-i","{{.Image}}"]
     InputImage       []string         `yaml:"input_image"`        // accepted image MIME types (default from the profile)
-    Description      string           `yaml:"description"`        // card description override (default template when empty)
-    Skills           []SkillConfig    `yaml:"skills"`             // card skills override (replace; generic single skill when empty)
+    CLIVersion       string           `yaml:"cli_version"`        // CLI version override; not the card version
+    Card             CardConfig       `yaml:"card"`
     Session        SessionConfig     `yaml:"session"`
     Limits         LimitsConfig      `yaml:"limits"`
+}
+
+type CardConfig struct {
+    Name             string            `yaml:"name"`
+    Description      string            `yaml:"description"`
+    Version          string            `yaml:"version"`
+    IconURL          string            `yaml:"icon_url"`
+    DocumentationURL string            `yaml:"documentation_url"`
+    Provider         *ProviderConfig   `yaml:"provider"`
+    Skills           []SkillConfig     `yaml:"skills"`
+    Extensions       []ExtensionConfig `yaml:"extensions"`
+    Signing          *CardSigningConfig `yaml:"signing"`
 }
 
 type SkillConfig struct {
@@ -1918,7 +1945,7 @@ func main() {
         ln, err := agent.NewLauncher(ac.Integration, ac)
         if err != nil { slog.Warn("agent disabled", "id", ac.ID, "err", err); continue }
         info := ln.Probe(context.Background())
-        if !info.Enabled { slog.Warn("binary missing", "id", ac.ID, "err", info.Err); continue }
+        if !info.Available { slog.Warn("binary missing", "id", ac.ID, "err", info.ProbeErr); continue }
 
         exec := a2a.NewCLIExecutor(ln, session.NewMemStore(), a2a.NewLiveSessions())
         h := a2asrv.NewHandler(exec,
