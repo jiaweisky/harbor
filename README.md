@@ -2,8 +2,8 @@
 
 Expose coding-agent CLIs (`codebuddy`, `claude`, `opencode`, `codex`, and others)
 as remote [A2A](https://a2a-protocol.org) v1.0 agents. Each CLI is served behind a
-standard AgentCard and JSON-RPC endpoint, with bearer auth, discovery, and a
-config-driven adapter layer.
+standard AgentCard with JSON-RPC and HTTP+JSON (REST) endpoints, bearer auth,
+discovery, and a config-driven adapter layer.
 
 - Design: [docs/DESIGN.md](docs/DESIGN.md)
 - Engineering conventions: [AGENTS.md](AGENTS.md)
@@ -15,9 +15,12 @@ make build
 ./bin/harbor --config examples/agents.yaml
 ```
 
-Requires Go 1.27+ (see `go.mod`). `make lint` additionally needs a
+Requires Go 1.27.1+ (see `go.mod`). `make lint` additionally needs a
 `golangci-lint` built with a Go toolchain at least as new as the module's `go`
-directive. `make test` runs the suite with `-race`.
+directive. `make test` runs the suite with `-race`. `./bin/harbor --version`
+prints the stamped build version; `make version` prints the version the next
+build would use, and `make release` packages a release archive from a clean,
+tagged HEAD.
 
 ## Adapters
 
@@ -31,9 +34,9 @@ An `agents[]` entry binds one CLI (`binary`) to exactly one **integration**
 | `acp`         | Agent Client Protocol over the CLI's stdio (`<cli> acp`, `codebuddy --acp`).          |
 | `server`      | Harbor proxies the CLI's own HTTP/app server (opencode `serve`, codebuddy `--serve`, codex `app-server`) and reuses server-side sessions. |
 
-Known CLIs get sensible defaults (integration, args, version check, session and
-attachment flags) from a built-in profile; unknown binaries need an explicit
-`integration`.
+Known CLIs get defaults (integration, parser, ACP and session-fork flags,
+attachment and structured-output args, and a minimum supported version) from a
+built-in profile; unknown binaries need an explicit `integration`.
 
 ### Supported adapters per CLI
 
@@ -141,13 +144,19 @@ For an agent with id `<id>`:
 | `/agents/<id>/` | JSON-RPC (A2A) binding |
 | `/agents/<id>/rest/` | HTTP+JSON (A2A REST) binding |
 | `/agents/<id>/.well-known/agent-card.json` | that agent's card |
-| `/.well-known/agent-card.json` | first agent's card |
+| `/.well-known/agent-card.json` | first available agent's card |
 | `/.well-known/agents.json` | aggregate discovery: a JSON array of all cards (used by codebuddy) |
 | `/healthz`, `/readyz`, `/metrics` | liveness, readiness (JSON), Prometheus metrics |
 
+Invocation requests (JSON-RPC and REST) must carry `A2A-Version: 1.0`, either as
+a header or as the `A2A-Version` query parameter. `/readyz` returns
+`{"ready": bool, "agents": {...}}` and answers `503` when no agent is ready; an
+agent is ready when its circuit breaker is closed, and CLI auth state is reported
+separately without affecting readiness.
+
 With `server.auth.mode: bearer`, the invocation endpoints (JSON-RPC, REST) require
-`Authorization: Bearer <token>`; cards and discovery stay public. A non-loopback
-`server.listen` with `auth.mode: none` refuses to start unless
+`Authorization: Bearer <token>`; cards, discovery, health, and metrics stay public.
+A non-loopback `server.listen` with `auth.mode: none` refuses to start unless
 `server.allow_insecure: true`.
 
 ## Configuration
@@ -185,10 +194,10 @@ any unset reference.
 | key | type | required | default | meaning |
 |---|---|---|---|---|
 | `version` | int | no | — | config schema version (currently `1`) |
-| `server` | object | no | — | HTTP server, auth, discovery, limits |
-| `sandbox` | object | no | — | workspace/env/container constraints |
+| `server` | object | **yes** | — | HTTP server, auth, discovery, limits (requires `listen`) |
+| `sandbox` | object | **yes** | — | workspace/env/container constraints (requires `state_dir`) |
 | `telemetry` | object | no | — | OTLP traces/metrics export |
-| `plugins` | string[] | no | — | Go plugin `.so` paths, each exporting `Register()` |
+| `plugins` | string[] | no | — | Go plugin `.so` paths, each exporting `Register()` (cgo only) |
 | `agents` | object[] | **yes** | — | at least one agent entry |
 
 ### `server`
@@ -199,15 +208,25 @@ any unset reference.
 | `base_url` | string | no | — | externally reachable URL used in agent cards |
 | `allow_insecure` | bool | no | `false` | allow a non-loopback bind with `auth.mode: none` |
 | `push_allow_private_networks` | bool | no | `false` | disable the SSRF guard on push webhooks |
-| `store` | string | no | — | persistence backend: unset = in-memory, `sqlite` = durable (survives restart) |
-| `store_path` | string | for `store: sqlite` | — | SQLite DB path for tasks |
-| `session_store_dir` | string | no | — | dir for per-agent session DBs (`<dir>/<id>.db`) |
+| `store` | string | no | — | persistence backend: unset = in-memory, `sqlite` = durable for the paths that are set (survives restart) |
+| `store_path` | string | no | — | with `store: sqlite`, SQLite DB path for tasks (tasks stay in-memory without it) |
+| `session_store_dir` | string | no | — | with `store: sqlite`, dir for per-agent session DBs (`<dir>/<id>.db`); sessions stay in-memory without it |
 | `agent_inactivity_timeout` | duration | no | `10m` | fail a task if the server sees no event from the CLI for this long; `0` disables. A silent CLI is kept alive only when the agent also sets `limits.timeout` or `limits.idle_timeout` |
+| `max_request_bytes` | int | no | `0` (off) | maximum incoming JSON-RPC/REST request body; larger requests fail with `413` before being buffered |
 | `auth.mode` | string | no | `none` | `none` \| `bearer` |
 | `auth.tokens` | string[] | no | — | bearer tokens (required when `mode: bearer`) |
 | `cors_allowed_origins` | string[] | no | — | allowed CORS origins |
 | `rate_limit.per_minute` | int | no | `0` (off) | sustained requests/min per (caller, agent) |
 | `rate_limit.burst` | int | no | `per_minute` | token-bucket capacity |
+| `tls.cert_file` | string | no | — | PEM certificate; setting it enables TLS on the listener |
+| `tls.key_file` | string | with `tls.cert_file` | — | PEM private key |
+| `tls.ca_file` | string | no | — | PEM CA bundle used to verify client certificates |
+| `tls.client_auth` | bool | no | `false` | require and verify a client certificate (mTLS) |
+
+`store: sqlite` requires at least one of `store_path` and `session_store_dir`.
+Setting `tls.cert_file` enables TLS; `tls.key_file` is then required. With
+`tls.client_auth`, clients must present a certificate verified against
+`tls.ca_file` when set.
 
 ### `sandbox`
 
@@ -215,7 +234,7 @@ any unset reference.
 |---|---|---|---|---|
 | `isolation` | string | no | `shared` | `shared` \| `worktree` \| `copy` \| `overlayfs` (per-context working views) |
 | `isolation_root` | string | for `worktree`/`copy`/`overlayfs` | — | base dir for per-context views |
-| `copy_strategy` | string | no | `full` | copy isolation implementation: `full` or `cow` (copy-on-write clone) |
+| `copy_strategy` | string | no | `full` (copy only) | copy isolation implementation: `full` or `cow` (copy-on-write clone) |
 | `inherit_env` | bool | no | `true` | inherit the parent env; `false` restricts to an allowlist |
 | `cli_home` | string | no | — | redirect the CLI's config/home here |
 | `state_dir` | string | **yes** | — | writable dir for CLI process records used for orphan cleanup; use a private per-user dir when several instances or users share a host |
@@ -243,18 +262,16 @@ read-only lower layers and per-context writable upper layers. It requires
 `CAP_SYS_ADMIN` in Harbor's mount namespace (for example, run Harbor in a user
 namespace that grants it) and cannot be combined with `sandbox.container`.
 
-Harbor takes an exclusive lock on `isolation_root`, so a second instance fails
-to start. At startup, after taking the lock, it removes stale copy staging
-directories and unmounts stale overlayfs views; on shutdown it detaches active
-overlayfs mounts while keeping their upper layers for resumed contexts.
+For `worktree`, `copy`, and `overlayfs`, Harbor takes an exclusive lock on
+`isolation_root`, so a second instance fails to start. At startup, after taking
+the lock, it removes stale copy staging directories and unmounts stale overlayfs
+views; on shutdown it detaches active overlayfs mounts while keeping their upper
+layers for resumed contexts.
 
-Isolation directories are keyed by the agent, workdir, and isolation mode.
-Changing any of them starts a new per-context tree; the previous directory stays
-under `isolation_root` and is not reused. Trees created by versions that keyed
-only by context ID are likewise not reused.
-
-
-
+Isolation directories are keyed by the agent, workdir, isolation mode, and copy
+strategy. Changing any of them starts a new per-context tree; the previous
+directory stays under `isolation_root` and is not reused. Trees created by
+versions that keyed only by context ID are likewise not reused.
 
 `sandbox.container`:
 
@@ -294,21 +311,21 @@ binary or daemon/VM is unavailable.
 | `card` | object | **yes** | — | A2A AgentCard configuration; see `agents[].card` |
 | `cli_version` | string | no | probed | CLI version override; not the A2A card version |
 | `workdir` | string | **yes** | — | project dir the CLI is started in (its project root); must exist; `"."` means Harbor's working directory and is stored absolute |
-| `args` | string[] | exec/acp rules | — | launch args. `exec` must contain `{{.Prompt}}`; `acp` needs the ACP subcommand |
+| `args` | string[] | exec/acp rules | — | launch args. `exec` must contain `{{.Prompt}}`; `acp` needs the ACP subcommand; `server` launchers generate their own args |
 | `env` | map | no | — | extra environment for the CLI |
-| `parser` | string | no | `text` | `exec` framing: `text` \| `stream-json` \| `codex` \| `regex` |
+| `parser` | string | no | profile (`text` when unknown) | `exec` framing: `text` \| `stream-json` \| `codex` \| `regex` |
 | `regex.text` | string | for `parser: regex` | — | line regex with one capture group |
-| `server_url` | string | no | — | `server`: connect to an existing instance instead of spawning |
-| `server_protocol` | string | no | `http` | `server`: `http` \| `acp` \| `acp-streamable-http` |
-| `allow_dangerous` | bool | no | `false` | enable the CLI's dangerous/permission-bypass flag |
-| `interaction` | string | no | `auto` | `auto` \| `interactive` \| `non-interactive`: whether CLI permission/plan prompts surface as A2A `input-required` |
+| `server_url` | string | no | — | `server`: connect to an existing opencode/codebuddy instance; codex always spawns `codex app-server` |
+| `server_protocol` | string | no | `http` | `server`: `http` \| `acp` \| `acp-streamable-http` (`acp` forms are codebuddy only) |
+| `allow_dangerous` | bool | no | `false` | `stream-json`: append `--dangerously-skip-permissions`; other integrations express this in their own args |
+| `interaction` | string | no | `auto` | `auto` \| `interactive` \| `non-interactive`: whether CLI permission/plan/question prompts surface as A2A `input-required` |
 | `sdk_capabilities` | bool | no | `false` | `stream-json`: declare `askUserQuestion` before the first prompt |
 | `output_schema_args` | string[] | no | profile | `exec` structured-output args (`{{.SchemaFile}}`/`{{.Schema}}`) |
-| `file_args` | string[] | no | profile | attach files via args (`{{.File}}`) |
-| `image_args` | string[] | no | profile | attach images via args (`{{.Image}}`) |
-| `input_image` | string[] | no | profile | accepted image MIME types |
+| `file_args` | string[] | no | profile | `exec`: attach files via args (`{{.File}}`) |
+| `image_args` | string[] | no | profile | `exec`: attach images via args (`{{.Image}}`) |
+| `input_image` | string[] | no | profile | accepted image MIME types; sent as native blocks on `stream-json`, via `image_args` on `exec` |
 
-`agents[].session` (optional; profile defaults for known CLIs):
+`agents[].session` (optional; the session-fork flag defaults from the CLI profile):
 
 | key | type | meaning |
 |---|---|---|
@@ -317,7 +334,7 @@ binary or daemon/VM is unavailable.
 | `continue_flag` | string | flag to continue the latest session |
 | `fork_flag` | string | flag to fork a session (used when `harbor.fork` is set) |
 
-`agents[].limits` (all optional; `0` disables):
+`agents[].limits` (all optional; `0` disables a bound or leaves the breaker default):
 
 | key | type | meaning |
 |---|---|---|
@@ -325,11 +342,11 @@ binary or daemon/VM is unavailable.
 | `timeout` | duration | total task timeout |
 | `idle_timeout` | duration | fail a task with no events for this long |
 | `max_turns` | int | max turns (start + resumes) per task |
-| `breaker.threshold` | int | recent calls tracked (window size) |
+| `breaker.threshold` | int | recent calls tracked (window size); `0` disables the breaker |
 | `breaker.failure_ratio` | float | trip when the failure ratio in the window reaches this (default `0.5`) |
 | `breaker.half_open_successes` | int | consecutive probe successes that close the breaker (default `1`) |
-| `breaker.cooldown` | duration | open duration before a probe (also the probe deadline) |
-| `breaker.max_cooldown` | duration | backoff cap |
+| `breaker.cooldown` | duration | open duration before a probe (also the probe deadline; default `30s`) |
+| `breaker.max_cooldown` | duration | backoff cap (default `10m`) |
 
 ### `agents[].card`
 
@@ -448,8 +465,10 @@ curl -s http://127.0.0.1:8080/agents/codebuddy/.well-known/agent-card.json | jq
 ## Extending
 
 - **New output format (no code change):** use `exec` with `parser: regex`.
-- **New parser or adapter (Go):** register a parser via
-  `internal/parser.RegisterParser` or a full CLI adapter via
-  `cli.Register` (compile-time `init()`); see docs/DESIGN.md §8.
+- **New parser (Go):** add a `core.ParserKind` and a builder to the registry in
+  `internal/parser/registry.go`.
+- **New CLI adapter (Go):** register a `cli.Descriptor` with `cli.Register` for
+  a new binary, or attach a launcher builder with `cli.AttachBuilder` for a known
+  binary, from a compile-time `init()`; see docs/DESIGN.md §8.
 - **Runtime adapter plugin:** build a Go plugin exporting `Register()` and list
   it under `plugins:` (optional, requires cgo on linux/darwin/freebsd).
