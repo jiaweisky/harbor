@@ -29,6 +29,47 @@ func TestStreamJSONThinkingAndUsage(t *testing.T) {
 	}
 }
 
+func TestStreamJSONErrorText(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  string
+		want string
+	}{
+		{
+			name: "result field",
+			rec:  `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}`,
+			want: "boom",
+		},
+		{
+			name: "result takes precedence over errors",
+			rec: `{"type":"result","subtype":"error_during_execution","is_error":true,` +
+				`"result":"primary","errors":["secondary"]}`,
+			want: "primary",
+		},
+		{
+			name: "errors array",
+			rec: `{"type":"result","subtype":"error_during_execution","is_error":true,"errors":` +
+				`["429 rate limited","try later"]}`,
+			want: "429 rate limited\ntry later",
+		},
+		{
+			name: "no text",
+			rec:  `{"type":"result","subtype":"error_during_execution","is_error":true}`,
+			want: "cli error",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evs := collect(t, parser.NewStreamJSON(), tc.rec)
+			if len(evs) != 1 || evs[0].Kind != agent.EventError || evs[0].Err == nil ||
+				evs[0].Err.Error() != tc.want {
+				t.Fatalf("events = %+v, want error %q", evs, tc.want)
+			}
+		})
+	}
+}
+
 func TestStreamJSONControlRequest(t *testing.T) {
 	p := parser.NewStreamJSON()
 	rec := `{"type":"control_request","request_id":"perm_1",` +

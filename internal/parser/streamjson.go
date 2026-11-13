@@ -119,6 +119,7 @@ func (p *StreamJSON) parseUser(rec []byte, out func(agent.Event)) {
 func (p *StreamJSON) parseResult(rec []byte, out func(agent.Event)) {
 	var r struct {
 		Result           string          `json:"result"`
+		Errors           []string        `json:"errors"`
 		IsError          bool            `json:"is_error"`
 		SessionID        string          `json:"session_id"`
 		CostUSD          float64         `json:"total_cost_usd"`
@@ -131,7 +132,7 @@ func (p *StreamJSON) parseResult(rec []byte, out func(agent.Event)) {
 
 	_ = json.Unmarshal(rec, &r)
 	if r.IsError {
-		out(agent.Event{Kind: agent.EventError, Err: errors.New(r.Result), Raw: rec})
+		out(agent.Event{Kind: agent.EventError, Err: errors.New(resultErrorText(r.Result, r.Errors)), Raw: rec})
 		return
 	}
 
@@ -153,6 +154,28 @@ func (p *StreamJSON) parseResult(rec []byte, out func(agent.Event)) {
 	}
 
 	out(agent.Event{Kind: agent.EventDone, Raw: rec})
+}
+
+// resultErrorText returns the text of a failed result. codebuddy reports the
+// failure in its errors array and leaves result empty; other CLIs put the text
+// in result.
+func resultErrorText(result string, errs []string) string {
+	if result != "" {
+		return result
+	}
+
+	parts := make([]string, 0, len(errs))
+	for _, e := range errs {
+		if e != "" {
+			parts = append(parts, e)
+		}
+	}
+
+	if text := strings.Join(parts, "\n"); text != "" {
+		return text
+	}
+
+	return "cli error"
 }
 
 // structuredData decodes a result's structured_output object, or nil when it is
@@ -184,11 +207,11 @@ func contentBlocks(rec []byte) []contentBlock {
 	var msg struct {
 		Message struct {
 			Content []struct {
-				Type     string         `json:"type"`
-				Text     string         `json:"text"`
-				Thinking string         `json:"thinking"`
-				Name     string         `json:"name"`
-				Input    map[string]any `json:"input"`
+				Type     string          `json:"type"`
+				Text     string          `json:"text"`
+				Thinking string          `json:"thinking"`
+				Name     string          `json:"name"`
+				Input    map[string]any  `json:"input"`
 				Content  json.RawMessage `json:"content"`
 			} `json:"content"`
 		} `json:"message"`
